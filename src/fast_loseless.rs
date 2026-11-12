@@ -420,48 +420,67 @@ impl PrefixCode {
     }
 }
 
-fn ycocg(r: i32, g: i32, b: i32) -> (i32, i32, i32) {
-    let co = r - b;
-    let tmp = b + (co >> 1);
-    let cg = g - tmp;
-    let y = tmp + (cg >> 1);
-    (y, co, cg)
+fn fill_color_planes<T: Copy + Into<i32>, const CHANNELS: usize>(
+    img: &[[T; CHANNELS]],
+    mut planes: [&mut [i32]; 3],
+    alpha: &mut [i32],
+) {
+    use crate::lossless::rct_simd::forward_ycocg_in_place;
+
+    const BLOCK: usize = 1024;
+    // Keep the deinterleaved samples hot for the in-place transform.
+    for (block, pixels) in img.chunks(BLOCK).enumerate() {
+        let start = block * BLOCK;
+        let range = start..start + pixels.len();
+        let [r, g, b] = planes.each_mut().map(|p| &mut p[range.clone()]);
+        for (((r, g), b), pixel) in r.iter_mut().zip(&mut *g).zip(&mut *b).zip(pixels) {
+            (*r, *g, *b) = (pixel[0].into(), pixel[1].into(), pixel[2].into());
+        }
+        forward_ycocg_in_place([r, g, b]);
+        if CHANNELS == 4 {
+            for (a, pixel) in alpha[range].iter_mut().zip(pixels) {
+                *a = pixel[3].into();
+            }
+        }
+    }
 }
-fn build_planes_from<F: Fn(usize) -> i32>(w: usize, h: usize, nb: usize, get: F) -> Vec<Vec<i32>> {
-    let n = w * h;
-    let mut p = vec![vec![0i32; n]; nb];
-    match p.as_mut_slice() {
+
+fn build_planes_from<T: Copy + Into<i32>>(img: &[T], n: usize, nb: usize) -> Vec<Vec<i32>> {
+    let mut planes = vec![vec![0i32; n]; nb];
+    match planes.as_mut_slice() {
         [gray] => {
-            for (i, value) in gray.iter_mut().enumerate() {
-                *value = get(i);
+            for (value, &src) in gray.iter_mut().zip(img) {
+                *value = src.into();
             }
         }
         [gray, alpha] => {
-            for (i, (value, a)) in gray.iter_mut().zip(alpha).enumerate() {
-                *value = get(2 * i);
-                *a = get(2 * i + 1);
+            for ((value, a), &[src, opacity]) in
+                gray.iter_mut().zip(alpha).zip(img.as_chunks::<2>().0)
+            {
+                *value = src.into();
+                *a = opacity.into();
             }
         }
-        [y, co, cg] => {
-            for (i, ((y, co), cg)) in y.iter_mut().zip(co).zip(cg).enumerate() {
-                (*y, *co, *cg) = ycocg(get(3 * i), get(3 * i + 1), get(3 * i + 2));
-            }
-        }
-        [y, co, cg, alpha] => {
-            for (i, (((y, co), cg), a)) in y.iter_mut().zip(co).zip(cg).zip(alpha).enumerate() {
-                (*y, *co, *cg) = ycocg(get(4 * i), get(4 * i + 1), get(4 * i + 2));
-                *a = get(4 * i + 3);
-            }
-        }
+        [r, g, b] => fill_color_planes(img.as_chunks::<3>().0, [r, g, b], &mut []),
+        [r, g, b, alpha] => fill_color_planes(img.as_chunks::<4>().0, [r, g, b], alpha),
         _ => unreachable!(),
     }
-    p
+    planes
 }
 fn build_planes_u8(img: &[u8], w: usize, h: usize, nb: usize) -> Vec<Vec<i32>> {
-    build_planes_from(w, h, nb, |i| img[i] as i32)
+    if nb == 3 {
+        let mut planes = [vec![0; w * h], vec![0; w * h], vec![0; w * h]];
+        crate::lossless::rct_simd::rgb8_to_ycocg(
+            img.as_chunks::<3>().0,
+            planes.each_mut().map(Vec::as_mut_slice),
+        );
+        Vec::from(planes)
+    } else {
+        build_planes_from(img, w * h, nb)
+    }
 }
 fn build_planes_u16(img: &[u16], w: usize, h: usize, nb: usize) -> Vec<Vec<i32>> {
-    build_planes_from(w, h, nb, |i| img[i] as i32)
+    build_planes_from(img, w * h, nb)
 }
 #[inline]
 fn pack_signed(v: i32) -> u32 {

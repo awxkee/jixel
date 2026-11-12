@@ -145,7 +145,7 @@ pub(crate) const NEG_BIAS_CBRT: f32 = -0.155_954_2;
 #[inline(always)]
 fn halley_refine(x: f32, a: f32) -> f32 {
     let tx = x * x * x;
-    x * fmla(2f32, a, tx) / fmla(2f32, tx, a)
+    x * fmla(2.0, a, tx) / fmla(2.0, tx, a)
 }
 
 #[inline]
@@ -180,6 +180,68 @@ pub(crate) fn rgb_to_xyb_pixel_f32(m: &XybMatrix, r: f32, g: f32, b: f32) -> (f3
     let tm2 = cbrtf(mixed2.max(0.0)) + NEG_BIAS_CBRT;
 
     (0.5 * (tm0 - tm1), 0.5 * (tm0 + tm1), tm2)
+}
+
+type XybLatticeFn = unsafe fn(&XybMatrix, [&[f32]; 3], [&mut [i32]; 3]) -> usize;
+
+fn select_xyb_lattice_fn() -> XybLatticeFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return crate::avx::xyb_lattice_avx2;
+    }
+    // The SSE kernel matches the unfused scalar arithmetic of generic x86 builds.
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "x86"),
+        feature = "sse",
+        not(target_feature = "fma")
+    ))]
+    if std::is_x86_feature_detected!("sse4.1") {
+        return crate::sse::xyb_lattice_sse41;
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    return crate::neon::xyb_lattice_neon;
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::xyb_lattice_wasm;
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
+    )))]
+    |_, _, _| 0
+}
+
+/// Convert linear RGB to the base frame's quantized XYB lattice, with YCoCg
+/// applied to (Y, X, B-Y) for modular coding. Each backend uses the same
+/// arithmetic for full vectors and tails, including AVX2's fused multiply-add.
+pub(crate) fn xyb_lattice_ycocg(m: &XybMatrix, input: [&[f32]; 3], output: [&mut [i32]; 3]) {
+    use crate::lossless::forward_ycocg;
+    use crate::quant_weights::INV_DC_QUANT;
+
+    static LATTICE: OnceLock<XybLatticeFn> = OnceLock::new();
+    let lattice = *LATTICE.get_or_init(select_xyb_lattice_fn);
+    let [r, g, b] = input;
+    let [y_out, co_out, cg_out] = output;
+    assert!(
+        [g.len(), b.len(), y_out.len(), co_out.len(), cg_out.len()]
+            .iter()
+            .all(|&len| len == r.len())
+    );
+    // SAFETY: dispatch selects supported CPU features. The kernels only load
+    // and store complete vectors from the slices they receive.
+    let done = unsafe { lattice(m, input, [y_out, co_out, cg_out]) };
+    let src = r[done..].iter().zip(&g[done..]).zip(&b[done..]);
+    let dst = y_out[done..]
+        .iter_mut()
+        .zip(&mut co_out[done..])
+        .zip(&mut cg_out[done..]);
+    for (((r, g), b), ((y_out, co_out), cg_out)) in src.zip(dst) {
+        let (x, y, b) = rgb_to_xyb_pixel_f32(m, *r, *g, *b);
+        let yq = (y * INV_DC_QUANT[1]).round() as i32;
+        (*y_out, *co_out, *cg_out) = forward_ycocg(
+            yq,
+            (x * INV_DC_QUANT[0]).round() as i32,
+            (b * INV_DC_QUANT[2]).round() as i32 - yq,
+        );
+    }
 }
 
 /// Inverse of [`rgb_to_xyb_pixel_f32`], using the active signalled matrix.

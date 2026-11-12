@@ -54,6 +54,7 @@ mod coeff_order;
 mod color;
 mod color_correlation;
 mod color_encoding;
+mod crop_frames;
 #[cfg(feature = "extraslow")]
 mod cvvdp_arbiter;
 mod dc_group_data;

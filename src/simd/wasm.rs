@@ -27,6 +27,27 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use std::arch::wasm32::*;
+
+#[inline]
+#[target_feature(enable = "simd128")]
+pub(crate) fn deinterleave_rgb8(pixels: &[[u8; 3]; 16]) -> [v128; 3] {
+    let src = pixels.as_ptr().cast::<u8>();
+    let loads: [_; 3] = std::array::from_fn(|i| unsafe { v128_load(src.add(16 * i).cast()) });
+    super::RGB8_SHUFFLE.each_ref().map(|channel| {
+        let masks = channel
+            .each_ref()
+            .map(|part| unsafe { v128_load(part.as_ptr().cast()) });
+        v128_or(
+            v128_or(
+                i8x16_swizzle(loads[0], masks[0]),
+                i8x16_swizzle(loads[1], masks[1]),
+            ),
+            i8x16_swizzle(loads[2], masks[2]),
+        )
+    })
+}
+
 pub(crate) mod i32 {
     pub(crate) type Vector = v128;
 

@@ -47,32 +47,10 @@ fn any(v: v128) -> bool {
 #[target_feature(enable = "simd128")]
 pub(crate) fn luma_row_wasm(rgb: &[[u8; 3]], out: &mut [u8]) {
     assert!(rgb.len() >= out.len());
-    let masks: [[v128; 3]; 3] = std::array::from_fn(|c| {
-        std::array::from_fn(|part| {
-            let indices: [u8; 16] = std::array::from_fn(|i| {
-                if (3 * i + c) / 16 == part {
-                    ((3 * i + c) % 16) as u8
-                } else {
-                    128
-                }
-            });
-            unsafe { v128_load(indices.as_ptr().cast()) }
-        })
-    });
     let end = out.len() / 16 * 16;
-    for x in (0..end).step_by(16) {
-        let src: [v128; 3] = std::array::from_fn(|part| unsafe {
-            v128_load(rgb.as_ptr().add(x).cast::<u8>().add(part * 16).cast())
-        });
-        let channels: [v128; 3] = std::array::from_fn(|c| {
-            v128_or(
-                v128_or(
-                    i8x16_swizzle(src[0], masks[c][0]),
-                    i8x16_swizzle(src[1], masks[c][1]),
-                ),
-                i8x16_swizzle(src[2], masks[c][2]),
-            )
-        });
+    for (x, pixels) in rgb[..end].as_chunks::<16>().0.iter().enumerate() {
+        let x = x * 16;
+        let channels = crate::simd::wasm::deinterleave_rgb8(pixels);
         let half = |hi: bool| {
             let [r, g, b] = channels.map(|v| {
                 if hi {

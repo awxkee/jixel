@@ -85,6 +85,8 @@ pub(crate) use quant::{
 pub(crate) use quantize_xyb::{
     quantize_xyb_channels_sse41, quantize_xyb_tile_colors_sse41, round_lattice_pow2_sse2,
 };
+#[cfg(not(target_feature = "fma"))]
+pub(crate) use xyb::xyb_lattice_sse41;
 pub(crate) use xyb::{to_linear_rows_sse41, to_xyb_sse41_band};
 
 #[cfg(feature = "splines")]

@@ -31,6 +31,7 @@
 pub(crate) mod avx;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 pub(crate) mod neon;
+pub(crate) mod rgb8_blend;
 #[cfg(any(
     all(target_arch = "x86_64", feature = "avx"),
     all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse")
@@ -38,6 +39,28 @@ pub(crate) mod neon;
 pub(crate) mod sse;
 #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
 pub(crate) mod wasm;
+
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "avx"),
+    all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"),
+    all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
+))]
+const RGB8_SHUFFLE: [[[u8; 16]; 3]; 3] = {
+    // Each channel merges contributions from three successive 16-byte loads.
+    // The 0x80 sentinel zeroes the lane in both pshufb and swizzle.
+    let mut masks = [[[0x80; 16]; 3]; 3];
+    let mut c = 0;
+    while c < 3 {
+        let mut i = 0;
+        while i < 16 {
+            let byte = 3 * i + c;
+            masks[c][byte / 16][i] = (byte % 16) as u8;
+            i += 1;
+        }
+        c += 1;
+    }
+    masks
+};
 
 #[cfg(test)]
 mod tests;

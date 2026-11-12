@@ -105,7 +105,7 @@ pub(crate) use predictor::{
     GradPackInteriorFn, GradientScratch, pack_gradient_row, selected_grad_pack_interior_fn,
 };
 pub(crate) use predictor::{PredictorNeighbors, predictor_value};
-pub(crate) use rct::forward_ycocg;
+pub(crate) use rct::{forward_ycocg, row_kernels as rct_simd};
 pub(crate) use squeeze::{GlobalPlaneTree, PlaneTreeBudget, StreamCrop, learn_global_plane_tree};
 
 /// The modular coding primitives [`crate::lossy_modular`] builds on: group
@@ -130,7 +130,6 @@ pub(crate) mod kit {
         PREDICTOR_GRADIENT, SqueezePredictorCost, channel_to_context, choose_predictor_for_rows,
         fixed_predictor, selected_grad_pack_interior_fn, tokenize_plane_rows,
     };
-    pub(crate) use super::rct::forward_ycocg;
     pub(crate) use super::squeeze::{
         GlobalPlaneTree, for_each_squeeze_group_crop, write_modular_transforms_rct_squeeze,
         write_modular_transforms_squeeze_only, write_modular_transforms_squeeze_palette,
@@ -141,8 +140,8 @@ pub(crate) mod kit {
 #[cfg(feature = "splines")]
 pub(crate) use xyb::encode_modular_xyb_atlas_tree_slot;
 pub(crate) use xyb::{
-    encode_frame_lossless_layer, encode_frame_lossless_xyb_ink, encode_modular_xyb_atlas,
-    encode_modular_xyb_atlas_ints, encode_modular_xyb_atlas_tree,
+    encode_frame_lossless_layer, encode_frame_lossless_xyb_crop, encode_frame_lossless_xyb_ink,
+    encode_modular_xyb_atlas, encode_modular_xyb_atlas_ints, encode_modular_xyb_atlas_tree,
 };
 
 use crate::encode_image::AlphaPlane;

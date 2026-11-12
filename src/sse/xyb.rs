@@ -120,25 +120,35 @@ unsafe fn to_linear_rows<const N: usize>(
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn halley_cbrt_sse41(x: __m128, a: __m128) -> __m128 {
+fn halley_cbrt_sse41<const SCALAR_ORDER: bool>(x: __m128, a: __m128) -> __m128 {
     let tx = _mm_mul_ps(_mm_mul_ps(x, x), x);
     let two = _mm_set1_ps(2.0);
     let num = _mm_add_ps(tx, _mm_mul_ps(a, two));
     let den = _mm_add_ps(a, _mm_mul_ps(tx, two));
 
-    _mm_mul_ps(x, _mm_div_ps(num, den))
+    if SCALAR_ORDER {
+        _mm_div_ps(_mm_mul_ps(x, num), den)
+    } else {
+        _mm_mul_ps(x, _mm_div_ps(num, den))
+    }
 }
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn integer_pow_1_3_sse41(hx: __m128i) -> __m128i {
-    let scale = _mm_set1_epi32(341);
+fn integer_pow_1_3_sse41<const SCALAR_ORDER: bool>(hx: __m128i) -> __m128i {
+    let scale = _mm_set1_epi32(if SCALAR_ORDER {
+        0xaaaa_aaabu32 as i32
+    } else {
+        341
+    });
     let even64 = _mm_mul_epu32(hx, scale);
-    let even = _mm_srli_epi64::<10>(even64);
-
-    let odd_src = _mm_srli_epi64::<32>(hx);
-    let odd64 = _mm_mul_epu32(odd_src, scale);
-    let odd = _mm_slli_epi64::<32>(_mm_srli_epi64::<10>(odd64));
+    let odd64 = _mm_mul_epu32(_mm_srli_epi64::<32>(hx), scale);
+    let (even, odd) = if SCALAR_ORDER {
+        (_mm_srli_epi64::<33>(even64), _mm_srli_epi64::<33>(odd64))
+    } else {
+        (_mm_srli_epi64::<10>(even64), _mm_srli_epi64::<10>(odd64))
+    };
+    let odd = _mm_slli_epi64::<32>(odd);
 
     // even: [r0, 0,  r2, 0]
     // odd:  [0,  r1, 0,  r3]
@@ -148,11 +158,14 @@ fn integer_pow_1_3_sse41(hx: __m128i) -> __m128i {
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn cbrt_seed_positive_sse41(x: __m128) -> __m128 {
+fn cbrt_seed_positive_sse41<const SCALAR_ORDER: bool>(x: __m128) -> __m128 {
     let ui = _mm_castps_si128(x);
     let hx = _mm_and_si128(ui, _mm_set1_epi32(0x7fff_ffff));
 
-    let hx = _mm_add_epi32(integer_pow_1_3_sse41(hx), _mm_set1_epi32(709958130));
+    let hx = _mm_add_epi32(
+        integer_pow_1_3_sse41::<SCALAR_ORDER>(hx),
+        _mm_set1_epi32(709958130),
+    );
 
     _mm_castsi128_ps(hx)
 }
@@ -164,17 +177,27 @@ pub(crate) fn vcbrt_fast3_positive_sse41(
     a1: __m128,
     a2: __m128,
 ) -> (__m128, __m128, __m128) {
-    let mut x0 = cbrt_seed_positive_sse41(a0);
-    let mut x1 = cbrt_seed_positive_sse41(a1);
-    let mut x2 = cbrt_seed_positive_sse41(a2);
+    cbrt3_positive_sse41::<false>(a0, a1, a2)
+}
 
-    x0 = halley_cbrt_sse41(x0, a0);
-    x1 = halley_cbrt_sse41(x1, a1);
-    x2 = halley_cbrt_sse41(x2, a2);
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn cbrt3_positive_sse41<const SCALAR_ORDER: bool>(
+    a0: __m128,
+    a1: __m128,
+    a2: __m128,
+) -> (__m128, __m128, __m128) {
+    let mut x0 = cbrt_seed_positive_sse41::<SCALAR_ORDER>(a0);
+    let mut x1 = cbrt_seed_positive_sse41::<SCALAR_ORDER>(a1);
+    let mut x2 = cbrt_seed_positive_sse41::<SCALAR_ORDER>(a2);
 
-    x0 = halley_cbrt_sse41(x0, a0);
-    x1 = halley_cbrt_sse41(x1, a1);
-    x2 = halley_cbrt_sse41(x2, a2);
+    x0 = halley_cbrt_sse41::<SCALAR_ORDER>(x0, a0);
+    x1 = halley_cbrt_sse41::<SCALAR_ORDER>(x1, a1);
+    x2 = halley_cbrt_sse41::<SCALAR_ORDER>(x2, a2);
+
+    x0 = halley_cbrt_sse41::<SCALAR_ORDER>(x0, a0);
+    x1 = halley_cbrt_sse41::<SCALAR_ORDER>(x1, a1);
+    x2 = halley_cbrt_sse41::<SCALAR_ORDER>(x2, a2);
 
     let zero = _mm_setzero_ps();
     x0 = _mm_blendv_ps(x0, zero, _mm_cmpeq_ps(a0, zero));
@@ -186,7 +209,7 @@ pub(crate) fn vcbrt_fast3_positive_sse41(
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn rgb_to_xyb_f32x4_sse41(
+fn rgb_to_xyb_f32x4_sse41<const SCALAR_ORDER: bool>(
     m: &XybMatrix,
     r: __m128,
     g: __m128,
@@ -215,7 +238,7 @@ fn rgb_to_xyb_f32x4_sse41(
     mixed1 = _mm_max_ps(mixed1, zero);
     mixed2 = _mm_max_ps(mixed2, zero);
 
-    let (tm0, tm1, tm2) = vcbrt_fast3_positive_sse41(mixed0, mixed1, mixed2);
+    let (tm0, tm1, tm2) = cbrt3_positive_sse41::<SCALAR_ORDER>(mixed0, mixed1, mixed2);
 
     let neg_bias = _mm_set1_ps(NEG_BIAS_CBRT);
 
@@ -229,6 +252,49 @@ fn rgb_to_xyb_f32x4_sse41(
     let y = _mm_mul_ps(_mm_add_ps(tm0, tm1), half);
 
     (x, y, tm2)
+}
+
+/// Convert the complete SIMD vectors of the modular XYB lattice.
+#[cfg(not(target_feature = "fma"))]
+#[target_feature(enable = "sse4.1")]
+pub(crate) fn xyb_lattice_sse41(
+    m: &XybMatrix,
+    [r, g, b]: [&[f32]; 3],
+    [luma, co, cg]: [&mut [i32]; 3],
+) -> usize {
+    use super::quantize_xyb::round_ties_away_i32;
+    use crate::lossless::rct_simd::sse::forward_vec;
+    use crate::quant_weights::INV_DC_QUANT;
+
+    let [sx, sy, sb] = [
+        _mm_set1_ps(INV_DC_QUANT[0]),
+        _mm_set1_ps(INV_DC_QUANT[1]),
+        _mm_set1_ps(INV_DC_QUANT[2]),
+    ];
+    let r = r.as_chunks::<4>().0;
+    let g = g.as_chunks::<4>().0;
+    let b = b.as_chunks::<4>().0;
+    let luma = luma.as_chunks_mut::<4>().0;
+    let co = co.as_chunks_mut::<4>().0;
+    let cg = cg.as_chunks_mut::<4>().0;
+    for (((r, g), b), ((luma, co_out), cg_out)) in
+        r.iter().zip(g).zip(b).zip(luma.iter_mut().zip(co).zip(cg))
+    {
+        let r = unsafe { _mm_loadu_ps(r.as_ptr()) };
+        let g = unsafe { _mm_loadu_ps(g.as_ptr()) };
+        let b = unsafe { _mm_loadu_ps(b.as_ptr()) };
+        let (x, y, b) = rgb_to_xyb_f32x4_sse41::<true>(m, r, g, b);
+        let y = round_ties_away_i32(_mm_mul_ps(y, sy));
+        let x = round_ties_away_i32(_mm_mul_ps(x, sx));
+        let b_minus_y = _mm_sub_epi32(round_ties_away_i32(_mm_mul_ps(b, sb)), y);
+        let [luma_value, co, cg] = forward_vec(y, x, b_minus_y);
+        unsafe {
+            _mm_storeu_si128(luma.as_mut_ptr().cast(), luma_value);
+            _mm_storeu_si128(co_out.as_mut_ptr().cast(), co);
+            _mm_storeu_si128(cg_out.as_mut_ptr().cast(), cg);
+        }
+    }
+    r.len() * 4
 }
 
 /// Transform one row-band into separate output planes.
@@ -268,7 +334,7 @@ pub(crate) fn to_xyb_sse41_band(
             let g = unsafe { _mm_loadu_ps(g4.as_ptr()) };
             let b = unsafe { _mm_loadu_ps(b4.as_ptr()) };
 
-            let (xv, yv, bv) = rgb_to_xyb_f32x4_sse41(m, r, g, b);
+            let (xv, yv, bv) = rgb_to_xyb_f32x4_sse41::<false>(m, r, g, b);
 
             unsafe {
                 _mm_storeu_ps(x4.as_mut_ptr(), xv);
@@ -290,7 +356,7 @@ pub(crate) fn to_xyb_sse41_band(
             let g = unsafe { _mm_loadu_ps(g4.as_ptr()) };
             let b = unsafe { _mm_loadu_ps(b4.as_ptr()) };
 
-            let (xv, yv, bv) = rgb_to_xyb_f32x4_sse41(m, r, g, b);
+            let (xv, yv, bv) = rgb_to_xyb_f32x4_sse41::<false>(m, r, g, b);
 
             unsafe {
                 _mm_storeu_ps(r4.as_mut_ptr(), xv);

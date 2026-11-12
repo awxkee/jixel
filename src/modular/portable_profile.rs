@@ -777,8 +777,8 @@ mod tests {
     #[test]
     fn portable_tree_predicts_the_interior_exactly() {
         for (width, height) in [(1, 1), (1, 40), (40, 1), (2, 2), (37, 29), (256, 256)] {
-            let u: Vec<i32> = (0..width).map(|x| (x * x % 37) as i32 + 5).collect();
-            let v: Vec<i32> = (0..height).map(|y| (y * 7 % 11) as i32 + 30).collect();
+            let u: Vec<i32> = (0..width).map(|x| x * x % 37 + 5).collect();
+            let v: Vec<i32> = (0..height).map(|y| y * 7 % 11 + 30).collect();
             check(&u, &v);
             check(&v, &u);
         }
@@ -793,8 +793,8 @@ mod tests {
     fn portable_sections_cover_every_group() {
         let (width, height) = (513, 259);
         let profile: Vec<i32> = (0..2048).map(|x| (x * x / 31) % 256).collect();
-        let u: Vec<i32> = (0..width).map(|x| x as i32 / 2).collect();
-        let v: Vec<i32> = (0..height).map(|y| y as i32 * 3).collect();
+        let u: Vec<i32> = (0..width).map(|x| x / 2).collect();
+        let v: Vec<i32> = (0..height).map(|y| y * 3).collect();
         let mut scratch = CoderScratch::lossless();
         let pool = ThreadPool::new(2);
         let (global, ac) = encode(&pool, &profile, &u, &v, &mut scratch).unwrap();
@@ -805,7 +805,7 @@ mod tests {
         let mut frame = BitWriter::new();
         encode_frame(&pool, &profile, &u, &v, false, &mut scratch, &mut frame).unwrap();
         let split = global.bits_written() + ac.iter().map(BitWriter::bits_written).sum::<usize>();
-        assert!(frame.bits_written() % 8 == 0 && frame.bits_written() < split + 256);
+        assert!(frame.bits_written().is_multiple_of(8) && frame.bits_written() < split + 256);
         // With the second Palette the groups hold a tree and nothing else.
         let (u, v): (Vec<i32>, Vec<i32>) = (
             (0..2100).map(|x| x * x % 97).collect(),

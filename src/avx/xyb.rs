@@ -207,7 +207,7 @@ fn cbrt3_positive_avx2<const SCALAR_ORDER: bool>(
 }
 
 /// Scalar-order mode preserves the classifier's seed and operation order.
-/// Both modes always use FMA, including in generic x86 builds.
+/// Both modes use FMA.
 #[inline]
 #[target_feature(enable = "avx2,fma")]
 pub(super) fn rgb_to_xyb_f32x8_avx2<const SCALAR_ORDER: bool>(
@@ -261,6 +261,55 @@ fn tail_mask_avx2(len: usize) -> __m256i {
         _mm256_set1_epi32(len as i32),
         _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
     )
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn xyb_lattice_vec(
+    m: &XybMatrix,
+    [r, g, b]: [__m256; 3],
+    [sx, sy, sb]: [__m256; 3],
+) -> [__m256i; 3] {
+    use super::quantize_xyb::round_ties_away_i32;
+    use crate::lossless::rct_simd::avx::forward_vec;
+
+    let (x, y, b) = rgb_to_xyb_f32x8_avx2::<true>(m, r, g, b);
+    let y = round_ties_away_i32(_mm256_mul_ps(y, sy));
+    let x = round_ties_away_i32(_mm256_mul_ps(x, sx));
+    let b_minus_y = _mm256_sub_epi32(round_ties_away_i32(_mm256_mul_ps(b, sb)), y);
+    forward_vec(y, x, b_minus_y)
+}
+
+/// Mask the tail so every pixel uses the same FMA arithmetic.
+/// The input and output planes must have equal lengths.
+#[target_feature(enable = "avx2,fma")]
+pub(crate) unsafe fn xyb_lattice_avx2(
+    m: &XybMatrix,
+    input: [&[f32]; 3],
+    output: [&mut [i32]; 3],
+) -> usize {
+    use crate::quant_weights::INV_DC_QUANT;
+
+    let scales = INV_DC_QUANT.map(|scale| _mm256_set1_ps(scale));
+    let len = input[0].len();
+    let end = len / 8 * 8;
+    let output = output.map(|p| p.as_mut_ptr());
+    for i in (0..end).step_by(8) {
+        let rgb = input.map(|p| unsafe { _mm256_loadu_ps(p.as_ptr().add(i)) });
+        let values = xyb_lattice_vec(m, rgb, scales);
+        for (p, value) in output.into_iter().zip(values) {
+            unsafe { _mm256_storeu_si256(p.add(i).cast(), value) };
+        }
+    }
+    if end < len {
+        let mask = tail_mask_avx2(len - end);
+        let rgb = input.map(|p| unsafe { _mm256_maskload_ps(p.as_ptr().add(end), mask) });
+        let values = xyb_lattice_vec(m, rgb, scales);
+        for (p, value) in output.into_iter().zip(values) {
+            unsafe { _mm256_maskstore_epi32(p.add(end), mask, value) };
+        }
+    }
+    len
 }
 
 /// Transform one row-band into separate output planes.

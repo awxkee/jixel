@@ -1083,7 +1083,11 @@ mod tests {
                 let i = next(&mut seed) as usize % pairs;
                 let (cx, cy) = lv[j].l.res_xy(line, i);
                 let ri = cy * lv[j].res_w + cx;
-                let step = if next(&mut seed) % 2 == 0 { 1 } else { -1 };
+                let step = if next(&mut seed).is_multiple_of(2) {
+                    1
+                } else {
+                    -1
+                };
                 lv[j].div[ri] += step;
                 lv[j].res[ri] = i64::from(lv[j].div[ri]) * lv[j].q;
                 log.clear();
@@ -1167,7 +1171,12 @@ mod tests {
                 let i = next(&mut seed) as usize % level.l.pairs;
                 let ri = level.l.res_index(line, i);
                 let old = level.div[ri];
-                let target = old + if next(&mut seed) % 2 == 0 { 1 } else { -1 };
+                let target = old
+                    + if next(&mut seed).is_multiple_of(2) {
+                        1
+                    } else {
+                        -1
+                    };
                 level.div[ri] = target;
                 level.res[ri] = i64::from(target) * level.q;
                 let stored = level.stored;

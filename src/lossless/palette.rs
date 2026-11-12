@@ -84,7 +84,7 @@ use super::lz77::{
     write_lz_section,
 };
 use super::predictor::{GradPackInteriorFn, choose_predictor_for_rows, fixed_predictor};
-use super::rct::inverse_ycocg;
+use super::rct::selected_rct_row_fn;
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
@@ -179,41 +179,44 @@ fn visit_palette_colors<const RGB: bool>(
     if w == 0 || h == 0 {
         return true;
     }
-    let plane0 = linear.plane_data(0);
-    let plane1 = linear.plane_data(1);
-    let plane2 = linear.plane_data(2);
+    const RGB_BLOCK: usize = 128;
+    let block = if RGB { RGB_BLOCK } else { w };
+    let inverse = RGB.then(selected_rct_row_fn);
+    let mut rgb = [[0; RGB_BLOCK]; 3];
+    let planes = [0, 1, 2].map(|c| linear.plane_data(c));
     for y in y0..y0 + h {
-        let start = y * stride + x0;
-        let row0 = &plane0[start..][..w];
-        let row1 = &plane1[start..][..w];
-        let row2 = &plane2[start..][..w];
-        let mut colors = row0.iter().zip(row1).zip(row2).map(|((&a, &b), &c)| {
-            let (a, b, c) = if RGB {
-                inverse_ycocg(a, b, c)
+        for offset in (0..w).step_by(block) {
+            let start = y * stride + x0 + offset;
+            let len = (w - offset).min(block);
+            let range = start..start + len;
+            let src = planes.map(|p| &p[range.clone()]);
+            let [r, g, b] = if let Some(inverse) = inverse {
+                inverse(src, 0, rgb.each_mut().map(|p| &mut p[..len]));
+                rgb.each_ref().map(|p| &p[..len])
             } else {
-                (a, b, c)
+                src
             };
-            [a, b, c, 0]
-        });
-        let complete = match alpha {
-            None => colors.all(&mut visit),
-            Some(AlphaPlane::U8(data)) => colors.zip(&data[start..][..w]).all(|(mut c, &a)| {
-                c[3] = a as i32;
-                visit(c)
-            }),
-            Some(AlphaPlane::U16 { data, .. }) => {
-                colors.zip(&data[start..][..w]).all(|(mut c, &a)| {
-                    c[3] = a as i32;
+            let mut colors = r.iter().zip(g).zip(b).map(|((&r, &g), &b)| [r, g, b, 0]);
+            let complete = match alpha {
+                None => colors.all(&mut visit),
+                Some(AlphaPlane::U8(data)) => colors.zip(&data[range]).all(|(mut c, &a)| {
+                    c[3] = i32::from(a);
                     visit(c)
-                })
+                }),
+                Some(AlphaPlane::U16 { data, .. }) => {
+                    colors.zip(&data[range]).all(|(mut c, &a)| {
+                        c[3] = i32::from(a);
+                        visit(c)
+                    })
+                }
+                Some(AlphaPlane::F32(data)) => colors.zip(&data[range]).all(|(mut c, &a)| {
+                    c[3] = a;
+                    visit(c)
+                }),
+            };
+            if !complete {
+                return false;
             }
-            Some(AlphaPlane::F32(data)) => colors.zip(&data[start..][..w]).all(|(mut c, &a)| {
-                c[3] = a;
-                visit(c)
-            }),
-        };
-        if !complete {
-            return false;
         }
     }
     true
