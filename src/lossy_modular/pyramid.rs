@@ -164,23 +164,7 @@ impl Pyramid {
         let chroma_pre = steps.len() >= 2 && !steps[0].in_place;
 
         // XYB floats onto the integer lattice, stored as [Y, X, B-Y].
-        let n = xsize * ysize;
-        let input = [
-            &xyb.plane_data(0)[..n],
-            &xyb.plane_data(1)[..n],
-            &xyb.plane_data(2)[..n],
-        ];
-        let mut planes = [vec![0i32; n], vec![0i32; n], vec![0i32; n]];
-        {
-            let [dst_y, dst_x, dst_b] = &mut planes;
-            unsafe {
-                crate::xyb::selected_quantize_xyb_channels_fn()(
-                    input,
-                    [dst_y, dst_x, dst_b],
-                    XYB_SCALE,
-                );
-            }
-        }
+        let planes = crate::xyb::quantize_xyb_channels_with_scales(xyb, XYB_SCALE);
         let mut channels = full_size_channels(planes.into_iter(), xsize, ysize);
         for s in &steps {
             apply_step_forward(&mut channels, s);

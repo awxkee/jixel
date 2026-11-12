@@ -43,6 +43,7 @@
 //! slack 1.0 loses quality and an unbounded budget changes almost nothing.
 
 use super::*;
+use crate::util::heap_array;
 
 mod compact;
 
@@ -1355,10 +1356,10 @@ struct SmallPlanner {
 impl Default for SmallPlanner {
     fn default() -> Self {
         Self {
-            cost: Box::new([f32::INFINITY; SMALL_STATES]),
-            next: Box::new([f32::INFINITY; SMALL_STATES]),
-            active: Box::new([0; SMALL_STATES]),
-            next_active: Box::new([0; SMALL_STATES]),
+            cost: heap_array(f32::INFINITY),
+            next: heap_array(f32::INFINITY),
+            active: heap_array(0),
+            next_active: heap_array(0),
             active_len: 0,
             parents: Vec::new(),
             plan: Vec::new(),

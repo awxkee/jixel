@@ -31,6 +31,7 @@
 //! statistics select the colors before encoding, and the union is inpainted
 //! once so the encoder writes one VarDCT base and one modular ink frame.
 
+use crate::adaptive_quant::dirty_log2p1f;
 use crate::thread_pool::ThreadPool;
 use crate::util::round_i32;
 
@@ -95,6 +96,38 @@ pub(crate) struct InkLayers {
     /// The strokes are mostly band or small components: text, which
     /// repeated-glyph patches may code better.
     pub(crate) glyph_text: bool,
+    /// Share of 8x8 blocks with photographic texture (see
+    /// [`textured_share`]); set by [`InkCandidates::select`].
+    pub(crate) textured: f32,
+}
+
+/// Distinct luma levels that make an 8x8 block photographic: flat fills,
+/// anti-aliased strokes and gradients across one block stay below it.
+const TEXTURED_BLOCK_LEVELS: u32 = 12;
+
+/// Share of whole 8x8 blocks holding at least [`TEXTURED_BLOCK_LEVELS`]
+/// distinct luma values.
+pub(crate) fn textured_share(rgb: &[[u8; 3]], width: usize, height: usize) -> f32 {
+    let (bw, bh) = (width / 8, height / 8);
+    if bw == 0 || bh == 0 {
+        return 0.0;
+    }
+    let mut textured = 0usize;
+    for by in 0..bh {
+        for bx in 0..bw {
+            let mut seen = [0u64; 4];
+            for y in by * 8..by * 8 + 8 {
+                for &[r, g, b] in &rgb[y * width + bx * 8..y * width + bx * 8 + 8] {
+                    let l = (77 * r as u32 + 150 * g as u32 + 29 * b as u32) >> 8;
+                    seen[(l >> 6) as usize] |= 1 << (l & 63);
+                }
+            }
+            if seen.iter().map(|w| w.count_ones()).sum::<u32>() >= TEXTURED_BLOCK_LEVELS {
+                textured += 1;
+            }
+        }
+    }
+    textured as f32 / (bw * bh) as f32
 }
 
 const UNGROWN: u8 = 1;
@@ -220,7 +253,7 @@ impl<'a> InkCandidates<'a> {
         if plans.is_empty() {
             return None;
         }
-        joint_split(
+        let mut layers = joint_split(
             self.rgb,
             self.alpha,
             self.width,
@@ -231,7 +264,9 @@ impl<'a> InkCandidates<'a> {
             &plans,
             distance,
             pool,
-        )
+        )?;
+        layers.textured = textured_share(self.rgb, self.width, self.height);
+        Some(layers)
     }
 }
 
@@ -314,7 +349,10 @@ fn joint_split(
     let num_bands = height.div_ceil(rows);
     let precision = (distance / INK_PRECISION_DISTANCE).min(1.0).powi(2);
     queue.clear();
-    let mut buckets = vec![0u32; 32 * 32 * 32];
+    let mut buckets: Box<[u32; 32 * 32 * 32]> = vec![0u32; 32 * 32 * 32]
+        .into_boxed_slice()
+        .try_into()
+        .ok()?;
     for (k, plan) in plans.iter().enumerate() {
         let radius = if plan.local {
             LOCAL_TOL - 1
@@ -340,7 +378,7 @@ fn joint_split(
         let start = b * rows * width;
         for (o, s) in states.iter_mut().enumerate() {
             let i = start + o;
-            classify_pixel(rgb, alpha, &*thin, plans, &buckets, i, s, seeds);
+            classify_pixel(rgb, alpha, &*thin, plans, buckets.as_slice(), i, s, seeds);
         }
     });
     // Strokes are 8-connected: a one-pixel diagonal touches only by corner.
@@ -416,7 +454,7 @@ fn joint_split(
     let mut components = vec![0usize; plans.len()];
     // Squared error of drawing the strokes in the flat ink color.
     let mut squares = vec![0u64; plans.len()];
-    // Components are labelled per band, joined across the band borders
+    // Components are labeled per band, joined across the band borders
     // with a union-find, and judged by their totals: the sizes and squares
     // are integer sums, so this is what one raster-order flood found.
     let mut labels = vec![0u32; n];
@@ -575,7 +613,7 @@ fn joint_split(
     // Whether the strokes are ink is a property of the image, not of the
     // distance: the edge costs are those of distance 1, and the coverage
     // precision follows the distance later.
-    let costs: [f32; 256] = std::array::from_fn(|v| (1.0 + v as f32 / 4.0).log2());
+    let costs: [f32; 256] = std::array::from_fn(|v| dirty_log2p1f(v as f32 * 0.25));
     // Edge terms are found in bands and summed in raster order, as one
     // serial pass would.
     let state_ref: &[u8] = state;
@@ -927,6 +965,7 @@ fn joint_split(
         ink,
         coverage,
         glyph_text,
+        textured: 0.0,
     })
 }
 
@@ -1210,7 +1249,7 @@ fn fill_dont_care_with_iters(
 }
 
 /// One Jacobi pass over a band's free rows. `own` holds image rows `y0..`
-/// through the band's last row; `above`/`below` are the rows around it.
+/// through the band's last row; `above`/`below` are the surrounding rows.
 /// Each row's writes wait until the next free row has been read, so a 3x3
 /// stencil only sees the previous iteration's values.
 #[allow(clippy::too_many_arguments)]
@@ -1284,7 +1323,7 @@ fn diffuse_band(
 }
 
 pub(crate) fn ridge_positions(x: usize, y: usize, w: usize, h: usize) -> [usize; 5] {
-    const R: usize = crate::ink_layer::FEATURE_RADIUS;
+    const R: usize = FEATURE_RADIUS;
     let left = x.saturating_sub(R);
     let right = (x + R).min(w - 1);
     let above = y.saturating_sub(R);
@@ -1383,8 +1422,34 @@ pub(crate) fn ridge_row_scalar(
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
+
+    #[test]
+    fn textured_share_separates_flat_art_from_photo_texture() {
+        let (w, h) = (64, 32);
+        // Flat fill with an anti-aliased diagonal stroke: few levels per block.
+        let art: Vec<[u8; 3]> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let d = (x as i32 - 2 * y as i32).unsigned_abs().min(3);
+                [[30, 30, 30], [90, 90, 90], [170, 170, 170], [240, 240, 240]][d as usize]
+            })
+            .collect();
+        assert_eq!(textured_share(&art, w, h), 0.0);
+        // Hash noise: every block has dozens of distinct luma levels.
+        let photo: Vec<[u8; 3]> = (0..w * h)
+            .map(|i| {
+                let v = ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8;
+                [v, v.wrapping_add(17), v.wrapping_mul(3)]
+            })
+            .collect();
+        assert_eq!(textured_share(&photo, w, h), 1.0);
+        // Left half photo, right half art.
+        let half: Vec<[u8; 3]> = (0..w * h)
+            .map(|i| if i % w < w / 2 { photo[i] } else { art[i] })
+            .collect();
+        assert_eq!(textured_share(&half, w, h), 0.5);
+    }
 
     #[test]
     fn slightly_varying_ink_is_lifted_at_high_quality_but_not_near_lossless() {
