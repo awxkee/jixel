@@ -50,7 +50,8 @@ mod compact;
 const TILE: usize = 8;
 const SIDE: usize = TILE;
 const CACHE_SIZE: usize = crate::dc_group_data::NUM_STRATEGIES * TILE * TILE;
-const REGION_COUNT: usize = SIDE * SIDE * (SIDE + 1) * (SIDE + 1);
+const AXIS_INTERVALS: usize = SIDE * (SIDE + 1) / 2;
+const REGION_COUNT: usize = AXIS_INTERVALS * AXIS_INTERVALS;
 const LINE_COUNT: usize = SIDE * (SIDE + 1) * (SIDE + 1);
 /// The 400 grid placements plus at most two incumbent 64-family blocks.
 const MAX_CANDIDATES: usize = 402;
@@ -306,7 +307,10 @@ struct PlannerScratch {
 }
 
 fn region_index(x: usize, y: usize, w: usize, h: usize) -> usize {
-    ((y * SIDE + x) * (SIDE + 1) + h) * (SIDE + 1) + w
+    // Group the nonempty intervals of each axis by length. The longer
+    // intervals have fewer valid origins and need no padding slots.
+    let axis = |origin, len| origin + (len - 1) * (2 * SIDE + 2 - len) / 2;
+    axis(y, h) * AXIS_INTERVALS + axis(x, w)
 }
 fn line_index(y: usize, start: usize, end: usize) -> usize {
     (y * (SIDE + 1) + start) * (SIDE + 1) + end
@@ -449,7 +453,7 @@ fn prepare_packing_bound(
     let objective = cells * cols;
     s.tableau.clear();
     s.tableau.resize(rows * cols, 0.0);
-    let mut basis: Vec<_> = (n..n + cells).collect();
+    let mut basis: [usize; SIDE * SIDE] = std::array::from_fn(|row| n + row);
     for (v, &(k, benefit)) in variables.iter().enumerate() {
         let c = candidates[k];
         for y in c.y()..c.y() + c.height {
@@ -466,8 +470,10 @@ fn prepare_packing_bound(
     for _ in 0..PIVOTS {
         let mut enter = None;
         let mut reduced = -1e-10;
-        for col in 0..cols - 1 {
-            let value = s.tableau[objective + col];
+        for (col, &value) in s.tableau[objective..objective + cols - 1]
+            .iter()
+            .enumerate()
+        {
             if value < reduced {
                 reduced = value;
                 enter = Some(col);
@@ -478,12 +484,12 @@ fn prepare_packing_bound(
         };
         let mut leave = None;
         let mut ratio = f64::INFINITY;
-        for row in 0..cells {
-            let a = s.tableau[row * cols + enter];
+        for (row, values) in s.tableau[..objective].chunks_exact(cols).enumerate() {
+            let a = values[enter];
             if a <= 1e-12 {
                 continue;
             }
-            let r = s.tableau[row * cols + cols - 1] / a;
+            let r = values[cols - 1] / a;
             if r < ratio - 1e-12
                 || ((r - ratio).abs() <= 1e-12 && leave.is_none_or(|old| basis[row] < basis[old]))
             {
@@ -504,16 +510,25 @@ fn prepare_packing_bound(
         }
         pivot_row[enter] = 1.0;
         let pivot_row = &*pivot_row;
-        for row in above
+        let mut changed = above
             .chunks_exact_mut(cols)
             .chain(below.chunks_exact_mut(cols))
-        {
+            .filter(|row| row[enter] != 0.0);
+        while let Some(row) = changed.next() {
             let factor = row[enter];
-            if factor == 0.0 {
-                continue;
-            }
-            for (v, &p) in row.iter_mut().zip(pivot_row) {
-                *v -= factor * p;
+            if let Some(next) = changed.next() {
+                // Both rows read the same immutable pivot. Loading it once
+                // preserves each element's multiply and subtraction.
+                let next_factor = next[enter];
+                for ((v, n), &p) in row.iter_mut().zip(next.iter_mut()).zip(pivot_row) {
+                    *v -= factor * p;
+                    *n -= next_factor * p;
+                }
+                next[enter] = 0.0;
+            } else {
+                for (v, &p) in row.iter_mut().zip(pivot_row) {
+                    *v -= factor * p;
+                }
             }
             row[enter] = 0.0;
         }
@@ -1375,15 +1390,71 @@ struct SmallCosts {
     square: [f32; SIDE * SIDE],
 }
 
-/// Returns the optimum and writes `(cell, choice)` per placed piece. `fixed`
-/// marks cells that are already covered (no cost, no piece).
+impl SmallCosts {
+    /// Prune pieces that cost at least as much as a tiling of the same cells
+    /// by smaller pieces.
+    fn live_masks(&self, w: usize, h: usize) -> [u8; SIDE * SIDE] {
+        let cells = w * h;
+        let mut live = [0; SIDE * SIDE];
+        if cells == 0 {
+            return live;
+        }
+
+        for (y, masks) in live[..cells].chunks_exact_mut(w).enumerate() {
+            let start = y * w;
+            let end = start + w;
+            let leaf = &self.leaf[start..end];
+            let wide = &self.wide[start..end];
+            if y + 1 == h {
+                for ((mask, &[left, right]), &wide) in
+                    masks.iter_mut().zip(leaf.array_windows::<2>()).zip(wide)
+                {
+                    *mask = u8::from(wide < left + right);
+                }
+                continue;
+            }
+
+            let leaf_below = &self.leaf[end..end + w];
+            let wide_below = &self.wide[end..end + w];
+            let tall = &self.tall[start..end];
+            let square = &self.square[start..end];
+            let leaves = leaf
+                .array_windows::<2>()
+                .zip(leaf_below.array_windows::<2>());
+            let interior = masks
+                .iter_mut()
+                .zip(leaves)
+                .zip(wide.iter().zip(wide_below))
+                .zip(tall.array_windows::<2>().zip(square));
+            for (((mask, leaves), (&wide, &wide_below)), (&[tall, tall_right], &square)) in interior
+            {
+                let (&[top_left, top_right], &[bottom_left, bottom_right]) = leaves;
+                let top_leaves = top_left + top_right;
+                let leaves = top_leaves + bottom_left + bottom_right;
+                let wides = wide + wide_below;
+                let talls = tall + tall_right;
+                *mask = u8::from(wide < top_leaves)
+                    | u8::from(tall < top_left + bottom_left) << 1
+                    | u8::from(square < leaves.min(wides).min(talls)) << 2;
+            }
+
+            // The windows stop before the right edge, where only a tall piece fits.
+            let right = w - 1;
+            masks[right] = u8::from(tall[right] < leaf[right] + leaf_below[right]) << 1;
+        }
+        live
+    }
+}
+
+/// Returns the optimum. If it beats `replace_below`, save the placed pieces
+/// in the scratch plan. `fixed` marks cells that are already covered.
 fn plan_small(
     costs: &SmallCosts,
+    live: &[u8; SIDE * SIDE],
     fixed: u64,
-    w: usize,
-    h: usize,
+    [w, h]: [usize; 2],
     s: &mut SmallPlanner,
-    out: &mut Vec<(usize, u16)>,
+    replace_below: f32,
 ) -> f32 {
     let cells = w * h;
     let bit = |cell: usize| -> usize {
@@ -1393,25 +1464,6 @@ fn plan_small(
             0
         }
     };
-    // A piece that costs at least as much as some tiling of its own cells by
-    // smaller pieces is never needed: every layout using it has a cheaper
-    // or equal twin. Such pieces open no states.
-    let mut live = [0u8; SIDE * SIDE];
-    for i in 0..cells {
-        let (x, y) = (i % w, i / w);
-        let right = x + 1 < w;
-        let below = y + 1 < h;
-        let wide = right && costs.wide[i] < costs.leaf[i] + costs.leaf[i + 1];
-        let tall = below && costs.tall[i] < costs.leaf[i] + costs.leaf[i + w];
-        let square = right && below && {
-            let leaves =
-                costs.leaf[i] + costs.leaf[i + 1] + costs.leaf[i + w] + costs.leaf[i + w + 1];
-            let wides = costs.wide[i] + costs.wide[i + w];
-            let talls = costs.tall[i] + costs.tall[i + 1];
-            costs.square[i] < leaves.min(wides).min(talls)
-        };
-        live[i] = u8::from(wide) | u8::from(tall) << 1 | u8::from(square) << 2;
-    }
     if s.parents.len() < cells {
         s.parents.resize(cells, [0; SMALL_PARENTS]);
     }
@@ -1477,14 +1529,14 @@ fn plan_small(
         std::mem::swap(active, next_active);
         *active_len = next_len;
     }
-    out.clear();
     let total = s.cost[0];
     for &state in &s.active[..s.active_len] {
         s.cost[state as usize & STATE_MASK] = f32::INFINITY;
     }
-    if !total.is_finite() {
+    if !(total.is_finite() && total < replace_below) {
         return total;
     }
+    s.plan.clear();
     let mut state = 0u16;
     for i in (0..cells).rev() {
         // Every reached predecessor was written during this plan. Unreached
@@ -1492,7 +1544,7 @@ fn plan_small(
         let from = s.parents[i][state as usize & (SMALL_PARENTS - 1) & ((1 << (w + 1)) - 1)];
         let choice = from & 7;
         if choice != SMALL_PREFILLED {
-            out.push((i, choice));
+            s.plan.push((i, choice));
         }
         state = from >> 3;
     }
@@ -1623,31 +1675,37 @@ fn search_tile_coefficient(
         fixed_cost += scores.score(coder, cache, p);
     }
     let mut layout = std::mem::take(&mut cache.layout);
-    let mut small = std::mem::take(&mut cache.small);
-    let mut plan_out = std::mem::take(&mut small.plan);
+    let live = costs.live_masks(width, height);
     let around = plan_small(
         &costs,
+        &live,
         fixed | blocked,
-        width,
-        height,
-        &mut small,
-        &mut plan_out,
+        [width, height],
+        &mut cache.small,
+        f32::INFINITY,
     ) + fixed_cost;
     layout.clear();
     let mut keep_fixed = true;
     let mut winner = around;
     if fixed != 0 {
-        let mut over_out = Vec::new();
-        let over = plan_small(&costs, blocked, width, height, &mut small, &mut over_out);
+        let over = plan_small(
+            &costs,
+            &live,
+            blocked,
+            [width, height],
+            &mut cache.small,
+            around,
+        );
         if over < around {
             winner = over;
             keep_fixed = false;
-            plan_out = over_out;
         }
     }
     if winner.is_finite() {
         layout.extend(
-            plan_out
+            cache
+                .small
+                .plan
                 .iter()
                 .map(|&(i, choice)| Piece::new(i % width, i / width, small_strategy(choice))),
         );
@@ -1691,8 +1749,6 @@ fn search_tile_coefficient(
         }
     }
     accepted.extend_from_slice(&cache.best);
-    small.plan = plan_out;
-    cache.small = small;
     cache.current = current;
     cache.layout = layout;
 }
@@ -2303,7 +2359,6 @@ mod tests {
     #[test]
     fn small_planner_matches_exhaustive_tilings_around_fixed_cells() {
         let mut s = SmallPlanner::default();
-        let mut out = Vec::new();
         let mut seed = 7u32;
         let mut rnd = || {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -2331,14 +2386,15 @@ mod tests {
                         .fold(0u64, |m, i| m | 1 << i)
                 };
                 let expected = small_enumerate(&costs, fixed, w, h, 0);
-                let actual = plan_small(&costs, fixed, w, h, &mut s, &mut out);
+                let live = costs.live_masks(w, h);
+                let actual = plan_small(&costs, &live, fixed, [w, h], &mut s, f32::INFINITY);
                 assert!(
                     (actual - expected).abs() <= 1e-4 * expected,
                     "{w}x{h}: {actual} vs {expected}"
                 );
                 let mut covered = fixed;
                 let mut total = 0.0;
-                for &(i, choice) in &out {
+                for &(i, choice) in &s.plan {
                     let p = Piece::new(i % w, i / w, small_strategy(choice));
                     total += match choice {
                         SMALL_LEAF => costs.leaf[i],
@@ -2364,23 +2420,32 @@ mod tests {
         // Uniform costs where every 2x2 square beats its parts: the optimum is
         // sixteen aligned squares, a nonslicing-free check of the full state space.
         let mut s = SmallPlanner::default();
-        let mut out = Vec::new();
         let costs = SmallCosts {
             leaf: [4.0; SIDE * SIDE],
             wide: [7.5; SIDE * SIDE],
             tall: [7.5; SIDE * SIDE],
             square: [13.0; SIDE * SIDE],
         };
-        assert_eq!(plan_small(&costs, 0, 8, 8, &mut s, &mut out), 16.0 * 13.0);
-        assert_eq!(out.len(), 16);
-        assert!(out.iter().all(|&(_, c)| c == SMALL_SQUARE));
+        let live = costs.live_masks(8, 8);
+        assert_eq!(
+            plan_small(&costs, &live, 0, [8, 8], &mut s, f32::INFINITY),
+            16.0 * 13.0
+        );
+        assert_eq!(s.plan.len(), 16);
+        assert!(s.plan.iter().all(|&(_, c)| c == SMALL_SQUARE));
         // With the top-left 4x4 fixed, the rest still tiles with squares.
         let fixed = (0..4).fold(0u64, |m, y| m | 0b1111 << (y * 8));
         assert_eq!(
-            plan_small(&costs, fixed, 8, 8, &mut s, &mut out),
+            plan_small(&costs, &live, fixed, [8, 8], &mut s, f32::INFINITY),
             12.0 * 13.0
         );
-        assert_eq!(out.len(), 12);
+        assert_eq!(s.plan.len(), 12);
+        // A cost tie leaves the previous layout in place.
+        assert_eq!(
+            plan_small(&costs, &live, 0, [8, 8], &mut s, 16.0 * 13.0),
+            16.0 * 13.0
+        );
+        assert_eq!(s.plan.len(), 12);
     }
 
     #[test]

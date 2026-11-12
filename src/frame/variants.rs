@@ -39,8 +39,12 @@ use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
-use crate::patches::{MODULAR_PATCH_REF_ID, PATCH_REF_ID, VarDctFrameKind};
+use crate::patches::{
+    EpfPatchAtlases, GlyphAtlasLuma, MODULAR_PATCH_REF_ID, PATCH_REF_ID, VarDctFrameKind,
+};
 use crate::util::EncodeError;
+use std::borrow::Cow;
+use std::sync::Arc;
 
 /// The kAdd and kMul lattice arms of a frame whose luma repeats on an integer
 /// lattice; both race the tile/glyph plans on estimated bits.
@@ -78,6 +82,7 @@ pub(super) fn lattice_variants(
                 prefix,
                 base,
                 references,
+                epf_atlases: None,
                 #[cfg(feature = "splines")]
                 splines: None,
                 tiles_touched: false,
@@ -130,10 +135,12 @@ pub(super) struct SplineStage<'a> {
 
 /// A frame's glyph patches and their coded atlas. Every variant of the
 /// patch race starts from the same glyphs, so they are found and coded once.
+#[derive(Clone)]
 pub(super) struct GlyphStage {
     atlas: BitWriter,
     base: Image3F,
     references: Vec<crate::patches::PatchReference>,
+    luma: Option<Arc<GlyphAtlasLuma>>,
 }
 
 impl GlyphStage {
@@ -144,6 +151,7 @@ impl GlyphStage {
         xyb: &Image3F,
         alpha: Option<&AlphaPlane>,
         free_singles: bool,
+        retain_epf_luma: bool,
     ) -> Option<Self> {
         let coarse = if distance < 1.5 {
             1
@@ -158,6 +166,8 @@ impl GlyphStage {
             ctx,
             xyb,
             &crate::patches::GlyphParams {
+                templates: ctx.glyph_templates
+                    && matches!(alpha, Some(crate::encode_image::AlphaPlane::U8(_))),
                 min_occurrences: 1,
                 min_repeat_pixels: if free_singles {
                     0
@@ -174,21 +184,46 @@ impl GlyphStage {
             },
         )?;
         let mut atlas = BitWriter::new();
-        let atlas_alpha = zero_alpha_for_lossy(alpha, plan.atlas_width * plan.atlas_height);
+        // Template coverage rides in the atlas alpha; kAdd entries leave it zero.
+        let coverage = match alpha {
+            Some(AlphaPlane::U8(_)) => plan.alpha_atlas.map(AlphaPlane::U8),
+            _ => None,
+        };
+        let zero_alpha;
+        let atlas_alpha = if let Some(coverage) = &coverage {
+            Some(coverage)
+        } else {
+            zero_alpha = zero_alpha_for_lossy(alpha, plan.atlas_width * plan.atlas_height);
+            zero_alpha.as_ref()
+        };
         crate::lossless::encode_modular_xyb_atlas_tree(
             &plan.atlas,
             plan.atlas_width,
             plan.atlas_height,
-            atlas_alpha.as_ref(),
+            atlas_alpha,
             ctx.speed,
             &ctx.thread_pool,
             scratch,
             &mut atlas,
         );
+        let luma = retain_epf_luma.then(|| {
+            let [samples, _, _] = plan.atlas;
+            Arc::new(GlyphAtlasLuma {
+                width: plan.atlas_width,
+                samples,
+                coverage: coverage.map(|plane| {
+                    let AlphaPlane::U8(samples) = plane else {
+                        unreachable!("glyph coverage is 8-bit")
+                    };
+                    samples
+                }),
+            })
+        });
         Some(Self {
             atlas,
             base: plan.base,
             references: plan.references,
+            luma,
         })
     }
 
@@ -210,16 +245,14 @@ pub(super) fn prepare_vardct_variant(
     scratch: &mut CoderScratch,
     distance: f32,
     distp: &DistanceParams,
-    xyb: Image3F,
+    #[allow(unused_mut)] mut xyb: Cow<'_, Image3F>,
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
     patches: bool,
-    glyphs: Option<&GlyphStage>,
+    glyphs: Option<Cow<'_, GlyphStage>>,
     tiles: bool,
     #[cfg(feature = "splines")] stage: Option<&SplineStage>,
 ) -> Result<PreparedVarDct, EncodeError> {
-    #[allow(unused_mut)]
-    let mut xyb = xyb;
     #[allow(unused_mut)]
     let mut tiles_touched = false;
     #[allow(unused_mut)]
@@ -250,19 +283,35 @@ pub(super) fn prepare_vardct_variant(
         0.0
     };
     if let Some(glyphs) = glyphs {
-        let mut patched_writer = glyphs.atlas.clone();
+        let (mut patched_writer, mut base, glyph_refs, luma) = match glyphs {
+            Cow::Borrowed(glyphs) => (
+                glyphs.atlas.clone(),
+                Cow::Borrowed(&glyphs.base),
+                Cow::Borrowed(glyphs.references.as_slice()),
+                glyphs.luma.clone(),
+            ),
+            Cow::Owned(glyphs) => (
+                glyphs.atlas,
+                Cow::Owned(glyphs.base),
+                Cow::Owned(glyphs.references),
+                glyphs.luma,
+            ),
+        };
 
         // Repeated tiles of what is left (icons, rules, UI chrome). They are
         // Replace entries and must precede the additive glyph entries, which
         // then land on top of the replaced rectangles.
-        let mut base = glyphs.base.clone();
         #[cfg(feature = "splines")]
         let early_splines = if before_tiles {
-            select_splines(scratch, &mut base, None)
+            select_splines(scratch, base.to_mut(), None)
         } else {
             None
         };
         let mut references: Vec<crate::patches::PatchReference> = Vec::new();
+        let mut epf_atlases = luma.map(|glyphs| EpfPatchAtlases {
+            glyphs,
+            tiles: None,
+        });
         if tiles {
             let tiles16 = crate::patches::find_lossy_patches_sized(
                 &base,
@@ -271,7 +320,7 @@ pub(super) fn prepare_vardct_variant(
                 &ctx.thread_pool,
                 scratch,
             );
-            let after16 = tiles16.as_ref().map_or(&base, |t| &t.base);
+            let after16 = tiles16.as_ref().map_or(base.as_ref(), |t| &t.base);
             let tiles8 = crate::patches::find_lossy_patch_groups_sized(
                 after16,
                 8,
@@ -297,7 +346,7 @@ pub(super) fn prepare_vardct_variant(
                     next_base = Some(t.base);
                 }
                 if let Some(groups8) = tiles8 {
-                    let residual = next_base.get_or_insert_with(|| base.clone());
+                    let residual = next_base.get_or_insert_with(|| base.as_ref().clone());
                     crate::patches::clear_patch_tiles(residual, 8, &groups8);
                     let (reused, groups8) =
                         crate::patches::reuse_tile_quadrants(&base, &tile_refs, groups8);
@@ -321,6 +370,9 @@ pub(super) fn prepare_vardct_variant(
                 );
                 let (atlas_w, atlas_h) = (tile_atlas.xsize(), tile_atlas.ysize());
                 let mut tile_atlas = tile_atlas;
+                if let Some(atlases) = epf_atlases.as_mut() {
+                    atlases.tiles = Some(tile_atlas.plane(1).clone());
+                }
                 let lattice = lattice_atlas(ctx, &tile_atlas, alpha.is_some(), scratch);
                 gaborize(&mut tile_atlas, &atlas_distp);
                 let mut vardct = BitWriter::new();
@@ -344,12 +396,17 @@ pub(super) fn prepare_vardct_variant(
                 )?;
                 patched_writer.append(&smaller_atlas(vardct, lattice));
                 references.extend(tile_refs);
-                base = next_base.expect("covered > 0");
+                base = Cow::Owned(next_base.expect("covered > 0"));
                 used_tiles = true;
             }
         }
         let atlas_bits = patched_writer.bits_written();
-        references.extend(glyphs.references.iter().cloned());
+        match glyph_refs {
+            Cow::Owned(glyph_refs) if references.is_empty() => references = glyph_refs,
+            Cow::Owned(glyph_refs) => references.extend(glyph_refs),
+            Cow::Borrowed(glyph_refs) => references.extend_from_slice(glyph_refs),
+        }
+        let mut base = base.into_owned();
 
         // Additive glyph entries commute with splines; Replace tiles cut from
         // the unsubtracted image must stay clear of them.
@@ -378,6 +435,7 @@ pub(super) fn prepare_vardct_variant(
             prefix: patched_writer,
             base,
             references,
+            epf_atlases,
             #[cfg(feature = "splines")]
             splines: base_splines,
             tiles_touched,
@@ -387,7 +445,7 @@ pub(super) fn prepare_vardct_variant(
         if distance >= GLYPH_CHECK_MIN_DISTANCE {
             let bits = prepared.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
             if atlas_bits as f64 > bits * GLYPH_CHECK_ATLAS_SHARE {
-                let mut regular = xyb;
+                let mut regular = xyb.into_owned();
                 #[cfg(feature = "splines")]
                 let regular_splines = select_splines(scratch, &mut regular, None);
                 gaborize(&mut regular, distp);
@@ -395,6 +453,7 @@ pub(super) fn prepare_vardct_variant(
                     prefix: BitWriter::new(),
                     base: regular,
                     references: Vec::new(),
+                    epf_atlases: None,
                     #[cfg(feature = "splines")]
                     splines: regular_splines,
                     tiles_touched,
@@ -414,7 +473,7 @@ pub(super) fn prepare_vardct_variant(
 
     #[cfg(feature = "splines")]
     let early_splines = if before_tiles {
-        select_splines(scratch, &mut xyb, None)
+        select_splines(scratch, xyb.to_mut(), None)
     } else {
         None
     };
@@ -428,7 +487,7 @@ pub(super) fn prepare_vardct_variant(
             &ctx.thread_pool,
             scratch,
         );
-        let after16 = plan16.as_ref().map_or(&xyb, |p| &p.base);
+        let after16 = plan16.as_ref().map_or(xyb.as_ref(), |p| &p.base);
         let tiles8 = crate::patches::find_lossy_patch_groups_sized(
             after16,
             8,
@@ -444,7 +503,7 @@ pub(super) fn prepare_vardct_variant(
             });
         (covered as f64 >= PATCH_TILE_MIN_COVER * (xyb.xsize() * xyb.ysize()) as f64).then(|| {
             let plan = plan16.unwrap_or_else(|| crate::patches::LossyPatches {
-                base: xyb.clone(),
+                base: xyb.as_ref().clone(),
                 groups: Vec::new(),
             });
             (plan, tiles8)
@@ -617,6 +676,7 @@ pub(super) fn prepare_vardct_variant(
             prefix: patched_writer,
             base,
             references,
+            epf_atlases: None,
             #[cfg(feature = "splines")]
             splines: base_splines,
             tiles_touched,
@@ -625,6 +685,7 @@ pub(super) fn prepare_vardct_variant(
         });
     }
 
+    let mut xyb = xyb.into_owned();
     #[cfg(feature = "splines")]
     let splines = if before_tiles {
         early_splines
@@ -636,6 +697,7 @@ pub(super) fn prepare_vardct_variant(
         prefix: BitWriter::new(),
         base: xyb,
         references: Vec::new(),
+        epf_atlases: None,
         #[cfg(feature = "splines")]
         splines,
         tiles_touched,
@@ -649,6 +711,7 @@ pub(super) struct PreparedVarDct {
     /// Selected splines/patches removed and inverse Gaborish already applied.
     base: Image3F,
     references: Vec<crate::patches::PatchReference>,
+    epf_atlases: Option<EpfPatchAtlases>,
     #[cfg(feature = "splines")]
     splines: Option<crate::splines::SplineSet>,
     #[cfg_attr(not(feature = "splines"), allow(dead_code))]
@@ -658,6 +721,33 @@ pub(super) struct PreparedVarDct {
 }
 
 impl PreparedVarDct {
+    pub(super) fn regular(base: Image3F) -> Self {
+        Self {
+            prefix: BitWriter::new(),
+            base,
+            references: Vec::new(),
+            epf_atlases: None,
+            #[cfg(feature = "splines")]
+            splines: None,
+            tiles_touched: false,
+            used_tiles: false,
+            estimated_bits: None,
+        }
+    }
+
+    /// Price a regular frame whose source has no spline or Gaborish changes.
+    pub(super) fn estimate_regular(
+        ctx: &EncodingContext,
+        scratch: &mut CoderScratch,
+        distance: f32,
+        source: &Image3F,
+        alpha: Option<&AlphaPlane>,
+        coeff_shifts: &[u32],
+    ) -> Result<f64, EncodeError> {
+        Ok(noise_estimate_bits(ctx)
+            + estimate_residual_bits(ctx, scratch, distance, source, alpha, coeff_shifts)?)
+    }
+
     #[cfg(feature = "splines")]
     pub(super) fn has_splines(&self) -> bool {
         self.splines.is_some()
@@ -720,7 +810,23 @@ impl PreparedVarDct {
     ) -> Result<(), EncodeError> {
         #[cfg(feature = "splines")]
         self.materialize_dots(ctx, scratch, alpha);
-        writer.append(&self.prefix);
+        let epf_atlases = self.epf_atlases.filter(|atlases| {
+            self.references.iter().all(|r| {
+                r.alpha_only
+                    || if r.mul {
+                        // Blend-above glyph templates: color and coverage in the glyph atlas.
+                        !r.add
+                            && r.ref_frame == MODULAR_PATCH_REF_ID
+                            && atlases.glyphs.coverage.is_some()
+                    } else if r.add {
+                        r.ref_frame == MODULAR_PATCH_REF_ID
+                    } else {
+                        r.ref_frame == PATCH_REF_ID && atlases.tiles.is_some()
+                    }
+            })
+        });
+        writer.append_bits(&self.prefix);
+        drop(self.prefix);
         encode_frame_core(
             ctx,
             scratch,
@@ -731,7 +837,7 @@ impl PreparedVarDct {
             if self.references.is_empty() {
                 VarDctFrameKind::Regular
             } else {
-                VarDctFrameKind::Patched(&self.references)
+                VarDctFrameKind::Patched(&self.references, epf_atlases.as_ref())
             },
             #[cfg(feature = "splines")]
             self.splines.as_ref(),
@@ -769,17 +875,20 @@ impl PreparedVarDct {
         if let Some(set) = &self.splines {
             crate::splines::write_splines(set, scratch, &mut extras);
         }
-        let noise_bits = if ctx.grain.enabled() {
-            crate::noise::NoiseParams::BITS as f64
-        } else {
-            0.0
-        };
         let bits = self.prefix.bits_written() as f64
             + extras.bits_written() as f64
-            + noise_bits
+            + noise_estimate_bits(ctx)
             + estimate_residual_bits(ctx, scratch, distance, &self.base, alpha, coeff_shifts)?;
         self.estimated_bits = Some(bits);
         Ok(bits)
+    }
+}
+
+fn noise_estimate_bits(ctx: &EncodingContext) -> f64 {
+    if ctx.grain.enabled() {
+        crate::noise::NoiseParams::BITS as f64
+    } else {
+        0.0
     }
 }
 
@@ -836,7 +945,14 @@ fn sample_vardct_residual(
     let count = columns * rows;
     let (sw, sh) = (tw * columns, th * rows);
     let mut sample = Image3F::new(sw, sh);
-    let mut indices = alpha.map(|_| vec![0usize; sw * sh]);
+    let mut sample_alpha = alpha.map(|alpha| match alpha {
+        AlphaPlane::U8(_) => AlphaPlane::U8(vec![0; sw * sh]),
+        AlphaPlane::U16 { bits, .. } => AlphaPlane::U16 {
+            data: vec![0; sw * sh],
+            bits: *bits,
+        },
+        AlphaPlane::F32(_) => AlphaPlane::F32(vec![0; sw * sh]),
+    });
     for i in 0..count {
         let cell = ((2 * i + 1) * cells / (2 * count)).min(cells - 1);
         let sx = ((cell % nx) * tw).min(w - tw);
@@ -847,21 +963,24 @@ fn sample_vardct_residual(
                 sample.plane_row_mut(c, dy + y)[dx..dx + tw]
                     .copy_from_slice(&source.plane_row(c, sy + y)[sx..sx + tw]);
             }
-            if let Some(indices) = &mut indices {
-                for x in 0..tw {
-                    indices[(dy + y) * sw + dx + x] = (sy + y) * w + sx + x;
+            if let Some((input, output)) = alpha.zip(sample_alpha.as_mut()) {
+                let src = (sy + y) * w + sx;
+                let dst = (dy + y) * sw + dx;
+                match (input, output) {
+                    (AlphaPlane::U8(input), AlphaPlane::U8(output)) => {
+                        output[dst..dst + tw].copy_from_slice(&input[src..src + tw]);
+                    }
+                    (AlphaPlane::U16 { data: input, .. }, AlphaPlane::U16 { data: output, .. }) => {
+                        output[dst..dst + tw].copy_from_slice(&input[src..src + tw]);
+                    }
+                    (AlphaPlane::F32(input), AlphaPlane::F32(output)) => {
+                        output[dst..dst + tw].copy_from_slice(&input[src..src + tw]);
+                    }
+                    _ => unreachable!("sample alpha uses the source format"),
                 }
             }
         }
     }
-    let sample_alpha = alpha.zip(indices).map(|(alpha, indices)| match alpha {
-        AlphaPlane::U8(data) => AlphaPlane::U8(indices.iter().map(|&i| data[i]).collect()),
-        AlphaPlane::U16 { data, bits } => AlphaPlane::U16 {
-            data: indices.iter().map(|&i| data[i]).collect(),
-            bits: *bits,
-        },
-        AlphaPlane::F32(data) => AlphaPlane::F32(indices.iter().map(|&i| data[i]).collect()),
-    });
     (sample, sample_alpha)
 }
 

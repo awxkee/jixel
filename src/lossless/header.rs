@@ -52,7 +52,7 @@ pub(crate) fn write_u64(value: u64, w: &mut BitWriter) {
     }
 }
 
-fn write_frame_dimension(value: usize, w: &mut BitWriter) {
+pub(crate) fn write_frame_dimension(value: usize, w: &mut BitWriter) {
     let value = value as u64;
     if value < 256 {
         w.write(2, 0);
@@ -463,12 +463,16 @@ fn patch_dictionary_tokens(references: &[PatchReference], has_alpha: bool) -> Ve
                 tokens.push(Token::new(PATCH_OFFSET, pack_signed(x as i32 - px as i32)));
                 tokens.push(Token::new(PATCH_OFFSET, pack_signed(y as i32 - py as i32)));
             }
-            // color = Mul (3), Add (2) or Replace (1); Mul also signals clamp = false
+            // color = BlendAbove (4), Mul (3), Add (2) or Replace (1); Mul and
+            // BlendAbove also signal clamp = false. BlendAbove takes the alpha
+            // of the only extra channel (glyph templates run on RGB + alpha).
             let alpha_only = reference.alpha_only;
             tokens.push(Token::new(
                 BLEND_MODE,
                 if alpha_only {
                     0
+                } else if reference.mul && !reference.add {
+                    4
                 } else if reference.mul {
                     3
                 } else if reference.add {

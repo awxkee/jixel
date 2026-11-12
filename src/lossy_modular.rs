@@ -115,6 +115,27 @@ pub(crate) fn encode_xyb_frame(
     race::encode(pyramid, speed, pool, scratch, writer)
 }
 
+/// Lossy modular crop frame of an XYB codestream: `xyb` is the rectangle at
+/// `origin`, coded like [`encode_xyb_frame`] (no patches) and replacing
+/// reference slot 0 there. None when the rectangle is too small to squeeze.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_xyb_crop_frame(
+    xyb: &Image3F,
+    distance: f32,
+    screen: bool,
+    origin: [usize; 2],
+    last: bool,
+    speed: crate::Speed,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    writer: &mut BitWriter,
+) -> Option<usize> {
+    let mut pyramid = Pyramid::xyb(xyb, distance, screen, pool)?;
+    pyramid.group_shift = group_shift(speed);
+    pyramid.crop = Some((origin, last));
+    race::encode(pyramid, speed, pool, scratch, writer)
+}
+
 /// Lossy modular frame of a non-XYB codestream: the integer planes in
 /// `input` at the plain-layout schedule ([`plain_distance`]). Returns the
 /// frame size in bits before the fold race, for the Auto gate, or None when

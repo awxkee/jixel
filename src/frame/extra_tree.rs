@@ -372,8 +372,16 @@ fn plan_joint(
     let dc = remap(streams.dc, &dc_map);
     let meta = remap(streams.meta, &dc_map);
     let effort = ctx.speed.effort();
-    let plane_streams = remap(&learned.crop_tokens, &plane_map);
-    drop(learned);
+    let mut plane_streams = learned.crop_tokens;
+    if plane_map
+        .iter()
+        .enumerate()
+        .any(|(index, &context)| index != context as usize)
+    {
+        for token in plane_streams.iter_mut().flatten() {
+            token.context = plane_map[token.context as usize];
+        }
+    }
 
     let all = || {
         dc.iter()

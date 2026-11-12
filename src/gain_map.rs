@@ -328,6 +328,7 @@ pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainM
         function_fields_portable: false,
         progressive: false,
         patches: base.patches,
+        patch_epf: false,
         #[cfg(feature = "splines")]
         splines: false,
         #[cfg(feature = "splines")]
@@ -350,6 +351,7 @@ pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainM
         ink_layer: false,
         vector_layers: false,
         crop_frames: false,
+        glyph_templates: false,
         progressive_dc: false,
         progressive_dc_levels: None,
         group_order: crate::GroupOrder::Scanline,
@@ -357,6 +359,8 @@ pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainM
         gain_map: None,
         grain: crate::Grain::Off,
         coding_transform: crate::CodingTransform::Xyb,
+        templates_active: false,
+        template_probe: None,
     };
 
     let (w, h) = (gm.width, gm.height);

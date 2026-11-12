@@ -96,10 +96,11 @@ fn expand_2x2(grid: [u8; 4], sx: usize, sy: usize, into: &mut [u8; 16]) {
 /// from the selected transform's first block).
 fn sub_grid(grid: &[u8; 16], ox: usize, oy: usize, cov_x: usize, cov_y: usize) -> [u8; 16] {
     let mut out = [NO_CHILD_BLOCK; 16];
-    for iy in 0..cov_y {
-        for ix in 0..cov_x {
-            out[iy * 4 + ix] = grid[(oy + iy) * 4 + ox + ix];
-        }
+    let src_rows = &grid.as_chunks::<4>().0[oy..oy + cov_y];
+    let dst_rows = &mut out.as_chunks_mut::<4>().0[..cov_y];
+    let end_x = ox + cov_x;
+    for (dst, src) in dst_rows.iter_mut().zip(src_rows) {
+        dst[..cov_x].copy_from_slice(&src[ox..end_x]);
     }
     out
 }

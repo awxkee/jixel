@@ -124,7 +124,7 @@ fn edge_view(
         }
     }
     let replaced = match frame_kind {
-        VarDctFrameKind::Patched(references) => {
+        VarDctFrameKind::Patched(references, _) => {
             let mut replaced = vec![false; len];
             for reference in references
                 .iter()
@@ -170,7 +170,7 @@ pub(super) fn encode_frame_core(
         let eligible = ctx.function_fields
             && match frame_kind {
                 VarDctFrameKind::Regular => true,
-                VarDctFrameKind::Patched(references) => {
+                VarDctFrameKind::Patched(references, _) => {
                     references.iter().all(|r| !r.alpha_only && r.ref_frame != 0)
                 }
                 VarDctFrameKind::ReferenceOnly { .. } => false,
@@ -615,7 +615,7 @@ fn encode_frame_core_masks(
                 ..ExtraCoding::default()
             },
             coeff_shifts,
-            VarDctFrameKind::Patched(&plan.references),
+            VarDctFrameKind::Patched(&plan.references, None),
             #[cfg(feature = "splines")]
             None,
             #[cfg(feature = "splines")]
@@ -650,7 +650,7 @@ fn encode_frame_core_plain(
 ) -> Result<usize, EncodeError> {
     let displayed = matches!(
         frame_kind,
-        VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
+        VarDctFrameKind::Regular | VarDctFrameKind::Patched(..)
     );
     if matches!(grain_pass, GrainPass::Inherit)
         && ctx.grain == crate::Grain::Auto
@@ -779,9 +779,16 @@ struct ExtraCoding<'a> {
 fn color_is_unpatched(frame_kind: VarDctFrameKind<'_>) -> bool {
     match frame_kind {
         VarDctFrameKind::Regular => true,
-        VarDctFrameKind::Patched(references) => references.iter().all(|r| r.alpha_only),
+        VarDctFrameKind::Patched(references, _) => references.iter().all(|r| r.alpha_only),
         VarDctFrameKind::ReferenceOnly { .. } => false,
     }
+}
+
+pub(super) fn epf_fit_enabled(ctx: &EncodingContext, distance: f32) -> bool {
+    // A saved base is fitted only when it knows what is laid over it.
+    let role = ctx.frame_role == FrameRole::Last
+        || (ctx.frame_role == FrameRole::SavedFirst && ctx.patch_epf && ctx.epf_overlay.is_some());
+    ctx.speed.effort().epf_fit && ctx.coding.is_xyb() && role && (0.5..=24.0).contains(&distance)
 }
 
 fn encode_frame_core_inner(
@@ -807,7 +814,7 @@ fn encode_frame_core_inner(
     let mut opsin = opsin;
     let displayed = matches!(
         frame_kind,
-        VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
+        VarDctFrameKind::Regular | VarDctFrameKind::Patched(..)
     );
     let probe_stats = match &grain_pass {
         GrainPass::Probe(stats) | GrainPass::Apply(_, stats, _) => Some(stats),
@@ -845,7 +852,7 @@ fn encode_frame_core_inner(
     let use_dc_frame = ctx.progressive_dc
         && matches!(
             frame_kind,
-            VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
+            VarDctFrameKind::Regular | VarDctFrameKind::Patched(..)
         )
         && alpha.is_none()
         && ctx.coding.is_xyb()
@@ -875,7 +882,7 @@ fn encode_frame_core_inner(
         && ctx.coding.is_xyb()
         && matches!(
             frame_kind,
-            VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
+            VarDctFrameKind::Regular | VarDctFrameKind::Patched(..)
         )
         && noise.is_none()
         && !use_dc_frame
@@ -987,14 +994,15 @@ fn encode_frame_core_inner(
         }
     }
 
+    let patch_luma = match frame_kind {
+        VarDctFrameKind::Patched(references, Some(atlases)) => Some((references, atlases)),
+        _ => None,
+    };
     // Layer residuals and progressive/DC frames retain the EPF schedule.
-    let fit_epf = ctx.speed.effort().epf_fit
-        && ctx.coding.is_xyb()
-        && color_is_unpatched(frame_kind)
-        && ctx.frame_role == FrameRole::Last
+    let fit_epf = epf_fit_enabled(ctx, distance)
+        && (patch_luma.is_some() || color_is_unpatched(frame_kind))
         && !use_dc_frame
         && num_passes == 1
-        && (0.5..=24.0).contains(&distance)
         && dim.xsize >= 16
         && dim.ysize >= 16;
     // The grain probe reads its survival off the same reconstruction.
@@ -1542,14 +1550,22 @@ fn encode_frame_core_inner(
             // Splines are drawn after the filter: the fit sees them as a layer.
             let spline_layer =
                 splines.map(|set| crate::splines::additive_y(ctx, set, dim.xsize, dim.ysize));
+            let overlay = ctx
+                .epf_overlay
+                .as_ref()
+                .filter(|o| o.len() == source_y.as_slice().len());
             let chosen = crate::epf_filter::fit(
                 ctx,
                 scratch,
-                &source_y,
-                #[cfg(feature = "splines")]
-                spline_layer.as_deref(),
-                #[cfg(not(feature = "splines"))]
-                None,
+                source_y,
+                crate::epf_filter::LumaLayers {
+                    #[cfg(feature = "splines")]
+                    additive: spline_layer.as_deref(),
+                    #[cfg(not(feature = "splines"))]
+                    additive: None,
+                    patches: patch_luma,
+                    overlay,
+                },
                 &recon,
                 &blocks,
                 distance,
@@ -2188,7 +2204,7 @@ fn encode_frame_core_inner(
     let dc_code = dc_code_owned.as_ref();
 
     // Write DC global with adaptive DC code.
-    if let VarDctFrameKind::Patched(references) = frame_kind {
+    if let VarDctFrameKind::Patched(references, _) = frame_kind {
         crate::lossless::write_patch_dictionary(
             references,
             alpha.is_some(),
@@ -2420,7 +2436,7 @@ fn encode_frame_core_inner(
     let order = (ctx.group_order != crate::GroupOrder::Scanline
         && matches!(
             frame_kind,
-            VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
+            VarDctFrameKind::Regular | VarDctFrameKind::Patched(..)
         ))
     .then(|| group_section_order(&dim, num_passes, ctx.group_order));
     combine_sections_ordered(

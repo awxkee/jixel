@@ -43,6 +43,7 @@ use crate::encode_image::AlphaPlane;
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
 use crate::util::EncodeError;
+use std::borrow::Cow;
 
 /// The VarDCT arm of lossy encoding (regular or patched), from a prepared XYB
 /// image.
@@ -84,7 +85,7 @@ pub(super) fn encode_frame_vardct(
             scratch,
             distance,
             distp,
-            xyb,
+            Cow::Owned(xyb),
             alpha,
             coeff_shifts,
             false,
@@ -101,6 +102,12 @@ pub(super) fn encode_frame_vardct(
     // Compare bounded residual samples plus the actual atlas, dictionary and
     // spline costs. Only the selected plan receives a full-frame encode.
     let lattice = crate::lattice_patches::find(&xyb);
+    let retain_epf_luma = ctx.patch_epf
+        && super::vardct_encoder::epf_fit_enabled(ctx, distance)
+        && !ctx.progressive_dc
+        && coeff_shifts == [0]
+        && xyb.xsize() >= 16
+        && xyb.ysize() >= 16;
     let mut glyphs = GlyphStage::find(
         ctx,
         scratch,
@@ -108,17 +115,18 @@ pub(super) fn encode_frame_vardct(
         &xyb,
         alpha,
         distance <= GLYPH_SINGLETON_FREE_MAX_DISTANCE,
+        retain_epf_luma,
     );
     let mut best = prepare_vardct_variant(
         ctx,
         scratch,
         distance,
         distp,
-        xyb.clone(),
+        Cow::Borrowed(&xyb),
         alpha,
         coeff_shifts,
         true,
-        glyphs.as_ref(),
+        glyphs.as_ref().map(Cow::Borrowed),
         true,
         #[cfg(feature = "splines")]
         stage.as_ref(),
@@ -129,7 +137,8 @@ pub(super) fn encode_frame_vardct(
     // winner is rebuilt with splines.
     if distance > GLYPH_SINGLETON_FREE_MAX_DISTANCE
         && distance <= GLYPH_SINGLETON_RACE_MAX_DISTANCE
-        && let Some(singles) = GlyphStage::find(ctx, scratch, distance, &xyb, alpha, true)
+        && let Some(singles) =
+            GlyphStage::find(ctx, scratch, distance, &xyb, alpha, true, retain_epf_luma)
     {
         let best_bits = best.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
         if (singles.atlas_bits() as f64) < best_bits {
@@ -138,11 +147,11 @@ pub(super) fn encode_frame_vardct(
                 scratch,
                 distance,
                 distp,
-                xyb.clone(),
+                Cow::Borrowed(&xyb),
                 alpha,
                 coeff_shifts,
                 true,
-                Some(&singles),
+                Some(Cow::Borrowed(&singles)),
                 true,
                 #[cfg(feature = "splines")]
                 None,
@@ -155,11 +164,11 @@ pub(super) fn encode_frame_vardct(
                         scratch,
                         distance,
                         distp,
-                        xyb.clone(),
+                        Cow::Borrowed(&xyb),
                         alpha,
                         coeff_shifts,
                         true,
-                        Some(&singles),
+                        Some(Cow::Borrowed(&singles)),
                         true,
                         stage.as_ref(),
                     )?;
@@ -180,19 +189,35 @@ pub(super) fn encode_frame_vardct(
     // thousands of near-glyph references cost more than they take out of
     // the residual. Patches code their pixels finer than the residual, so
     // the unpatched frame must win by the same margin as dropping tiles.
-    // Only plans that found something pay for the extra estimate. Base
-    // frames under an ink or crop layer keep their patches: there the
-    // sampled estimate prices the unpatched base far below its real size
-    // (an ink-stacked text screenshot +10 % at d1 without them).
-    let race_unpatched = ctx.frame_role == crate::encoding_context::FrameRole::Last
+    // Only plans that found something pay for the extra estimate. The base
+    // frame under an ink layer keeps its patches: there the sampled estimate
+    // prices the unpatched base far below its real size (an ink-stacked text
+    // screenshot +10 % at d1 without them). A crop stack's base is the image
+    // itself less some rectangles and races like a whole frame (one store
+    // screen's base 109 -> 89 kB at d1.2).
+    let race_unpatched = (ctx.frame_role == crate::encoding_context::FrameRole::Last
+        || ctx.crop_base)
         && (glyphs.is_some() || best.used_tiles || lattice.is_some());
-    let mut unpatched = if race_unpatched {
+    // An unchanged unpatched arm can price the borrowed source and only
+    // take ownership of the image if it wins the final rate comparison.
+    let defer_unpatched = race_unpatched && glyphs.is_some() && !distp.gab_enabled;
+    #[cfg(feature = "splines")]
+    let defer_unpatched = defer_unpatched && stage.is_none();
+    if !best.used_tiles || lattice.is_some() {
+        // No more variants need the glyph residual or atlas.
+        drop(glyphs.take());
+    }
+    let mut unpatched = if defer_unpatched {
+        let bits =
+            PreparedVarDct::estimate_regular(ctx, scratch, distance, &xyb, alpha, coeff_shifts)?;
+        Some((None, bits))
+    } else if race_unpatched {
         let mut arm = prepare_vardct_variant(
             ctx,
             scratch,
             distance,
             distp,
-            xyb.clone(),
+            Cow::Borrowed(&xyb),
             alpha,
             coeff_shifts,
             false,
@@ -202,12 +227,13 @@ pub(super) fn encode_frame_vardct(
             stage.as_ref(),
         )?;
         let bits = arm.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
-        Some((arm, bits))
+        Some((Some(arm), bits))
     } else {
         None
     };
     let mut pick = |mut best: PreparedVarDct,
                     best_bits: Option<f64>,
+                    original: Option<Image3F>,
                     scratch: &mut CoderScratch|
      -> Result<PreparedVarDct, EncodeError> {
         let Some((arm, bits)) = unpatched.take() else {
@@ -218,24 +244,22 @@ pub(super) fn encode_frame_vardct(
             None => best.estimate(ctx, scratch, distance, alpha, coeff_shifts)?,
         };
         Ok(if bits * GLYPH_BITS_MARGIN < best_bits {
-            arm
+            arm.unwrap_or_else(|| PreparedVarDct::regular(original.expect("unpatched source")))
         } else {
             best
         })
     };
     if !best.used_tiles && lattice.is_none() {
-        drop(xyb);
-        drop(glyphs);
+        let original = defer_unpatched.then_some(xyb);
         #[cfg(feature = "splines")]
         drop(spline_candidates);
-        let best = pick(best, None, scratch)?;
+        let best = pick(best, None, original, scratch)?;
         return best.encode(ctx, scratch, distance, alpha, coeff_shifts, writer);
     }
     #[allow(unused_mut)]
     let mut best_bits = best.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
     if let Some(plan) = lattice {
-        drop(xyb);
-        drop(glyphs);
+        let original = defer_unpatched.then_some(xyb);
         #[cfg(feature = "splines")]
         drop(spline_candidates);
         // A lattice arm codes what the tile leaves at the frame's own distance,
@@ -255,6 +279,7 @@ pub(super) fn encode_frame_vardct(
         let best = pick(
             best,
             Some(if lattice_won { best_bits } else { patched_bits }),
+            original,
             scratch,
         )?;
         return best.encode(ctx, scratch, distance, alpha, coeff_shifts, writer);
@@ -270,11 +295,11 @@ pub(super) fn encode_frame_vardct(
             scratch,
             distance,
             distp,
-            xyb.clone(),
+            Cow::Borrowed(&xyb),
             alpha,
             coeff_shifts,
             true,
-            glyphs.as_ref(),
+            glyphs.as_ref().map(Cow::Borrowed),
             true,
             Some(&stage),
         )?;
@@ -284,16 +309,22 @@ pub(super) fn encode_frame_vardct(
             best_bits = bits;
         }
     }
+    let mut original = Some(xyb);
+    let input = if defer_unpatched {
+        Cow::Borrowed(original.as_ref().unwrap())
+    } else {
+        Cow::Owned(original.take().unwrap())
+    };
     let mut no_tiles = prepare_vardct_variant(
         ctx,
         scratch,
         distance,
         distp,
-        xyb,
+        input,
         alpha,
         coeff_shifts,
         true,
-        glyphs.as_ref(),
+        glyphs.map(Cow::Owned),
         false,
         #[cfg(feature = "splines")]
         stage.as_ref(),
@@ -307,9 +338,8 @@ pub(super) fn encode_frame_vardct(
     } else {
         drop(no_tiles);
     }
-    drop(glyphs);
     #[cfg(feature = "splines")]
     drop(spline_candidates);
-    let best = pick(best, Some(best_bits), scratch)?;
+    let best = pick(best, Some(best_bits), original, scratch)?;
     best.encode(ctx, scratch, distance, alpha, coeff_shifts, writer)
 }

@@ -32,6 +32,7 @@ fn usage() -> ! {
     );
     eprintln!("         [--dots] (experimental dot coding; requires --speed slow)");
     eprintln!("         [--patches | --no-patches] (override the speed preset)");
+    eprintln!("         [--patch-epf] (experimental glyph-patch filter fit; MediumSlow or higher)");
     eprintln!("         [--alpha] (encode the RGBA input with its alpha channel)");
     eprintln!("         [--alpha-distance <d>] (lossy alpha distance; 0 = lossless)");
     eprintln!("         [--arbiter ssimulacra2|cvvdp]");
@@ -61,6 +62,7 @@ fn main() -> ExitCode {
     let mut edge_splines = false;
     let mut dots = false;
     let mut patches = None;
+    let mut patch_epf = false;
     let mut keep_alpha = false;
     let mut alpha_distance: Option<f32> = None;
     let mut progressive_dc = false;
@@ -159,6 +161,10 @@ fn main() -> ExitCode {
             }
             "--patches" | "--no-patches" => {
                 patches = Some(args[i] == "--patches");
+                i += 1;
+            }
+            "--patch-epf" => {
+                patch_epf = true;
                 i += 1;
             }
             "--lossless" => {
@@ -290,6 +296,7 @@ fn main() -> ExitCode {
         .with_splines(splines)
         .with_edge_splines(edge_splines)
         .with_dots(dots)
+        .with_patch_epf(patch_epf)
         .with_progressive_dc(progressive_dc)
         .with_lossy_modular(lossy_modular)
         .with_coding_transform(coding);

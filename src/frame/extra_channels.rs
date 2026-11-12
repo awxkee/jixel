@@ -211,10 +211,12 @@ fn extra_palette(plane: &AlphaPlane) -> Option<ExtraPalette> {
 /// The lossless sections of the extra channel, through `palette` when given:
 /// its Palette transform and entries in the global stream and the indices per
 /// AC group. Otherwise the values themselves.
+#[allow(clippy::too_many_arguments)]
 fn lossless_sections(
     ctx: &EncodingContext,
     plane: &AlphaPlane,
     palette: Option<&ExtraPalette>,
+    constant_integer: bool,
     dim: &ImageDim,
     num_dc_groups: usize,
     global_code_ans: bool,
@@ -243,26 +245,44 @@ fn lossless_sections(
         ),
     }
     let ac_plane = palette.map_or(plane, |p| &p.indices);
-    sections.ac = ctx
-        .thread_pool
-        .steal_map(scratch, dim.num_groups, |group_id, scratch| {
-            let x0 = (group_id % dim.xsize_groups) * K_GROUP_DIM;
-            let y0 = (group_id / dim.xsize_groups) * K_GROUP_DIM;
-            let mut w = BitWriter::new();
-            crate::modular::write_ac_group_alpha(
-                ac_plane,
-                dim.xsize,
-                dim.ysize,
-                x0,
-                y0,
-                K_GROUP_DIM.min(dim.xsize - x0),
-                K_GROUP_DIM.min(dim.ysize - y0),
-                ctx.extra_step,
-                scratch,
-                &mut w,
-            );
-            w
-        });
+    let encode_group = |group_id, scratch: &mut CoderScratch| {
+        let x0 = (group_id % dim.xsize_groups) * K_GROUP_DIM;
+        let y0 = (group_id / dim.xsize_groups) * K_GROUP_DIM;
+        let mut w = BitWriter::new();
+        crate::modular::write_ac_group_alpha(
+            ac_plane,
+            dim.xsize,
+            dim.ysize,
+            x0,
+            y0,
+            K_GROUP_DIM.min(dim.xsize - x0),
+            K_GROUP_DIM.min(dim.ysize - y0),
+            ctx.extra_step,
+            scratch,
+            &mut w,
+        );
+        w
+    };
+    sections.ac =
+        if constant_integer && (dim.xsize / K_GROUP_DIM > 1 || dim.ysize / K_GROUP_DIM > 1) {
+            // Prediction restarts at each group, so a constant integer plane's
+            // local coding depends only on the group's width and height.
+            let mut by_shape: [Option<BitWriter>; 4] = Default::default();
+            (0..dim.num_groups)
+                .map(|group_id| {
+                    let x0 = (group_id % dim.xsize_groups) * K_GROUP_DIM;
+                    let y0 = (group_id / dim.xsize_groups) * K_GROUP_DIM;
+                    let narrow = usize::from(dim.xsize - x0 < K_GROUP_DIM);
+                    let short = usize::from(dim.ysize - y0 < K_GROUP_DIM);
+                    by_shape[narrow + 2 * short]
+                        .get_or_insert_with(|| encode_group(group_id, scratch))
+                        .clone()
+                })
+                .collect()
+        } else {
+            ctx.thread_pool
+                .steal_map(scratch, dim.num_groups, encode_group)
+        };
     sections
 }
 
@@ -573,7 +593,10 @@ fn prepare_extra_sections_impl(
     track_reconstruction: bool,
 ) -> PreparedExtra {
     let single = dim.xsize <= K_GROUP_DIM && dim.ysize <= K_GROUP_DIM;
-    let lossless_plane = ctx.extra_step == 1 && !plane.is_constant();
+    let try_squeeze = !force_lossless && ctx.extra_squeeze_distance > 0.0;
+    let constant = (ctx.extra_step == 1 || try_squeeze) && plane.is_constant();
+    let lossless_plane = ctx.extra_step == 1 && !constant;
+    let constant_integer = ctx.extra_step == 1 && constant && !matches!(plane, AlphaPlane::F32(_));
     let mut palette = lossless_plane.then(|| extra_palette(plane)).flatten();
     let ans = !streams.code.use_prefix_code;
     let groups = dc_group_coords.len();
@@ -586,11 +609,11 @@ fn prepare_extra_sections_impl(
     // of its global-tree coding, which carries the palette.
     let mut lossless = match palette.as_ref().filter(|_| !single) {
         Some(p) => {
-            let indexed = lossless_sections(ctx, plane, Some(p), dim, groups, ans, scratch);
+            let indexed = lossless_sections(ctx, plane, Some(p), false, dim, groups, ans, scratch);
             if ctx.extra_plane_tree.is_some() {
                 indexed
             } else {
-                let plain = lossless_sections(ctx, plane, None, dim, groups, ans, scratch);
+                let plain = lossless_sections(ctx, plane, None, false, dim, groups, ans, scratch);
                 if plain.bits() < indexed.bits() {
                     palette = None;
                     plain
@@ -599,9 +622,18 @@ fn prepare_extra_sections_impl(
                 }
             }
         }
-        None => lossless_sections(ctx, plane, None, dim, groups, ans, scratch),
+        None => lossless_sections(
+            ctx,
+            plane,
+            None,
+            constant_integer,
+            dim,
+            groups,
+            ans,
+            scratch,
+        ),
     };
-    let squeezed = (!force_lossless && ctx.extra_squeeze_distance > 0.0 && !plane.is_constant())
+    let squeezed = (try_squeeze && !constant)
         .then(|| {
             crate::lossy_modular::ExtraSqueeze::new(
                 plane,
@@ -617,7 +649,11 @@ fn prepare_extra_sections_impl(
     let lossy = squeezed
         .as_ref()
         .map(|s| squeezed_sections(ctx, s, dim, dc_group_coords, ans, None, scratch));
-    let global_tree = (lossless_plane
+    // A constant plane (the opaque alpha a layered or templated RGB image
+    // declares) shares one leaf through the global tree instead of carrying a
+    // local tree and histogram in every group.
+    let constant_global = ctx.extra_step == 1 && !single && constant;
+    let global_tree = ((lossless_plane || constant_global)
         && ctx.extra_plane_tree.is_some_and(|budget| {
             lossy.as_ref().is_none_or(|lossy| {
                 if budget.gradient_only {
@@ -856,7 +892,16 @@ fn lossy_palette(
     let code = |scratch: &mut CoderScratch| {
         let palette = extra_palette(&levels);
         let local_palette = palette.as_ref().filter(|_| !single);
-        let sections = lossless_sections(ctx, &levels, local_palette, dim, groups, ans, scratch);
+        let sections = lossless_sections(
+            ctx,
+            &levels,
+            local_palette,
+            false,
+            dim,
+            groups,
+            ans,
+            scratch,
+        );
         let tree = extra_tree::plan_global_extra_tree(
             ctx,
             &levels,

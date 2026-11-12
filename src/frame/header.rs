@@ -95,7 +95,7 @@ pub(super) fn write_frame_header_kind(
             role,
             w,
         ),
-        VarDctFrameKind::Patched(_) => write_frame_header(
+        VarDctFrameKind::Patched(..) => write_frame_header(
             x_qm_scale,
             b_qm_scale,
             epf_iters,

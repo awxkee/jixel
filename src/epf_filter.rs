@@ -40,6 +40,7 @@ use crate::dc_group_data::{AcStrategyImage, DcGroupData, STRATEGY_DCT};
 use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, Plane};
 use crate::thread_pool::ThreadPool;
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 mod kernels;
@@ -618,38 +619,167 @@ fn choose(distance: f32, baseline: Choice, mut score: impl FnMut(Choice) -> f32)
     rows.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0
 }
 
-/// Compose the decoder's additive luma only for scoring. The filter itself
-/// always receives the base reconstruction, since splines are drawn after EPF.
-fn add_luma_layer(base: &[f32], layer: &[f32], output: &mut [f32]) {
-    assert_eq!(base.len(), layer.len());
-    assert_eq!(base.len(), output.len());
-    for (out, (&base, &layer)) in output.iter_mut().zip(base.iter().zip(layer)) {
-        *out = base + layer;
+/// What later frames lay over a saved base frame, in luma: the decoder
+/// shows `base * (1 - coverage) + luma * coverage` (an ink frame blended by
+/// its coverage, crop frames replacing their boxes with coverage 1).
+pub(crate) enum EpfOverlay {
+    Ink {
+        indices: Vec<u8>,
+        coverage: Vec<u8>,
+        luma: Vec<f32>,
+    },
+    Crops {
+        coverage: Vec<u8>,
+    },
+}
+
+const fn byte_coverage() -> [f32; 256] {
+    let mut values = [0.0; 256];
+    let mut i = 0;
+    while i < values.len() {
+        values[i] = i as f32 / 255.0;
+        i += 1;
+    }
+    values
+}
+
+impl EpfOverlay {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Ink { coverage, .. } | Self::Crops { coverage } => coverage.len(),
+        }
+    }
+
+    fn blend(&self, output: &mut [f32]) {
+        match self {
+            Self::Ink {
+                indices,
+                coverage,
+                luma,
+            } => {
+                static ALPHA: [f32; 256] = byte_coverage();
+                assert_eq!(output.len(), indices.len());
+                assert_eq!(output.len(), coverage.len());
+                for ((out, &k), &a) in output.iter_mut().zip(indices).zip(coverage) {
+                    let c = ALPHA[usize::from(if k == 0 { 0 } else { a })];
+                    *out = *out * (1.0 - c) + luma[usize::from(k)] * c;
+                }
+            }
+            Self::Crops { coverage } => {
+                assert_eq!(output.len(), coverage.len());
+                for (out, &c) in output.iter_mut().zip(coverage) {
+                    *out = *out * (1.0 - f32::from(c)) + 0.0;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LumaLayers<'a> {
+    pub(crate) additive: Option<&'a [f32]>,
+    pub(crate) patches: Option<(
+        &'a [crate::patches::PatchReference],
+        &'a crate::patches::EpfPatchAtlases,
+    )>,
+    /// Later frames over this one, applied last.
+    pub(crate) overlay: Option<&'a EpfOverlay>,
+}
+
+impl LumaLayers<'_> {
+    fn is_empty(self) -> bool {
+        self.additive.is_none() && self.patches.is_none() && self.overlay.is_none()
+    }
+
+    fn compose(mut self, base: &[f32], width: usize) -> Vec<f32> {
+        let mut output = if self.patches.is_none()
+            && let Some(layer) = self.additive.take()
+        {
+            assert_eq!(base.len(), layer.len());
+            base.iter()
+                .zip(layer)
+                .map(|(&base, &layer)| base + layer)
+                .collect()
+        } else {
+            base.to_vec()
+        };
+        self.compose_in_place(width, &mut output);
+        output
+    }
+
+    /// The decoder applies patches in dictionary order, then draws splines.
+    /// The filter itself still receives the base reconstruction.
+    fn compose_in_place(self, width: usize, output: &mut [f32]) {
+        if let Some((references, atlases)) = self.patches {
+            let glyph_step = 1.0 / crate::quant_weights::INV_DC_QUANT[1];
+            for patch in references.iter().filter(|patch| !patch.alpha_only) {
+                for &(px, py) in &patch.positions {
+                    for dy in 0..patch.height {
+                        let start = (py + dy) * width + px;
+                        let dst = &mut output[start..start + patch.width];
+                        let ay = patch.atlas_y + dy;
+                        let ax = patch.atlas_x;
+                        if patch.mul && !patch.add {
+                            // kBlendAbove: the template color over the frame by its coverage.
+                            let start = ay * atlases.glyphs.width + ax;
+                            let src = &atlases.glyphs.samples[start..start + patch.width];
+                            let coverage = atlases.glyphs.coverage.as_ref().unwrap();
+                            let alpha = &coverage[start..start + patch.width];
+                            for ((out, &value), &a) in dst.iter_mut().zip(src).zip(alpha) {
+                                let a = f32::from(a) / 255.0;
+                                *out = *out * (1.0 - a) + value as f32 * glyph_step * a;
+                            }
+                        } else if patch.add {
+                            let start = ay * atlases.glyphs.width + ax;
+                            let src = &atlases.glyphs.samples[start..start + patch.width];
+                            for (out, &value) in dst.iter_mut().zip(src) {
+                                *out += value as f32 * glyph_step;
+                            }
+                        } else {
+                            let src = atlases.tiles.as_ref().unwrap().row(ay);
+                            dst.copy_from_slice(&src[ax..ax + patch.width]);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(layer) = self.additive {
+            assert_eq!(output.len(), layer.len());
+            for (out, &value) in output.iter_mut().zip(layer) {
+                *out += value;
+            }
+        }
+        if let Some(overlay) = self.overlay {
+            overlay.blend(output);
+        }
     }
 }
 
 pub(crate) fn fit(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
-    source_y: &Plane<f32>,
-    additive_y: Option<&[f32]>,
+    mut source_y: Cow<'_, Plane<f32>>,
+    layers: LumaLayers<'_>,
     reconstruction: &Image3F,
     blocks: &FrameBlocks,
     distance: f32,
     baseline: Choice,
 ) -> Choice {
-    let composite_source = additive_y.map(|layer| {
-        let mut composite = vec![0.0; source_y.as_slice().len()];
-        add_luma_layer(source_y.as_slice(), layer, &mut composite);
-        composite
-    });
-    let reference = crate::epf_proxy::LumaProxy::new(
-        composite_source.as_deref().unwrap_or(source_y.as_slice()),
-        source_y.xsize(),
-        source_y.ysize(),
-        &ctx.thread_pool,
-    );
-    let mut composite_candidate = additive_y.map(|_| vec![0.0; source_y.as_slice().len()]);
+    let (width, height) = (source_y.xsize(), source_y.ysize());
+    let has_layers = !layers.is_empty();
+    let composite_source;
+    let reference_y = match (&mut source_y, has_layers) {
+        (Cow::Owned(y), true) => {
+            layers.compose_in_place(width, y.as_mut_slice());
+            y.as_slice()
+        }
+        (Cow::Borrowed(y), true) => {
+            composite_source = layers.compose(y.as_slice(), width);
+            composite_source.as_slice()
+        }
+        (y, false) => y.as_slice(),
+    };
+    let reference = crate::epf_proxy::LumaProxy::new(reference_y, width, height, &ctx.thread_pool);
     let mut work = crate::epf_proxy::Scratch::default();
     let make = |choice: Choice| {
         LoopFilter::new(
@@ -660,20 +790,37 @@ pub(crate) fn fit(
         )
     };
     let mut epf = Epf::new(&ctx.thread_pool, reconstruction, blocks);
+    let mut unfiltered_score = None;
     choose(distance, baseline, |choice| {
-        let filtered = if choice.iters == 0 {
-            reconstruction
+        let unfiltered = choice.iters == 0
+            || std::ptr::eq(
+                epf.apply(&ctx.thread_pool, scratch, &make(choice), choice.sharpness),
+                reconstruction,
+            );
+        if unfiltered && let Some(score) = unfiltered_score {
+            return score;
+        }
+        let composite;
+        let candidate_y = if unfiltered {
+            let y = reconstruction.plane_data(1);
+            if has_layers {
+                composite = layers.compose(y, width);
+                composite.as_slice()
+            } else {
+                y
+            }
         } else {
-            epf.apply(&ctx.thread_pool, scratch, &make(choice), choice.sharpness)
+            // The next active render overwrites every pixel from the base,
+            // so this trial can use the renderer's luma as composition scratch.
+            let y = epf.output.as_mut().unwrap().plane_mut(1).as_mut_slice();
+            layers.compose_in_place(width, y);
+            y
         };
-        let candidate_y = if let Some(layer) = additive_y {
-            let output = composite_candidate.as_mut().unwrap();
-            add_luma_layer(filtered.plane_data(1), layer, output);
-            output.as_slice()
-        } else {
-            filtered.plane_data(1)
-        };
-        reference.compare(candidate_y, &mut work).0
+        let score = reference.compare(candidate_y, &mut work).0;
+        if unfiltered {
+            unfiltered_score = Some(score);
+        }
+        score
     })
 }
 
@@ -713,6 +860,136 @@ mod fit_tests {
     }
 
     #[test]
+    fn luma_composite_lays_the_overlay_over_the_base_last() {
+        // An ink overlay (half covered, then fully covered) over a base that
+        // also carries an additive layer: the overlay comes last.
+        let overlay = EpfOverlay::Ink {
+            indices: vec![0, 1, 2],
+            coverage: vec![255, 128, 255],
+            luma: vec![0.0, 0.2, 0.1],
+        };
+        let layers = LumaLayers {
+            additive: Some(&[0.1, 0.1, 0.1]),
+            overlay: Some(&overlay),
+            ..LumaLayers::default()
+        };
+        let out = layers.compose(&[0.4, 0.4, 0.4], 3);
+        let half = 128.0 / 255.0;
+        assert_eq!(out, [0.5, 0.5 * (1.0 - half) + 0.2 * half, 0.1]);
+    }
+
+    #[test]
+    fn crop_overlay_matches_float_blend_including_signed_zero() {
+        let coverage = vec![0, 0, 1, 1];
+        let mut output = [0.4, -0.0, -0.8, -0.0];
+        let expected = output.map(f32::to_bits);
+        let overlay = EpfOverlay::Crops { coverage };
+        overlay.blend(&mut output);
+        assert_eq!(output.map(f32::to_bits), [expected[0], 0, 0, 0]);
+    }
+
+    #[test]
+    fn luma_composite_blends_glyph_templates_by_their_coverage() {
+        use crate::patches::{GlyphAtlasLuma, MODULAR_PATCH_REF_ID, PatchReference};
+
+        // A blend-above template: color Y = 51 lattice steps, coverage 1 and 0.5.
+        let template = PatchReference {
+            atlas_x: 0,
+            atlas_y: 0,
+            width: 2,
+            height: 1,
+            ref_frame: MODULAR_PATCH_REF_ID,
+            alpha_only: false,
+            add: false,
+            mul: true,
+            positions: vec![(1, 0)],
+        };
+        let atlases = crate::patches::EpfPatchAtlases {
+            glyphs: std::sync::Arc::new(GlyphAtlasLuma {
+                width: 2,
+                samples: vec![51, 51],
+                coverage: Some(vec![255, 128]),
+            }),
+            tiles: None,
+        };
+        let layers = LumaLayers {
+            patches: Some((std::slice::from_ref(&template), &atlases)),
+            ..LumaLayers::default()
+        };
+        let out = layers.compose(&[0.5, 0.5, 0.5], 3);
+        let color = 51.0 / crate::quant_weights::INV_DC_QUANT[1];
+        let half = 128.0 / 255.0;
+        assert_eq!(out[0], 0.5);
+        assert!((out[1] - color).abs() < 1e-6);
+        assert!((out[2] - (0.5 * (1.0 - half) + color * half)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn luma_composite_replaces_tiles_before_adding_glyphs_and_splines() {
+        use crate::patches::{GlyphAtlasLuma, MODULAR_PATCH_REF_ID, PATCH_REF_ID, PatchReference};
+
+        let tile = PatchReference {
+            atlas_x: 1,
+            atlas_y: 0,
+            width: 2,
+            height: 1,
+            ref_frame: PATCH_REF_ID,
+            alpha_only: false,
+            add: false,
+            mul: false,
+            positions: vec![(0, 1)],
+        };
+        let glyph = PatchReference {
+            atlas_x: 1,
+            atlas_y: 1,
+            width: 2,
+            height: 1,
+            ref_frame: MODULAR_PATCH_REF_ID,
+            alpha_only: false,
+            add: true,
+            mul: false,
+            positions: vec![(1, 0), (1, 1)],
+        };
+        let references = [
+            tile.clone(),
+            glyph,
+            PatchReference {
+                alpha_only: true,
+                positions: vec![(0, 0)],
+                ..tile
+            },
+        ];
+        let mut tiles = Plane::new(3, 1);
+        tiles.row_mut(0).copy_from_slice(&[0.2, 0.4, 0.6]);
+        let atlases = crate::patches::EpfPatchAtlases {
+            glyphs: std::sync::Arc::new(GlyphAtlasLuma {
+                width: 3,
+                samples: vec![0, 0, 0, 0, 9, -4],
+                coverage: None,
+            }),
+            tiles: Some(tiles),
+        };
+        let layers = LumaLayers {
+            additive: Some(&[0.0, 0.0, 0.0, 0.05, 0.01, 0.0]),
+            patches: Some((&references, &atlases)),
+            overlay: None,
+        };
+        let output = layers.compose(&[0.1; 6], 3);
+        let step = 1.0 / crate::quant_weights::INV_DC_QUANT[1];
+        assert_eq!(
+            output,
+            [
+                0.1,
+                0.1 + 9.0 * step,
+                0.1 - 4.0 * step,
+                0.4 + 0.05,
+                0.6 + 9.0 * step + 0.01,
+                0.1 - 4.0 * step,
+            ]
+        );
+    }
+
+    #[test]
     fn no_additive_luma_matches_zero_layer_choice() {
         let ctx = EncodingContext::default();
         let (source, recon, blocks, _) = additive_scene();
@@ -720,8 +997,8 @@ mod fit_tests {
         let none = fit(
             &ctx,
             &mut scratch,
-            &source,
-            None,
+            Cow::Borrowed(&source),
+            LumaLayers::default(),
             &recon,
             &blocks,
             2.0,
@@ -731,8 +1008,11 @@ mod fit_tests {
         let with_zero = fit(
             &ctx,
             &mut scratch,
-            &source,
-            Some(&zero),
+            Cow::Borrowed(&source),
+            LumaLayers {
+                additive: Some(&zero),
+                ..LumaLayers::default()
+            },
             &recon,
             &blocks,
             2.0,
@@ -749,8 +1029,11 @@ mod fit_tests {
         let actual = fit(
             &ctx,
             &mut scratch,
-            &source,
-            Some(&layer),
+            Cow::Borrowed(&source),
+            LumaLayers {
+                additive: Some(&layer),
+                ..LumaLayers::default()
+            },
             &recon,
             &blocks,
             2.0,
