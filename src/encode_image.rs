@@ -1622,9 +1622,41 @@ fn encode_image_rgb(
             encode_crop_stack(input, width, height, config, whole.len(), crop_share)?
         && (stack.len() as f64) < crop_share * whole.len() as f64
     {
-        return Ok(stack);
+        return snapped_vector_race(input, width, height, config, stack);
     }
-    Ok(whole)
+    snapped_vector_race(input, width, height, config, whole)
+}
+
+/// The vector layers of the fringe-snapped split
+/// ([`crate::vector_layers::split_snapped`]) against the finished encode,
+/// smaller file standing. The snap passes art the split's gates would refuse
+/// and the edge-cost budget misjudges, so only real bytes decide, at the
+/// distance's full coverage precision.
+fn snapped_vector_race(
+    input: &[u8],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+    current: Vec<u8>,
+) -> Result<Vec<u8>, EncodeError> {
+    if !config.vector_layers
+        || config.speed < Speed::Slow
+        || config.coding_transform != CodingTransform::Xyb
+        || config.progressive
+        || config.progressive_dc
+    {
+        return Ok(current);
+    }
+    let steps = crate::vector_layers::coverage_steps(config.distance);
+    let Some(split) = crate::vector_layers::split_snapped(input, width, height, steps) else {
+        return Ok(current);
+    };
+    let snapped = encode_vector_layers(split, width, height, config)?.bytes;
+    Ok(if snapped.len() < current.len() {
+        snapped
+    } else {
+        current
+    })
 }
 
 /// The whole-image arms (vector layers, ink stack, VarDCT) of a validated
