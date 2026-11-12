@@ -114,7 +114,7 @@ pub(crate) use squeeze::{GlobalPlaneTree, PlaneTreeBudget, StreamCrop, learn_glo
 pub(crate) mod kit {
     pub(crate) use super::GroupLayout;
     pub(crate) use super::groups::{group_lz_threads, write_lz_groups};
-    pub(crate) use super::header::{write_toc_entry, write_u64};
+    pub(crate) use super::header::{write_frame_dimension, write_toc_entry, write_u64};
     pub(crate) use super::lz77::{
         LZ77_MIN_SYMBOL, LzToken, LzTokenSource, build_lz_pixel_code_ans, lz77_compress_for_speed,
         lz77_literals, write_lz_section, write_tree_lz77,

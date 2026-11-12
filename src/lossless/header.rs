@@ -52,7 +52,7 @@ pub(crate) fn write_u64(value: u64, w: &mut BitWriter) {
     }
 }
 
-fn write_frame_dimension(value: usize, w: &mut BitWriter) {
+pub(crate) fn write_frame_dimension(value: usize, w: &mut BitWriter) {
     let value = value as u64;
     if value < 256 {
         w.write(2, 0);
@@ -66,6 +66,28 @@ fn write_frame_dimension(value: usize, w: &mut BitWriter) {
     } else {
         w.write(2, 3);
         w.write(30, value - 18688);
+    }
+}
+
+/// The LfGlobal dc_quant field of a modular frame: all_default, or the
+/// refined XYB lattice of a crop or ink frame ([`crate::xyb::CROP_LATTICE_SCALE`]).
+pub(super) fn write_dc_quant(kind: ModularFrameKind<'_>, w: &mut BitWriter) {
+    let scale = match kind {
+        ModularFrameKind::XybCrop { .. } | ModularFrameKind::XybBlend { .. } => {
+            crate::xyb::CROP_LATTICE_SCALE
+        }
+        _ => 1,
+    };
+    if scale == 1 {
+        w.write(1, 1); // dc_quant all_default = 1
+        return;
+    }
+    use crate::quant_weights::INV_DC_QUANT;
+    w.write(1, 0);
+    for inv in INV_DC_QUANT {
+        // Read as value / 128; powers of two keep every step F16-exact.
+        let step_x128 = 128.0 / (inv * scale as f32);
+        w.write(16, crate::util::f32_to_f16_bits(step_x128) as u64);
     }
 }
 
@@ -463,12 +485,16 @@ fn patch_dictionary_tokens(references: &[PatchReference], has_alpha: bool) -> Ve
                 tokens.push(Token::new(PATCH_OFFSET, pack_signed(x as i32 - px as i32)));
                 tokens.push(Token::new(PATCH_OFFSET, pack_signed(y as i32 - py as i32)));
             }
-            // color = Mul (3), Add (2) or Replace (1); Mul also signals clamp = false
+            // color = BlendAbove (4), Mul (3), Add (2) or Replace (1); Mul and
+            // BlendAbove also signal clamp = false. BlendAbove takes the alpha
+            // of the only extra channel (glyph templates run on RGB + alpha).
             let alpha_only = reference.alpha_only;
             tokens.push(Token::new(
                 BLEND_MODE,
                 if alpha_only {
                     0
+                } else if reference.mul && !reference.add {
+                    4
                 } else if reference.mul {
                     3
                 } else if reference.add {

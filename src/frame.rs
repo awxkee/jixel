@@ -66,7 +66,7 @@ pub(crate) use dc_tokens::{
     DC_PREDICTOR_WEIGHTED, DcPlanePrice, collect_dc_tokens_with_gradient, price_dc_plane,
     write_context_tree, write_tree_tokens,
 };
-pub(crate) use encoder::encode_frame;
+pub(crate) use encoder::{encode_frame, encode_modular_crop_frame};
 pub(crate) use header::write_quant_scales;
 pub(crate) use metadata::{ac_metadata_context, collect_ac_metadata_tokens};
 pub(crate) use quantization::epf_sharpness_id;

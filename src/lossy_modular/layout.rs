@@ -37,8 +37,8 @@
 
 use crate::bit_writer::BitWriter;
 use crate::lossless::kit::{
-    GroupLayout, write_modular_transforms_rct_squeeze, write_modular_transforms_squeeze_only,
-    write_modular_transforms_squeeze_palette, write_u64,
+    GroupLayout, write_frame_dimension, write_modular_transforms_rct_squeeze,
+    write_modular_transforms_squeeze_only, write_modular_transforms_squeeze_palette, write_u64,
 };
 
 /// XYB float -> integer scale factors in X, Y, B order. Signaled to the decoder
@@ -138,6 +138,42 @@ fn write_xyb_frame_header(epf: (u32, f32), patched: bool, group_shift: u32, w: &
     w.write(1, 0); // have_crop = false
     w.write(2, 0b00); // blending = Replace
     w.write(1, 1); // is_last
+    w.write(2, 0b00); // name length = 0
+    write_loop_filter(epf, w);
+    w.write(2, 0b00); // no FH extensions
+}
+
+/// Cropped modular frame of the lossy codestream: the rectangle at `origin`
+/// replaces reference slot 0 there and, unless `last`, the result goes back
+/// to slot 0 (a crop frame over a saved base, see `crop_frames`).
+pub(super) fn write_xyb_crop_frame_header(
+    epf: (u32, f32),
+    group_shift: u32,
+    origin: [usize; 2],
+    size: [usize; 2],
+    last: bool,
+    w: &mut BitWriter,
+) {
+    w.write(1, 0); // all_default = false
+    w.write(2, 0b00); // regular frame
+    w.write(1, 1); // encoding = Modular
+    write_u64(0, w); // flags
+    w.write(2, 0b00); // upsampling = 1
+    w.write(2, group_shift as u64);
+    w.write(2, 0b00); // num_passes = 1
+    w.write(1, 1); // have_crop
+    write_frame_dimension(2 * origin[0], w); // PackSigned(x0)
+    write_frame_dimension(2 * origin[1], w);
+    write_frame_dimension(size[0], w);
+    write_frame_dimension(size[1], w);
+    w.write(2, 0b00); // blending = Replace
+    w.write(2, 0); // source = 0
+    if last {
+        w.write(1, 1); // is_last
+    } else {
+        w.write(1, 0); // not the last frame
+        w.write(2, 0); // save_as_reference = 0
+    }
     w.write(2, 0b00); // name length = 0
     write_loop_filter(epf, w);
     w.write(2, 0b00); // no FH extensions

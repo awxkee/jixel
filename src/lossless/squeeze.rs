@@ -244,7 +244,7 @@ pub(super) fn encode_squeeze_single_group(
 
     write_frame_header_modular_kind(alpha.is_some(), frame_kind, layout, writer);
     let mut section = BitWriter::new();
-    section.write(1, 1); // dc_quant all_default = 1
+    super::header::write_dc_quant(frame_kind, &mut section);
     section.write(1, 0); // has_tree = 0 (local tree in GroupHeader)
     section.write(1, 0); // use_global_tree = 0
     section.write(1, 1); // wp_default = 1
@@ -564,7 +564,7 @@ pub(super) fn encode_squeeze_multigroup(
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
 
     // ----- Section 0: LfGlobal = global tree + global modular image -----
-    sections[0].write(1, 1); // dc_quant all_default = 1
+    super::header::write_dc_quant(frame_kind, &mut sections[0]);
     sections[0].write(1, 1); // has_tree = 1
     write_local_tree_lz77(
         &predictors,

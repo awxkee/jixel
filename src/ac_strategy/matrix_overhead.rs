@@ -147,7 +147,7 @@ pub(crate) fn account_matrix_headers(
     }
     let qm_mult_x = 1.25f32.powf(x_qm_scale as f32 - 2.0);
     let dc_ref = &*dc_datas;
-    const FAMILIES: [usize; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 12];
+    static FAMILIES: [usize; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 12];
     let families = ctx
         .thread_pool
         .steal_map(scratch, FAMILIES.len(), |index, scratch| {

@@ -350,7 +350,7 @@ pub(super) fn try_encode_palette_single_group(
         write_frame_header_modular_kind(alpha.is_some(), frame_kind, layout, writer);
 
         let mut section = BitWriter::new();
-        section.write(1, 1); // dc_quant all_default = 1
+        super::header::write_dc_quant(frame_kind, &mut section);
         section.write(1, 0); // has_tree = 0
         section.write(1, 0); // use_global_tree = 0
         section.write(1, 1); // wp_default = 1

@@ -261,16 +261,12 @@ pub(crate) fn xyb_lattice_sse41(
     m: &XybMatrix,
     [r, g, b]: [&[f32]; 3],
     [luma, co, cg]: [&mut [i32]; 3],
+    scale: u32,
 ) -> usize {
     use super::quantize_xyb::round_ties_away_i32;
     use crate::lossless::rct_simd::sse::forward_vec;
-    use crate::quant_weights::INV_DC_QUANT;
 
-    let [sx, sy, sb] = [
-        _mm_set1_ps(INV_DC_QUANT[0]),
-        _mm_set1_ps(INV_DC_QUANT[1]),
-        _mm_set1_ps(INV_DC_QUANT[2]),
-    ];
+    let [sx, sy, sb] = scaled_lattice_quantizers(scale).map(|quantizer| _mm_set1_ps(quantizer));
     let r = r.as_chunks::<4>().0;
     let g = g.as_chunks::<4>().0;
     let b = b.as_chunks::<4>().0;

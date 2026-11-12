@@ -73,7 +73,7 @@ pub(crate) const RESAMPLE_SCALE_128_TO_16: [f32; 16] = [
         all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
     ))
 ))]
-pub(crate) const WC128: [f32; 64] = [
+pub(crate) static WC128: [f32; 64] = [
     0.50003767,
     0.500339031,
     0.500942707,
@@ -140,7 +140,7 @@ pub(crate) const WC128: [f32; 64] = [
     40.7446899,
 ];
 
-pub(crate) const INV_WC128: [f32; 64] = [
+pub(crate) static INV_WC128: [f32; 64] = [
     1.99984944,
     1.99864471,
     1.99623621,
@@ -218,7 +218,7 @@ pub(crate) const INV_WC128: [f32; 64] = [
     all(target_arch = "x86_64", feature = "avx"),
     all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
 ))]
-pub(crate) const DCT128_SPLIT_COS: [f32; 32] = [
+pub(crate) static DCT128_SPLIT_COS: [f32; 32] = [
     0.999924719,
     0.999322355,
     0.998118103,

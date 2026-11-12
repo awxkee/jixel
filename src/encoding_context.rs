@@ -71,6 +71,9 @@ pub(crate) struct EncodingContext {
     pub(crate) thread_pool: ThreadPool,
     pub(crate) speed: Speed,
     pub(crate) frame_role: FrameRole,
+    /// The saved first frame is the base of a crop stack: a whole image
+    /// with some rectangles filled flat, not an ink stack's base.
+    pub(crate) crop_base: bool,
     /// Lossy arm selection from the public config
     pub(crate) lossy_modular: crate::LossyModular,
     /// Code VarDCT frames' DC as a separate DC frame (see
@@ -137,6 +140,18 @@ pub(crate) struct EncodingContext {
     /// Permit repeated coverage masks to use their own patch atlas. Follows
     /// the public patch setting; exact extra-channel coding is independent.
     pub(crate) alpha_patches: bool,
+    /// Fit the edge-preserving filter with glyph patches included.
+    pub(crate) patch_epf: bool,
+    /// Later frames over this saved base frame (ink or crop frames), for
+    /// the edge-preserving filter fit (see `EncodeConfig::patch_epf`).
+    pub(crate) epf_overlay: Option<crate::epf_filter::EpfOverlay>,
+    /// Glyphs recurring over different backgrounds share one blend-above
+    /// template (color and coverage) in frames that carry an 8-bit alpha
+    /// channel (see `EncodeConfig::glyph_templates`).
+    pub(crate) glyph_templates: bool,
+    /// Receives the most atlas area (pixels) any glyph search's templates
+    /// would save over exact patches.
+    pub(crate) template_probe: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     /// Native coherent extra-channel function fields.
     pub(crate) function_fields: bool,
     /// Function fields may use a second frame (function base + residual).
@@ -605,6 +620,7 @@ impl EncodingContext {
             thread_pool: ThreadPool::new(num_threads),
             speed,
             frame_role: FrameRole::Last,
+            crop_base: false,
             lossy_modular: crate::LossyModular::Off,
             progressive_dc: false,
             progressive_dc_levels: None,
@@ -639,6 +655,10 @@ impl EncodingContext {
             extra_plane_tree: None,
             extra_context_trees: false,
             alpha_patches: false,
+            patch_epf: false,
+            epf_overlay: None,
+            glyph_templates: false,
+            template_probe: None,
             function_fields: false,
             function_fields_layered: false,
             function_fields_exact: false,

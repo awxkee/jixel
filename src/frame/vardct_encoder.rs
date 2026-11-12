@@ -66,6 +66,7 @@ use crate::noise::GrainPass;
 use crate::patches::VarDctFrameKind;
 use crate::util::EncodeError;
 use std::borrow::Cow;
+use std::sync::Mutex;
 
 #[cfg(test)]
 #[path = "vardct_encoder_tests.rs"]
@@ -124,7 +125,7 @@ fn edge_view(
         }
     }
     let replaced = match frame_kind {
-        VarDctFrameKind::Patched(references) => {
+        VarDctFrameKind::Patched(references, _) => {
             let mut replaced = vec![false; len];
             for reference in references
                 .iter()
@@ -170,7 +171,7 @@ pub(super) fn encode_frame_core(
         let eligible = ctx.function_fields
             && match frame_kind {
                 VarDctFrameKind::Regular => true,
-                VarDctFrameKind::Patched(references) => {
+                VarDctFrameKind::Patched(references, _) => {
                     references.iter().all(|r| !r.alpha_only && r.ref_frame != 0)
                 }
                 VarDctFrameKind::ReferenceOnly { .. } => false,
@@ -615,7 +616,7 @@ fn encode_frame_core_masks(
                 ..ExtraCoding::default()
             },
             coeff_shifts,
-            VarDctFrameKind::Patched(&plan.references),
+            VarDctFrameKind::Patched(&plan.references, None),
             #[cfg(feature = "splines")]
             None,
             #[cfg(feature = "splines")]
@@ -650,7 +651,7 @@ fn encode_frame_core_plain(
 ) -> Result<usize, EncodeError> {
     let displayed = matches!(
         frame_kind,
-        VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
+        VarDctFrameKind::Regular | VarDctFrameKind::Patched(..)
     );
     if matches!(grain_pass, GrainPass::Inherit)
         && ctx.grain == crate::Grain::Auto
@@ -779,9 +780,16 @@ struct ExtraCoding<'a> {
 fn color_is_unpatched(frame_kind: VarDctFrameKind<'_>) -> bool {
     match frame_kind {
         VarDctFrameKind::Regular => true,
-        VarDctFrameKind::Patched(references) => references.iter().all(|r| r.alpha_only),
+        VarDctFrameKind::Patched(references, _) => references.iter().all(|r| r.alpha_only),
         VarDctFrameKind::ReferenceOnly { .. } => false,
     }
+}
+
+pub(super) fn epf_fit_enabled(ctx: &EncodingContext, distance: f32) -> bool {
+    // A saved base is fitted only when it knows what is laid over it.
+    let role = ctx.frame_role == FrameRole::Last
+        || (ctx.frame_role == FrameRole::SavedFirst && ctx.patch_epf && ctx.epf_overlay.is_some());
+    ctx.speed.effort().epf_fit && ctx.coding.is_xyb() && role && (0.5..=24.0).contains(&distance)
 }
 
 fn encode_frame_core_inner(
@@ -807,7 +815,7 @@ fn encode_frame_core_inner(
     let mut opsin = opsin;
     let displayed = matches!(
         frame_kind,
-        VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
+        VarDctFrameKind::Regular | VarDctFrameKind::Patched(..)
     );
     let probe_stats = match &grain_pass {
         GrainPass::Probe(stats) | GrainPass::Apply(_, stats, _) => Some(stats),
@@ -845,7 +853,7 @@ fn encode_frame_core_inner(
     let use_dc_frame = ctx.progressive_dc
         && matches!(
             frame_kind,
-            VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
+            VarDctFrameKind::Regular | VarDctFrameKind::Patched(..)
         )
         && alpha.is_none()
         && ctx.coding.is_xyb()
@@ -875,7 +883,7 @@ fn encode_frame_core_inner(
         && ctx.coding.is_xyb()
         && matches!(
             frame_kind,
-            VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
+            VarDctFrameKind::Regular | VarDctFrameKind::Patched(..)
         )
         && noise.is_none()
         && !use_dc_frame
@@ -987,19 +995,19 @@ fn encode_frame_core_inner(
         }
     }
 
+    let patch_luma = match frame_kind {
+        VarDctFrameKind::Patched(references, Some(atlases)) => Some((references, atlases)),
+        _ => None,
+    };
     // Layer residuals and progressive/DC frames retain the EPF schedule.
-    let fit_epf = ctx.speed.effort().epf_fit
-        && ctx.coding.is_xyb()
-        && color_is_unpatched(frame_kind)
-        && ctx.frame_role == FrameRole::Last
+    let fit_epf = epf_fit_enabled(ctx, distance)
+        && (patch_luma.is_some() || color_is_unpatched(frame_kind))
         && !use_dc_frame
         && num_passes == 1
-        && (0.5..=24.0).contains(&distance)
         && dim.xsize >= 16
         && dim.ysize >= 16;
     // The grain probe reads its survival off the same reconstruction.
     let want_recon = fit_epf || (probe_stats.is_some() && !use_dc_frame && num_passes == 1);
-    let mut epf_recon = want_recon.then(|| Image3F::new(dim.xsize, dim.ysize));
 
     // Per-image quant-field threshold for the fine AC block-context layout.
     // The median splits the field into halves with genuinely different
@@ -1023,48 +1031,51 @@ fn encode_frame_core_inner(
     } else {
         (num_passes, coeff_shifts)
     };
-    let results = ctx
-        .thread_pool
-        .steal_map(scratch, ac_tasks.len(), |t, scratch| {
-            let (dc_idx, gx, gy) = ac_tasks[t];
-            let (dc_gx, dc_gy) = group_coords[dc_idx];
-            let (p, local, source_b, stats, capture) = process_ac_group(
-                ctx,
-                scratch,
-                opsin,
-                &dim,
-                &distp,
-                &dc_ref[dc_idx],
-                analysis_passes,
-                analysis_shifts,
-                dc_gx,
-                dc_gy,
-                gx,
-                gy,
-                0,
-                None,
-                &natural_orders,
-                &[],
-                want_order_stats || use_dc_frame || want_recon,
-                qf_threshold,
-                // Without custom orders this pass is the final quantization.
-                want_recon && !want_order_stats,
-                None,
-            );
-            (
-                (dc_idx, gx, gy, p, local, source_b, stats),
-                capture.map(|(image, _)| image),
-            )
-        });
+    // Only the final quantization produces pixels. Each worker pastes its
+    // group on completion so the frame and all group captures never coexist.
+    let mut epf_recon =
+        (want_recon && !want_order_stats).then(|| Image3F::new(dim.xsize, dim.ysize));
+    let results = {
+        let target = epf_recon.as_mut().map(Mutex::new);
+        ctx.thread_pool
+            .steal_map(scratch, ac_tasks.len(), |t, scratch| {
+                let (dc_idx, gx, gy) = ac_tasks[t];
+                let (dc_gx, dc_gy) = group_coords[dc_idx];
+                let (p, local, source_b, stats, capture) = process_ac_group(
+                    ctx,
+                    scratch,
+                    opsin,
+                    &dim,
+                    &distp,
+                    &dc_ref[dc_idx],
+                    analysis_passes,
+                    analysis_shifts,
+                    dc_gx,
+                    dc_gy,
+                    gx,
+                    gy,
+                    0,
+                    None,
+                    &natural_orders,
+                    &[],
+                    want_order_stats || use_dc_frame || want_recon,
+                    qf_threshold,
+                    // Without custom orders this pass is the final quantization.
+                    want_recon && !want_order_stats,
+                    None,
+                );
+                if let (Some(target), Some((image, _))) = (&target, capture) {
+                    paste_group(&mut target.lock().unwrap(), &dim, p.group_idx, &image);
+                }
+                (dc_idx, gx, gy, p, local, source_b, stats)
+            })
+    };
 
     let mut all_pending: Vec<PendingAcGroup> = Vec::with_capacity(results.len());
     // Adopt the first group's buffers instead of allocating an empty tally.
     // Fast and progressive frames never allocate aggregate order statistics.
     let mut order_stats: Option<crate::coeff_order::OrderStats> = None;
-    for ((dc_idx, gx, gy, p, local, source, stats), capture) in results {
-        if let (Some(target), Some(image)) = (epf_recon.as_mut(), capture) {
-            paste_group(target, &dim, p.group_idx, &image);
-        }
+    for (dc_idx, gx, gy, p, local, source, stats) in results {
         merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
         if let Some(source) = source {
             let dc = &mut dc_datas[dc_idx];
@@ -1330,7 +1341,7 @@ fn encode_frame_core_inner(
                 ytob_dc,
                 qf_threshold,
                 &prices,
-                epf_recon.is_some(),
+                want_recon,
                 // Patch atlases and reference frames are judged by the
                 // frames that use them, not by their own reconstruction.
                 if color_is_unpatched(frame_kind)
@@ -1353,9 +1364,11 @@ fn encode_frame_core_inner(
         let refined = if let Some((groups, recon)) = loop_groups {
             // The loop's final reconstruction replaces the pass-2 captures.
             epf_recon = recon;
-            groups.into_iter().map(|g| (g, None)).collect::<Vec<_>>()
+            groups
         } else {
             let dc_ref = &dc_datas;
+            epf_recon = want_recon.then(|| Image3F::new(dim.xsize, dim.ysize));
+            let target = epf_recon.as_mut().map(Mutex::new);
             ctx.thread_pool
                 .steal_map(scratch, ac_tasks.len(), |t, scratch| {
                     let (dc_idx, gx, gy) = ac_tasks[t];
@@ -1382,13 +1395,13 @@ fn encode_frame_core_inner(
                         want_recon,
                         None,
                     );
-                    ((dc_idx, gx, gy, p, local), capture.map(|(image, _)| image))
+                    if let (Some(target), Some((image, _))) = (&target, capture) {
+                        paste_group(&mut target.lock().unwrap(), &dim, p.group_idx, &image);
+                    }
+                    (dc_idx, gx, gy, p, local)
                 })
         };
-        for ((dc_idx, gx, gy, p, local), capture) in refined {
-            if let (Some(target), Some(image)) = (epf_recon.as_mut(), capture) {
-                paste_group(target, &dim, p.group_idx, &image);
-            }
+        for (dc_idx, gx, gy, p, local) in refined {
             merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
             all_pending.push(p);
         }
@@ -1542,14 +1555,22 @@ fn encode_frame_core_inner(
             // Splines are drawn after the filter: the fit sees them as a layer.
             let spline_layer =
                 splines.map(|set| crate::splines::additive_y(ctx, set, dim.xsize, dim.ysize));
+            let overlay = ctx
+                .epf_overlay
+                .as_ref()
+                .filter(|o| o.len() == source_y.as_slice().len());
             let chosen = crate::epf_filter::fit(
                 ctx,
                 scratch,
-                &source_y,
-                #[cfg(feature = "splines")]
-                spline_layer.as_deref(),
-                #[cfg(not(feature = "splines"))]
-                None,
+                source_y,
+                crate::epf_filter::LumaLayers {
+                    #[cfg(feature = "splines")]
+                    additive: spline_layer.as_deref(),
+                    #[cfg(not(feature = "splines"))]
+                    additive: None,
+                    patches: patch_luma,
+                    overlay,
+                },
                 &recon,
                 &blocks,
                 distance,
@@ -2188,7 +2209,7 @@ fn encode_frame_core_inner(
     let dc_code = dc_code_owned.as_ref();
 
     // Write DC global with adaptive DC code.
-    if let VarDctFrameKind::Patched(references) = frame_kind {
+    if let VarDctFrameKind::Patched(references, _) = frame_kind {
         crate::lossless::write_patch_dictionary(
             references,
             alpha.is_some(),
@@ -2420,7 +2441,7 @@ fn encode_frame_core_inner(
     let order = (ctx.group_order != crate::GroupOrder::Scanline
         && matches!(
             frame_kind,
-            VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
+            VarDctFrameKind::Regular | VarDctFrameKind::Patched(..)
         ))
     .then(|| group_section_order(&dim, num_passes, ctx.group_order));
     combine_sections_ordered(

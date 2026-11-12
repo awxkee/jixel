@@ -182,7 +182,7 @@ pub(crate) fn rgb_to_xyb_pixel_f32(m: &XybMatrix, r: f32, g: f32, b: f32) -> (f3
     (0.5 * (tm0 - tm1), 0.5 * (tm0 + tm1), tm2)
 }
 
-type XybLatticeFn = unsafe fn(&XybMatrix, [&[f32]; 3], [&mut [i32]; 3]) -> usize;
+type XybLatticeFn = unsafe fn(&XybMatrix, [&[f32]; 3], [&mut [i32]; 3], u32) -> usize;
 
 fn select_xyb_lattice_fn() -> XybLatticeFn {
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
@@ -199,22 +199,39 @@ fn select_xyb_lattice_fn() -> XybLatticeFn {
         return crate::sse::xyb_lattice_sse41;
     }
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    return crate::neon::xyb_lattice_neon;
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        return crate::neon::xyb_lattice_neon;
+    }
     #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
-    return crate::wasm::xyb_lattice_wasm;
-    #[cfg(not(any(
-        all(target_arch = "aarch64", feature = "neon"),
-        all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
-    )))]
-    |_, _, _| 0
+    {
+        crate::wasm::xyb_lattice_wasm
+    }
+    #[cfg(not(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")))]
+    {
+        |_, _, _, _| 0
+    }
 }
 
-/// Convert linear RGB to the base frame's quantized XYB lattice, with YCoCg
-/// applied to (Y, X, B-Y) for modular coding. Each backend uses the same
-/// arithmetic for full vectors and tails, including AVX2's fused multiply-add.
-pub(crate) fn xyb_lattice_ycocg(m: &XybMatrix, input: [&[f32]; 3], output: [&mut [i32]; 3]) {
+/// Refinement of the default XYB lattice in crop and ink frames.
+pub(crate) const CROP_LATTICE_SCALE: u32 = 8;
+
+#[inline]
+pub(crate) fn scaled_lattice_quantizers(scale: u32) -> [f32; 3] {
+    // The base quantizers are powers of two, so folding in the refinement
+    // preserves rounding before conversion to lattice integers.
+    crate::quant_weights::INV_DC_QUANT.map(|quantizer| quantizer * scale as f32)
+}
+
+/// Convert linear RGB to the XYB lattice refined `scale` times. Apply YCoCg
+/// to the quantized (Y, X, B-Y) planes for modular coding.
+/// The input and output planes must have equal lengths.
+pub(crate) fn xyb_lattice_ycocg_scaled(
+    m: &XybMatrix,
+    input: [&[f32]; 3],
+    output: [&mut [i32]; 3],
+    scale: u32,
+) {
     use crate::lossless::forward_ycocg;
-    use crate::quant_weights::INV_DC_QUANT;
 
     static LATTICE: OnceLock<XybLatticeFn> = OnceLock::new();
     let lattice = *LATTICE.get_or_init(select_xyb_lattice_fn);
@@ -225,9 +242,10 @@ pub(crate) fn xyb_lattice_ycocg(m: &XybMatrix, input: [&[f32]; 3], output: [&mut
             .iter()
             .all(|&len| len == r.len())
     );
-    // SAFETY: dispatch selects supported CPU features. The kernels only load
-    // and store complete vectors from the slices they receive.
-    let done = unsafe { lattice(m, input, [y_out, co_out, cg_out]) };
+    // SAFETY: dispatch selects supported CPU features and all six planes
+    // have equal lengths. The AVX2 kernel masks any partial vector.
+    let done = unsafe { lattice(m, input, [y_out, co_out, cg_out], scale) };
+    let [sx, sy, sb] = scaled_lattice_quantizers(scale);
     let src = r[done..].iter().zip(&g[done..]).zip(&b[done..]);
     let dst = y_out[done..]
         .iter_mut()
@@ -235,12 +253,9 @@ pub(crate) fn xyb_lattice_ycocg(m: &XybMatrix, input: [&[f32]; 3], output: [&mut
         .zip(&mut cg_out[done..]);
     for (((r, g), b), ((y_out, co_out), cg_out)) in src.zip(dst) {
         let (x, y, b) = rgb_to_xyb_pixel_f32(m, *r, *g, *b);
-        let yq = (y * INV_DC_QUANT[1]).round() as i32;
-        (*y_out, *co_out, *cg_out) = forward_ycocg(
-            yq,
-            (x * INV_DC_QUANT[0]).round() as i32,
-            (b * INV_DC_QUANT[2]).round() as i32 - yq,
-        );
+        let yq = (y * sy).round() as i32;
+        (*y_out, *co_out, *cg_out) =
+            forward_ycocg(yq, (x * sx).round() as i32, (b * sb).round() as i32 - yq);
     }
 }
 
@@ -505,13 +520,17 @@ pub(crate) type RoundLatticePow2Fn = unsafe fn(&mut [i32], u32);
 
 /// `round_lattice_pow2` without SIMD; also the tails of the SIMD kernels.
 pub(crate) fn round_lattice_pow2_scalar(plane: &mut [i32], shift: u32) {
-    let half = (1i32 << shift) >> 1;
-    let mask = -(1i32 << shift);
     for v in plane.iter_mut() {
-        let sign = *v >> 31;
-        let r = (v.wrapping_abs().wrapping_add(half)) & mask;
-        *v = (r ^ sign).wrapping_sub(sign);
+        *v = round_lattice_pow2_value(*v, shift);
     }
+}
+
+#[inline]
+pub(crate) fn round_lattice_pow2_value(value: i32, shift: u32) -> i32 {
+    let step = 1i32 << shift;
+    let sign = value >> 31;
+    let rounded = value.wrapping_abs().wrapping_add(step >> 1) & -step;
+    (rounded ^ sign).wrapping_sub(sign)
 }
 
 fn select_round_lattice_pow2_fn() -> RoundLatticePow2Fn {
@@ -651,6 +670,50 @@ pub(crate) fn quantize_xyb_tile_colors(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refined_lattice_matches_scalar_across_vector_tails() {
+        use crate::lossless::forward_ycocg;
+        use crate::quant_weights::INV_DC_QUANT;
+
+        const GUARD: i32 = i32::MIN;
+        let mut custom = XybMatrix::SPEC;
+        custom.fwd[6..].copy_from_slice(&[0.1, 0.2, 0.7]);
+        let rgb: [[f32; 258]; 3] = std::array::from_fn(|c| {
+            std::array::from_fn(|i| ((i * (97 + 4 * c) + c * 113) % 1031) as f32 / 255.0 - 0.5)
+        });
+        for matrix in [XybMatrix::SPEC, custom] {
+            for scale in [0, 2, 3, CROP_LATTICE_SCALE] {
+                for n in (0..=33).chain([255, 256, 257]) {
+                    let input = rgb.each_ref().map(|p| &p[1..1 + n]);
+                    let mut output = [[GUARD; 259]; 3];
+                    xyb_lattice_ycocg_scaled(
+                        &matrix,
+                        input,
+                        output.each_mut().map(|p| &mut p[1..1 + n]),
+                        scale,
+                    );
+                    for i in 0..n {
+                        let (x, y, b) =
+                            rgb_to_xyb_pixel_f32(&matrix, input[0][i], input[1][i], input[2][i]);
+                        let quantize =
+                            |v: f32, c: usize| (v * INV_DC_QUANT[c] * scale as f32).round() as i32;
+                        let y = quantize(y, 1);
+                        let (luma, co, cg) = forward_ycocg(y, quantize(x, 0), quantize(b, 2) - y);
+                        assert_eq!(
+                            output.each_ref().map(|p| p[i + 1]),
+                            [luma, co, cg],
+                            "scale={scale}, len={n}, pixel={i}",
+                        );
+                    }
+                    for p in output {
+                        assert_eq!(p[0], GUARD);
+                        assert!(p[1 + n..].iter().all(|&v| v == GUARD));
+                    }
+                }
+            }
+        }
+    }
 
     fn inverse_row_kernels() -> Vec<(&'static str, ToLinearRowsFn)> {
         #[allow(unused_mut)]

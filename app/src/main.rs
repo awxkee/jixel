@@ -9,21 +9,18 @@ use std::thread::available_parallelism;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     // let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new(
-        "./assets/illustrations/jake-cat-illustration.png",
-    ))
-    .unwrap();
+    let image = image::open(Path::new("./assets/Screenshot 2026-10-17 at 21.00.25.png")).unwrap();
     let rgb_img = image.to_rgb8();
     // let rgba_img = image.to_rgba8();
     // let gray_img = image.to_luma8();
     // let src_rgb = rgb_img.as_raw();
-    let distance = 4.515;
+    let distance = 1.515;
     let width = image.width() as usize;
     let height = image.height() as usize;
     let cfg = EncodeConfig::default()
         .with_lossless(false)
         .with_distance(distance)
-        .with_speed(Speed::ExtraSlow)
+        .with_speed(Speed::Slow)
         .with_progressive(false)
         .with_decoding_speed(DecodingSpeed::Slow)
         .with_upsampling(false)

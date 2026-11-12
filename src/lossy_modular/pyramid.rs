@@ -89,6 +89,9 @@ pub(crate) struct Pyramid {
     /// is then the palette's meta channel (the entries, ascending) and the
     /// channel at that index + 1 holds the indices.
     pub(crate) palette: Option<usize>,
+    /// A crop frame over reference slot 0: the rectangle's origin in the
+    /// image and whether the frame is the last one.
+    pub(crate) crop: Option<([usize; 2], bool)>,
 }
 
 impl Pyramid {
@@ -205,6 +208,7 @@ impl Pyramid {
             patches: Vec::new(),
             group_shift: GroupLayout::DEFAULT.shift,
             palette: None,
+            crop: None,
         })
     }
 
@@ -323,6 +327,7 @@ impl Pyramid {
             patches: Vec::new(),
             group_shift: GroupLayout::DEFAULT.shift,
             palette: None,
+            crop: None,
         })
     }
 
@@ -421,6 +426,15 @@ impl Pyramid {
     pub(crate) fn write_frame_header(&self, w: &mut BitWriter) {
         if self.dc_frame {
             write_dc_frame_header(w);
+        } else if let Some((origin, last)) = self.crop {
+            super::layout::write_xyb_crop_frame_header(
+                self.epf,
+                self.group_shift,
+                origin,
+                [self.xsize, self.ysize],
+                last,
+                w,
+            );
         } else {
             self.layout
                 .write_frame_header(self.epf, !self.patches.is_empty(), self.group_shift, w);

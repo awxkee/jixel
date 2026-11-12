@@ -96,6 +96,7 @@ pub(super) const LOCAL_TREE_MAX_BITS_PER_VALUE: f64 = 0.5;
 /// order, or `None` when the source has a global stream.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_local_tree_sections(
+    frame_kind: crate::patches::ModularFrameKind<'_>,
     speed: crate::Speed,
     source: &MaSource<'_>,
     placement: &[MaPlacement],
@@ -295,7 +296,7 @@ pub(super) fn write_local_tree_sections(
     if let Some(dictionary) = dictionary {
         sections[0].append(dictionary);
     }
-    sections[0].write(1, 1); // dc_quant all_default = 1
+    super::header::write_dc_quant(frame_kind, &mut sections[0]);
     sections[0].write(1, 0); // has_tree = 0
     sections[0].write(1, 0); // use_global_tree = 0 (no channel is coded here)
     write_wp_header(wp_params, &mut sections[0]);

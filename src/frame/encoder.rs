@@ -232,6 +232,35 @@ pub(crate) fn encode_frame(
     Ok(false)
 }
 
+/// A lossy-modular crop frame over the saved base (see `crop_frames`): the
+/// rectangle `linear` at `origin`, at the arm's calibrated distance for
+/// `distance`. None when the rectangle is too small to squeeze.
+pub(crate) fn encode_modular_crop_frame(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    distance: f32,
+    linear: Image3F,
+    origin: [usize; 2],
+    last: bool,
+    writer: &mut BitWriter,
+) -> Option<usize> {
+    let texture = lm_texture_factor(&linear);
+    let xyb = to_xyb_image(ctx, scratch, linear);
+    let screen = crate::frame::is_screen_content(&xyb);
+    let modular_distance = crate::lossy_modular::calibrated_distance(distance, screen) * texture;
+    crate::lossy_modular::encode_xyb_crop_frame(
+        &xyb,
+        modular_distance,
+        screen,
+        origin,
+        last,
+        ctx.speed,
+        &ctx.thread_pool,
+        scratch,
+        writer,
+    )
+}
+
 /// The lossy-modular arm of an XYB frame. With `patches`, repeated glyphs
 /// go to an atlas reference frame and the frame codes the image less them:
 /// on screenshots that is -11.7 % SS2 / -9.5 % BA BD at Slow, so a found
@@ -285,7 +314,7 @@ fn encode_modular_xyb(
     };
     let free_singles = distance <= GLYPH_SINGLETON_FREE_MAX_DISTANCE;
     let glyphs = patches
-        .then(|| GlyphStage::find(ctx, scratch, distance, xyb, None, free_singles))
+        .then(|| GlyphStage::find(ctx, scratch, distance, xyb, None, free_singles, false))
         .flatten();
     let best = encode(glyphs, scratch)?;
     // The race encodes the frame twice (1.8x on the screenshots it runs on),
@@ -298,7 +327,7 @@ fn encode_modular_xyb(
         return Some(best);
     }
     let best_bits = best.0.bits_written();
-    match GlyphStage::find(ctx, scratch, distance, xyb, None, true) {
+    match GlyphStage::find(ctx, scratch, distance, xyb, None, true, false) {
         Some(singles)
             if singles.atlas_bits() < best_bits && singles.atlas_bits() * 4 >= best_bits =>
         {

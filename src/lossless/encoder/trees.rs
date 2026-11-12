@@ -277,13 +277,14 @@ impl SourcePlan {
         let rank_layout = layouts.rank_layout();
         let header_bits = |params: WpParams| frame.wp_header_bits(params);
         let keep_stages = !effort.tree_fresh_final_samples;
+        let rank_presets_deep = effort.tree_rank_deep();
         // An ink frame is a palette image by construction: its color planes
         // hold one value per ink, so only the palette source is learned.
         let palette_only =
             matches!(frame.kind, ModularFrameKind::XybBlend { .. }) && palette.is_some();
         let rank_sampling = self.rank_sampling;
         let coarse = |source: &MaSource<'_>, wp_params: WpParams, scratch: &mut CoderScratch| {
-            rank_coarse(
+            let mut stage = rank_coarse(
                 source,
                 xsize,
                 ysize,
@@ -294,7 +295,14 @@ impl SourcePlan {
                 rank_sampling,
                 pool,
                 scratch,
-            )
+            )?;
+            if !keep_stages && !rank_presets_deep {
+                // Later ranking uses only the coarse estimate, and the final
+                // learn samples afresh. Release these rows before the next
+                // source allocates its sample set.
+                stage.samples = crate::ma_tree::MaSamples::with_capacity(0);
+            }
+            Some(stage)
         };
 
         // One coarse learn per source decides which are learned in full.
@@ -359,7 +367,7 @@ impl SourcePlan {
                     rgb_stage.take(),
                     self.wp_params,
                     &header_bits,
-                    effort.tree_rank_deep(),
+                    rank_presets_deep,
                     rank_layout,
                     self.rank_sampling,
                     keep_stages,
@@ -400,7 +408,7 @@ impl SourcePlan {
         }
         if self.palette
             && rank_more
-            && effort.tree_rank_deep()
+            && rank_presets_deep
             && let Some(p) = palette
         {
             // The palette source's WP presets.

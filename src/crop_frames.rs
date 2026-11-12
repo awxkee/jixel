@@ -35,6 +35,11 @@
 //! color, so the base spends almost nothing there. Each crop carries the
 //! vector split's composite at the distance's coverage precision when the
 //! split takes the crop, else the exact pixels.
+//!
+//! Detail crops are the second kind: rectangles of small text and line work
+//! whose edges move luma almost alone, coded as lossy modular crop frames
+//! (the quantized squeeze beats VarDCT there, and loses once the edges
+//! carry chroma, where VarDCT has chroma-from-luma).
 
 /// Side of the planner's tiles; also the alignment of every crop, so the
 /// filled base never splits a VarDCT block across a crop edge.
@@ -145,35 +150,160 @@ pub(crate) fn plan(rgb: &[u8], width: usize, height: usize) -> Vec<CropBox> {
     boxes
 }
 
-/// The image with each box filled with its own most common color: the
-/// crop's background, which the surrounding flat art usually continues.
+/// A crop's most common color, which the surrounding flat art usually
+/// continues.
 /// (A Coons patch of the border pixels streaks a neighbouring photo's grain
 /// across the box: base +4..+8 %, and the corpus wins shrink by a third.)
-pub(crate) fn fill(rgb: &[u8], width: usize, boxes: &[CropBox]) -> Vec<u8> {
-    let mut out = rgb.to_vec();
-    for b in boxes {
-        let mut counts = std::collections::HashMap::<[u8; 3], usize>::new();
-        for y in b.y0..b.y0 + b.height {
-            let row = &rgb[(y * width + b.x0) * 3..(y * width + b.x0 + b.width) * 3];
-            for &p in row.as_chunks::<3>().0 {
-                *counts.entry(p).or_default() += 1;
-            }
-        }
-        let Some(mode) = counts
-            .into_iter()
-            .max_by_key(|&(c, n)| (n, c))
-            .map(|(c, _)| c)
-        else {
-            continue;
-        };
-        for y in b.y0..b.y0 + b.height {
-            let row = &mut out[(y * width + b.x0) * 3..(y * width + b.x0 + b.width) * 3];
-            for p in row.as_chunks_mut::<3>().0 {
-                *p = mode;
-            }
+pub(crate) fn background_color(rgb: &[u8], width: usize, b: CropBox) -> [u8; 3] {
+    let pixels = rgb.as_chunks::<3>().0;
+    let mut crop = (b.y0..b.y0 + b.height).flat_map(|y| &pixels[y * width + b.x0..][..b.width]);
+    let mut color = *crop.next().expect("nonempty crop rectangle");
+    let mut run = 1usize;
+    let mut counts = std::collections::HashMap::<[u8; 3], usize>::new();
+    for &pixel in crop {
+        if pixel == color {
+            run += 1;
+        } else {
+            *counts.entry(color).or_default() += run;
+            color = pixel;
+            run = 1;
         }
     }
-    out
+    if counts.is_empty() {
+        return color;
+    }
+    *counts.entry(color).or_default() += run;
+    counts.into_iter().max_by_key(|&(c, n)| (n, c)).unwrap().0
+}
+
+/// Detail crops stop here: coarser, the squeeze loses its edge over VarDCT
+/// on text (one screen at d 2.7: -1.3 % bytes for -1.1 SS2).
+pub(crate) const DETAIL_MAX_DISTANCE: f32 = 2.0;
+/// Smallest detail crop, in tiles, and its shorter side.
+const MIN_DETAIL_TILES: usize = 16;
+const MIN_DETAIL_SIDE: usize = 3;
+/// Detail crops per image.
+const MAX_DETAIL_CROPS: usize = 4;
+/// A detail tile's mean luma step between neighbors, in 8-bit levels.
+const DETAIL_MIN_STEP: f32 = 3.0;
+/// Its chroma steps stay under this share of its luma steps: the edges move
+/// mostly luma, whatever the two tones are (0.2 misses a scanned page with
+/// blue headings, 1.0 lets saturated text in and loses SS2 there).
+const DETAIL_MAX_CHROMA: f32 = 0.5;
+/// A detail crop is taken when its lossy modular frame costs under this
+/// share of the Fast VarDCT encode of the same crop.
+pub(crate) const DETAIL_MARGIN: f64 = 0.9;
+/// This share of its luma steps comes from hard steps (at least
+/// `DETAIL_HARD_STEP` levels): text and line work, not photo texture.
+const DETAIL_HARD_SHARE: f32 = 0.5;
+const DETAIL_HARD_STEP: i32 = 24;
+/// A blank tile (paper between lines) steps less than this on average.
+const BLANK_MAX_STEP: f32 = 1.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DetailTile {
+    Other,
+    Blank,
+    Detail,
+}
+
+/// Classify every whole tile for [`plan_detail`].
+fn detail_tiles(rgb: &[u8], width: usize, height: usize) -> (Vec<DetailTile>, usize, usize) {
+    let (tw, th) = (width / TILE, height / TILE);
+    let px = rgb.as_chunks::<3>().0;
+    // Luma and the two YCoCg differences of a pixel.
+    let ycc = |x: usize, y: usize| {
+        let [r, g, b] = px[y * width + x].map(i32::from);
+        [(r + 2 * g + b) >> 2, r - b, g - ((r + b) >> 1)]
+    };
+    let mut tiles = vec![DetailTile::Other; tw * th];
+    for ty in 0..th {
+        for tx in 0..tw {
+            let (mut luma, mut chroma, mut hard) = (0i64, 0i64, 0i64);
+            for y in ty * TILE..(ty + 1) * TILE {
+                for x in tx * TILE..(tx + 1) * TILE {
+                    let p = ycc(x, y);
+                    for (nx, ny) in [(x + 1, y), (x, y + 1)] {
+                        if nx >= (tx + 1) * TILE || ny >= (ty + 1) * TILE {
+                            continue;
+                        }
+                        let q = ycc(nx, ny);
+                        let step = (p[0] - q[0]).abs();
+                        luma += i64::from(step);
+                        chroma += i64::from((p[1] - q[1]).abs() + (p[2] - q[2]).abs());
+                        if step >= DETAIL_HARD_STEP {
+                            hard += i64::from(step);
+                        }
+                    }
+                }
+            }
+            let pairs = (2 * TILE * (TILE - 1)) as f32;
+            let (luma, chroma, hard) = (luma as f32, chroma as f32, hard as f32);
+            tiles[ty * tw + tx] =
+                if luma < BLANK_MAX_STEP * pairs && chroma < BLANK_MAX_STEP * pairs {
+                    DetailTile::Blank
+                } else if luma >= DETAIL_MIN_STEP * pairs
+                    && chroma <= DETAIL_MAX_CHROMA * luma
+                    && hard >= DETAIL_HARD_SHARE * luma
+                {
+                    DetailTile::Detail
+                } else {
+                    DetailTile::Other
+                };
+        }
+    }
+    (tiles, tw, th)
+}
+
+/// Tile-aligned rectangles of achromatic sharp detail (small text and line
+/// work in any two tones whose edges move luma alone), largest first, clear
+/// of the `taken` boxes: the lossy modular arm's content. A rectangle holds
+/// detail tiles and the blank tiles next to one.
+pub(crate) fn plan_detail(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    taken: &[CropBox],
+) -> Vec<CropBox> {
+    if width < 4 * TILE || height < 4 * TILE {
+        return Vec::new();
+    }
+    let (tiles, tw, th) = detail_tiles(rgb, width, height);
+    let mut free: Vec<bool> = (0..tw * th)
+        .map(|i| {
+            let (tx, ty) = (i % tw, i / tw);
+            match tiles[i] {
+                DetailTile::Detail => true,
+                DetailTile::Other => false,
+                DetailTile::Blank => (ty.saturating_sub(1)..(ty + 2).min(th)).any(|y| {
+                    (tx.saturating_sub(1)..(tx + 2).min(tw))
+                        .any(|x| tiles[y * tw + x] == DetailTile::Detail)
+                }),
+            }
+        })
+        .collect();
+    for b in taken {
+        for y in b.y0 / TILE..(b.y0 + b.height) / TILE {
+            free[y * tw + b.x0 / TILE..y * tw + (b.x0 + b.width) / TILE].fill(false);
+        }
+    }
+    let mut boxes = Vec::new();
+    while boxes.len() < MAX_DETAIL_CROPS {
+        let (area, x0, y0, x1, y1) = max_rect(&free, tw, th);
+        if area < MIN_DETAIL_TILES || (x1 - x0).min(y1 - y0) < MIN_DETAIL_SIDE {
+            break;
+        }
+        for y in y0..y1 {
+            free[y * tw + x0..y * tw + x1].fill(false);
+        }
+        boxes.push(CropBox {
+            x0: x0 * TILE,
+            y0: y0 * TILE,
+            width: (x1 - x0) * TILE,
+            height: (y1 - y0) * TILE,
+        });
+    }
+    boxes
 }
 
 /// The box's pixels, interleaved RGB.
@@ -247,6 +377,62 @@ mod tests {
         }
     }
 
+    /// Noise everywhere but a 256x192 panel of hard two-tone strokes
+    /// (`ink` on `paper`) at (64, 64).
+    fn strokes(width: usize, height: usize, paper: [u8; 3], ink: [u8; 3]) -> Vec<u8> {
+        let mut seed = 5u32;
+        let mut rgb: Vec<u8> = (0..width * height * 3)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        for y in 64..256 {
+            for x in 64..320 {
+                // Glyph-like marks: 2 px strokes every 5 px on lines 7 px apart.
+                let on = y % 7 < 4 && (x + y / 7) % 5 < 2;
+                rgb[(y * width + x) * 3..][..3].copy_from_slice(if on { &ink } else { &paper });
+            }
+        }
+        rgb
+    }
+
+    #[test]
+    fn plan_detail_takes_two_tone_strokes_in_either_polarity() {
+        let (w, h) = (448, 320);
+        for (paper, ink) in [
+            ([250, 250, 250], [20, 20, 20]),
+            ([10, 10, 10], [230, 230, 230]),
+        ] {
+            let boxes = plan_detail(&strokes(w, h, paper, ink), w, h, &[]);
+            assert_eq!(
+                boxes,
+                vec![CropBox {
+                    x0: 64,
+                    y0: 64,
+                    width: 256,
+                    height: 192
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn plan_detail_leaves_saturated_strokes_noise_and_taken_boxes() {
+        let (w, h) = (448, 320);
+        // Red on white: the edges move chroma as much as luma.
+        let red = strokes(w, h, [255, 255, 255], [255, 0, 0]);
+        assert!(plan_detail(&red, w, h, &[]).is_empty());
+        let gray = strokes(w, h, [250, 250, 250], [20, 20, 20]);
+        let taken = CropBox {
+            x0: 64,
+            y0: 64,
+            width: 256,
+            height: 192,
+        };
+        assert!(plan_detail(&gray, w, h, &[taken]).is_empty());
+    }
+
     #[test]
     fn plan_skips_flat_and_rich_images() {
         let (w, h) = (256, 256);
@@ -262,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_paints_each_box_with_its_most_common_color() {
+    fn background_color_counts_only_the_box_and_keeps_color_ties() {
         let (w, h) = (96, 64);
         let mut rgb = vec![10u8; w * h * 3];
         let b = CropBox {
@@ -278,20 +464,12 @@ mod tests {
             }
         }
         rgb[(5 * w + 40) * 3..][..3].copy_from_slice(&[1, 2, 3]);
-        let filled = fill(&rgb, w, &[b]);
-        for y in 0..h {
-            for x in 0..w {
-                let p = &filled[(y * w + x) * 3..][..3];
-                let inside = (32..64).contains(&x) && y < 32;
-                assert_eq!(
-                    p,
-                    if inside {
-                        &[200, 100, 50][..]
-                    } else {
-                        &[10, 10, 10][..]
-                    }
-                );
-            }
+        assert_eq!(background_color(&rgb, w, b), [200, 100, 50]);
+        rgb[(5 * w + 40) * 3..][..3].copy_from_slice(&[200, 100, 50]);
+        assert_eq!(background_color(&rgb, w, b), [200, 100, 50]);
+        for y in 0..16 {
+            rgb.as_chunks_mut::<3>().0[y * w + 32..y * w + 64].fill([200, 100, 51]);
         }
+        assert_eq!(background_color(&rgb, w, b), [200, 100, 51]);
     }
 }

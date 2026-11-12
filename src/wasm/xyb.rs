@@ -249,16 +249,12 @@ pub(crate) fn xyb_lattice_wasm(
     m: &XybMatrix,
     [r, g, b]: [&[f32]; 3],
     [luma, co, cg]: [&mut [i32]; 3],
+    scale: u32,
 ) -> usize {
     use super::quantize_xyb::round_ties_away_i32;
     use crate::lossless::rct_simd::wasm::forward_vec;
-    use crate::quant_weights::INV_DC_QUANT;
 
-    let [sx, sy, sb] = [
-        f32x4_splat(INV_DC_QUANT[0]),
-        f32x4_splat(INV_DC_QUANT[1]),
-        f32x4_splat(INV_DC_QUANT[2]),
-    ];
+    let [sx, sy, sb] = scaled_lattice_quantizers(scale).map(|quantizer| f32x4_splat(quantizer));
     let r = r.as_chunks::<4>().0;
     let g = g.as_chunks::<4>().0;
     let b = b.as_chunks::<4>().0;

@@ -332,7 +332,7 @@ pub(crate) fn encode_frame_lossless_xyb_ink(
         linear,
         Some(alpha),
         LosslessSettings {
-            max_bits: 13,
+            max_bits: 13 + crate::xyb::CROP_LATTICE_SCALE.ilog2(),
             ..LosslessSettings::rgb8(speed, decoding_speed)
         },
         ModularFrameKind::XybBlend { last: true },
@@ -362,7 +362,7 @@ pub(crate) fn encode_frame_lossless_xyb_crop(
         linear,
         None,
         LosslessSettings {
-            max_bits: 13,
+            max_bits: 13 + crate::xyb::CROP_LATTICE_SCALE.ilog2(),
             ..LosslessSettings::rgb8(speed, decoding_speed)
         },
         kind,
