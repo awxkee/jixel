@@ -1670,19 +1670,28 @@ fn select_ink_layered(
     // and the model does not see them: the plain encode decides, and the
     // stack has no quality edge over patched text to pay for.
     let glyph_text = plan.glyph_text && config.patches;
+    // The edge-cost budget was fitted on flat art. Over photographs (phone
+    // mock-ups, store screenshots) it overshoots the plain encode several
+    // times, and strokes extracted from photographed text are not exact, so
+    // the stack must simply be smaller than the plain encode.
+    let photographic = plan.textured > INK_MODEL_MAX_TEXTURED;
     // Only the bytes outlive the stack: release its planes and context before
     // the plain encode allocates its own.
     let Some(stack) = InkStack::new(plan, width, height, config, alpha, budget)? else {
         return ordinary();
     };
     let stack = stack.bytes;
-    if !glyph_text && stack.len() as f64 <= budget {
+    if !glyph_text && !photographic && stack.len() as f64 <= budget {
         return Ok(stack);
     }
     // Past the modeled VarDCT size the plain encode decides: the stack, exact
     // on its strokes, may cost one quality step more than it.
     let plain = ordinary()?;
-    let step = if glyph_text { 1.0 } else { INK_STACK_STEP };
+    let step = if glyph_text || photographic {
+        1.0
+    } else {
+        INK_STACK_STEP
+    };
     Ok(if stack.len() as f64 <= plain.len() as f64 * step {
         stack
     } else {
@@ -1693,6 +1702,10 @@ fn select_ink_layered(
 /// Bytes an ink stack may cost relative to the plain encode it replaces: one
 /// quality step of the rate curve.
 const INK_STACK_STEP: f64 = 1.15;
+
+/// Textured block share above which the ink budget model is not trusted:
+/// ink-winning art measures 0.05..0.15, a phone mock-up over a photo 0.34.
+const INK_MODEL_MAX_TEXTURED: f32 = 0.2;
 
 /// Coverage levels of the ink frame at a distance: 7 at distance 1, more
 /// below it, fewer above, within the palette's room for the inks.
@@ -1996,7 +2009,7 @@ fn encode_ink_frame(
     };
     let pool = crate::thread_pool::ThreadPool::new_lossless(config.num_threads);
     let mut frame = BitWriter::new();
-    if !crate::lossless::encode_frame_lossless_xyb_ink(
+    crate::lossless::encode_frame_lossless_xyb_ink(
         &image,
         &alpha,
         speed,
@@ -2004,9 +2017,7 @@ fn encode_ink_frame(
         &pool,
         scratch,
         &mut frame,
-    ) {
-        return Err(EncodeError::EmptyImage);
-    }
+    );
     Ok(frame)
 }
 
@@ -2046,15 +2057,14 @@ fn encode_crop_stack(
     };
     let pool = crate::thread_pool::ThreadPool::new_lossless(config.num_threads);
     let mut scratch = Box::<CoderScratch>::default();
-    // One crop frame on the lattice of `ctx`'s opsin matrix; `None` when the
-    // coder refuses it.
+    // One crop frame on the lattice of `ctx`'s opsin matrix.
     let crop_frame = |ctx: &EncodingContext,
                       rgb: &[u8],
                       b: &crop_frames::CropBox,
                       last: bool,
                       speed: Speed,
                       scratch: &mut CoderScratch|
-     -> Option<BitWriter> {
+     -> BitWriter {
         let mut image = Image3Si::new(b.width, b.height);
         rgb_to_xyb_lattice(
             &ctx.xyb,
@@ -2077,8 +2087,8 @@ fn encode_crop_stack(
             &pool,
             scratch,
             &mut frame,
-        )
-        .then_some(frame)
+        );
+        frame
     };
     // Choose on the spec matrix's lattice: the base's own matrix is only
     // known once the base is coded, and moves the crop size by a few bytes.
@@ -2099,9 +2109,7 @@ fn encode_crop_stack(
         // the plain encoder at this distance.
         let model = encode_image(&crop, b.width, b.height, &vardct_config)?.len() as f64;
         let content = crop_frames::content(crop, b, config.distance);
-        let Some(frame) = crop_frame(&spec, &content, b, false, Speed::Medium, &mut scratch) else {
-            continue;
-        };
+        let frame = crop_frame(&spec, &content, b, false, Speed::Medium, &mut scratch);
         let bytes = frame.bits_written() as f64 / 8.0 + crop_frames::FRAME_OVERHEAD;
         if bytes < model {
             estimated_saving += model - bytes;
@@ -2174,10 +2182,7 @@ fn encode_crop_stack(
         drop(base);
         let last = chosen.len() - 1;
         for (i, (b, content, ..)) in chosen.iter().enumerate() {
-            let Some(frame) = crop_frame(&ctx, content, b, i == last, speed, scratch) else {
-                return Ok((None, base_bytes));
-            };
-            w.append(&frame);
+            w.append(&crop_frame(&ctx, content, b, i == last, speed, scratch));
         }
         finalize_container(
             w.into_bytes(),
@@ -4415,6 +4420,57 @@ mod encode_smoke_tests {
                 .with_num_threads(1);
             let stack = InkStack::new(plan, 256, 256, &config, None, 0.0).unwrap();
             assert_eq!(stack.is_some(), accepted, "distance {distance}");
+        }
+    }
+
+    /// A 288x32 strip clipped from a screenshot: white page and the bottoms
+    /// of gray 3-px glyph stems in the top seven rows. Its ink frame's
+    /// learned tree is not decisive against the flat coder.
+    fn clipped_text_strip_fixture() -> (Vec<u8>, usize, usize) {
+        let (width, height) = (288, 32);
+        let mut rgb = vec![255u8; width * height * 3];
+        let mut seed = 2u64;
+        let mut rnd = move || {
+            seed = (seed * 1_103_515_245 + 12_345) & 0x7fff_ffff;
+            (seed >> 16) as usize
+        };
+        let mut x = 2;
+        while x < width - 6 {
+            if rnd() % 4 != 0 {
+                for y in 0..7 - rnd() % 3 {
+                    rgb[(y * width + x) * 3..][..9].fill(102);
+                }
+            }
+            x += 6 + rnd() % 4;
+        }
+        (rgb, width, height)
+    }
+
+    /// Regression: a non-decisive ink frame used to fail the whole encode
+    /// with `EmptyImage`: the lossless core's "learned tree was decisive"
+    /// flag was read as success.
+    #[test]
+    fn ink_frame_without_a_decisive_tree_encodes() {
+        let (rgb, width, height) = clipped_text_strip_fixture();
+        let pool = crate::thread_pool::ThreadPool::new(1);
+        for speed in [Speed::Medium, Speed::Slow, Speed::ExtraSlow] {
+            for distance in [0.5, 1.0, 2.0, 4.0] {
+                let config = EncodeConfig::default()
+                    .with_speed(speed)
+                    .with_distance(distance)
+                    .with_num_threads(1);
+                encode_image(&rgb, width, height, &config)
+                    .unwrap_or_else(|e| panic!("{speed:?} d{distance}: {e:?}"));
+                // The ink stack itself, whether the race keeps it.
+                let Some(plan) =
+                    crate::ink_layer::InkCandidates::new_fast(&rgb, None, width, height, &pool)
+                        .and_then(|candidates| candidates.select(distance, &pool))
+                else {
+                    continue;
+                };
+                InkStack::new(plan, width, height, &config, None, f64::INFINITY)
+                    .unwrap_or_else(|e| panic!("ink stack {speed:?} d{distance}: {e:?}"));
+            }
         }
     }
 

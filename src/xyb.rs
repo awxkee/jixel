@@ -497,7 +497,7 @@ fn select_quantize_xyb_channels_fn() -> QuantizeXybChannelsFn {
 static QUANTIZE_XYB_CHANNELS_FN: OnceLock<QuantizeXybChannelsFn> = OnceLock::new();
 
 #[inline]
-pub(crate) fn selected_quantize_xyb_channels_fn() -> QuantizeXybChannelsFn {
+fn selected_quantize_xyb_channels_fn() -> QuantizeXybChannelsFn {
     *QUANTIZE_XYB_CHANNELS_FN.get_or_init(select_quantize_xyb_channels_fn)
 }
 
@@ -546,22 +546,26 @@ pub(crate) fn selected_round_lattice_pow2_fn() -> RoundLatticePow2Fn {
 /// XYB samples quantized onto the fixed modular-XYB integer lattice.
 pub(crate) fn quantize_xyb_channels(atlas: &Image3F, lattice_scale: u32) -> [Vec<i32>; 3] {
     use crate::quant_weights::INV_DC_QUANT;
-    let n = atlas.xsize() * atlas.ysize();
-    let input = [
-        &atlas.plane_data(0)[..n],
-        &atlas.plane_data(1)[..n],
-        &atlas.plane_data(2)[..n],
-    ];
-    let mut output = [vec![0; n], vec![0; n], vec![0; n]];
-    let [dst_y, dst_x, dst_b] = &mut output;
     let m = lattice_scale as f32;
-    let scales = [
-        INV_DC_QUANT[0] * m,
-        INV_DC_QUANT[1] * m,
-        INV_DC_QUANT[2] * m,
-    ];
+    quantize_xyb_channels_with_scales(atlas, INV_DC_QUANT.map(|scale| scale * m))
+}
+
+/// Quantize contiguous X, Y and B planes into the stored Y, X and B-Y order.
+/// The scales are given in input channel order.
+pub(crate) fn quantize_xyb_channels_with_scales(
+    image: &Image3F,
+    scales: [f32; 3],
+) -> [Vec<i32>; 3] {
+    let n = image.xsize() * image.ysize();
+    let input = [0, 1, 2].map(|c| &image.plane_data(c)[..n]);
+    let mut output = [vec![0; n], vec![0; n], vec![0; n]];
+    // SAFETY: the dispatcher selects a supported ISA, and all planes have n samples.
     unsafe {
-        selected_quantize_xyb_channels_fn()(input, [dst_y, dst_x, dst_b], scales);
+        selected_quantize_xyb_channels_fn()(
+            input,
+            output.each_mut().map(Vec::as_mut_slice),
+            scales,
+        );
     }
     output
 }

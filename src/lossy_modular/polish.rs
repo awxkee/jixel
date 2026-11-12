@@ -42,7 +42,7 @@
 
 use super::layout::XYB_SCALE;
 use super::pyramid::Pyramid;
-use crate::adaptive_quant::dirty_log2f;
+use crate::adaptive_quant::{dirty_log2f, dirty_log2p1f};
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::cvvdp_arbiter::{CvvdpArbiter, CvvdpCheckpoint};
@@ -50,7 +50,7 @@ use crate::image::Image3F;
 use crate::squeeze::{Channel, apply_step_inverse, smooth_tendency};
 use crate::ssimulacra2::{Rect, Ssimulacra2Checkpoint, Ssimulacra2Reference};
 use crate::thread_pool::ThreadPool;
-use crate::util::round_i32;
+use crate::xyb::quantize_xyb_channels_with_scales;
 use cvvdp_lite::PreparedReference;
 use std::sync::Arc;
 
@@ -210,7 +210,7 @@ impl Prices {
 
     fn escape(v: i32) -> f32 {
         if v.abs() > VMAX {
-            2.0 * ((v.unsigned_abs() - VMAX as u32) as f32 + 1.0).log2() + 1.0
+            2.0 * dirty_log2p1f((v.unsigned_abs() - VMAX as u32) as f32) + 1.0
         } else {
             0.0
         }
@@ -580,6 +580,7 @@ impl Baseline {
         let tags = residual_tags(p, 3);
         debug_assert_eq!(tags.len(), p.channels.len());
         let (w, h) = (p.xsize, p.ysize);
+        debug_assert_eq!((source.xsize(), source.ysize()), (w, h));
         // The forward step sequence of each plane: the pre-squeeze steps that
         // touch it, then every shared step.
         let seq: Vec<Vec<usize>> = (0..3)
@@ -619,23 +620,9 @@ impl Baseline {
         let recon = planes_to_xyb(&outs[0][0], &outs[1][0], &outs[2][0], w, h);
         // Source planes on the lattice (Y, X, B-Y as the pyramid stores them)
         // and their exact averages per level.
-        let mut src: [Vec<i32>; 3] = std::array::from_fn(|_| Vec::with_capacity(w * h));
-        for y in 0..h {
-            let (rx, ry, rb) = (
-                &source.plane_row(0, y)[..w],
-                &source.plane_row(1, y)[..w],
-                &source.plane_row(2, y)[..w],
-            );
-            for x in 0..w {
-                let yq = round_i32(ry[x] * XYB_SCALE[1]);
-                src[0].push(yq);
-                src[1].push(round_i32(rx[x] * XYB_SCALE[0]));
-                src[2].push(round_i32(rb[x] * XYB_SCALE[2]) - yq);
-            }
-        }
         // These source samples never change; share them across band copies
         // and with the finest exact level instead of copying full planes.
-        let src = src.map(Arc::<[i32]>::from);
+        let src = quantize_xyb_channels_with_scales(source, XYB_SCALE).map(Arc::<[i32]>::from);
         let mut chains = Vec::with_capacity(3);
         for c in 0..3 {
             let n = seq[c].len();

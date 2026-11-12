@@ -316,6 +316,7 @@ pub(crate) fn encode_modular_xyb_atlas_ints(
 /// Ink frame of the lossy codestream: XYB lattice ints (Y, X, B-Y, run
 /// through YCoCg like RGB so the signaled RCT restores them exactly) and the
 /// coverage alpha, blended over reference slot 0 with the learned-tree coder.
+/// Always writes a complete frame.
 pub(crate) fn encode_frame_lossless_xyb_ink(
     linear: &Image3Si,
     alpha: &AlphaPlane,
@@ -324,7 +325,9 @@ pub(crate) fn encode_frame_lossless_xyb_ink(
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
-) -> bool {
+) {
+    // The core's return is whether a learned tree won decisively, not
+    // success: a non-decisive frame (flat or v1-tree coder) is just as valid.
     encode_frame_lossless_core(
         linear,
         Some(alpha),
@@ -337,12 +340,13 @@ pub(crate) fn encode_frame_lossless_xyb_ink(
         pool,
         scratch,
         writer,
-    )
+    );
 }
 
 /// A crop frame of the lossy codestream (see `crop_frames`): XYB lattice ints
 /// (Y, X, B-Y through YCoCg, as the ink frame) replacing a rectangle of
-/// reference slot 0, coded by the learned-tree coder.
+/// reference slot 0, coded by the learned-tree coder. Always writes a
+/// complete frame.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_frame_lossless_xyb_crop(
     linear: &Image3Si,
@@ -352,7 +356,7 @@ pub(crate) fn encode_frame_lossless_xyb_crop(
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
-) -> bool {
+) {
     debug_assert!(matches!(kind, ModularFrameKind::XybCrop { .. }));
     encode_frame_lossless_core(
         linear,
@@ -366,7 +370,7 @@ pub(crate) fn encode_frame_lossless_xyb_crop(
         pool,
         scratch,
         writer,
-    )
+    );
 }
 
 /// One lossless 8-bit RGB(+alpha) frame of a layered codestream.

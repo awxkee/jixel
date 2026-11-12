@@ -33,7 +33,7 @@ use super::chroma::configure_chroma;
 use super::quantization::DistanceParams;
 use super::variants::{
     GLYPH_BITS_MARGIN, GLYPH_SINGLETON_FREE_MAX_DISTANCE, GLYPH_SINGLETON_RACE_MAX_DISTANCE,
-    GlyphStage, LATTICE_BITS_MARGIN, lattice_variants, prepare_vardct_variant,
+    GlyphStage, LATTICE_BITS_MARGIN, PreparedVarDct, lattice_variants, prepare_vardct_variant,
 };
 #[cfg(feature = "splines")]
 use super::variants::{SplineStage, spline_quant_field};
@@ -174,11 +174,61 @@ pub(super) fn encode_frame_vardct(
             }
         }
     }
+    // Glyph and tile plans race each other, and the frame without any
+    // patches races the winner: on photo-heavy composites (store and
+    // marketing screenshots, phone mock-ups with tiny perspective text)
+    // thousands of near-glyph references cost more than they take out of
+    // the residual. Patches code their pixels finer than the residual, so
+    // the unpatched frame must win by the same margin as dropping tiles.
+    // Only plans that found something pay for the extra estimate. Base
+    // frames under an ink or crop layer keep their patches: there the
+    // sampled estimate prices the unpatched base far below its real size
+    // (an ink-stacked text screenshot +10 % at d1 without them).
+    let race_unpatched = ctx.frame_role == crate::encoding_context::FrameRole::Last
+        && (glyphs.is_some() || best.used_tiles || lattice.is_some());
+    let mut unpatched = if race_unpatched {
+        let mut arm = prepare_vardct_variant(
+            ctx,
+            scratch,
+            distance,
+            distp,
+            xyb.clone(),
+            alpha,
+            coeff_shifts,
+            false,
+            None,
+            true,
+            #[cfg(feature = "splines")]
+            stage.as_ref(),
+        )?;
+        let bits = arm.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
+        Some((arm, bits))
+    } else {
+        None
+    };
+    let mut pick = |mut best: PreparedVarDct,
+                    best_bits: Option<f64>,
+                    scratch: &mut CoderScratch|
+     -> Result<PreparedVarDct, EncodeError> {
+        let Some((arm, bits)) = unpatched.take() else {
+            return Ok(best);
+        };
+        let best_bits = match best_bits {
+            Some(bits) => bits,
+            None => best.estimate(ctx, scratch, distance, alpha, coeff_shifts)?,
+        };
+        Ok(if bits * GLYPH_BITS_MARGIN < best_bits {
+            arm
+        } else {
+            best
+        })
+    };
     if !best.used_tiles && lattice.is_none() {
         drop(xyb);
         drop(glyphs);
         #[cfg(feature = "splines")]
         drop(spline_candidates);
+        let best = pick(best, None, scratch)?;
         return best.encode(ctx, scratch, distance, alpha, coeff_shifts, writer);
     }
     #[allow(unused_mut)]
@@ -191,14 +241,22 @@ pub(super) fn encode_frame_vardct(
         // A lattice arm codes what the tile leaves at the frame's own distance,
         // where an exact-tile plan repeats it at the finer atlas distance, so
         // near-equal bits buy only a coarser remainder.
+        let patched_bits = best_bits;
         best_bits *= LATTICE_BITS_MARGIN;
+        let mut lattice_won = false;
         for mut arm in lattice_variants(ctx, scratch, distance, distp, plan, alpha)? {
             let bits = arm.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
             if bits < best_bits {
                 best = arm;
                 best_bits = bits;
+                lattice_won = true;
             }
         }
+        let best = pick(
+            best,
+            Some(if lattice_won { best_bits } else { patched_bits }),
+            scratch,
+        )?;
         return best.encode(ctx, scratch, distance, alpha, coeff_shifts, writer);
     }
     #[cfg(feature = "splines")]
@@ -245,11 +303,13 @@ pub(super) fn encode_frame_vardct(
     // the same quality margin as the previous full-bitstream comparison.
     if no_tile_bits * GLYPH_BITS_MARGIN < best_bits {
         best = no_tiles;
+        best_bits = no_tile_bits;
     } else {
         drop(no_tiles);
     }
     drop(glyphs);
     #[cfg(feature = "splines")]
     drop(spline_candidates);
+    let best = pick(best, Some(best_bits), scratch)?;
     best.encode(ctx, scratch, distance, alpha, coeff_shifts, writer)
 }
