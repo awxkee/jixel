@@ -34,7 +34,7 @@
 //! on uniform neighborhoods for the palette, then each non-palette pixel is
 //! unblended between two neighboring region colors.
 
-use crate::util::round_i32;
+use crate::util::{heap_array, round_i32};
 
 /// A palette color must fill at least this many uniform pixels.
 const MIN_PALETTE_PIXELS: usize = 32;
@@ -54,6 +54,8 @@ const MAX_TEXTURED_SHARE: f32 = 0.005;
 /// Largest distance (squared) of a pixel from the segment between its two
 /// region colors for the pixel to count as their mix.
 const MAX_MIX_RESIDUAL_SQ: f32 = 36.0;
+/// Pixels around a non-palette pixel searched for its two region colors.
+const MIX_REACH: i32 = 3;
 /// Coverage steps above zero at distance 1 and below: alpha = step * 17.
 const COVERAGE_STEPS: u32 = 15;
 
@@ -72,10 +74,7 @@ pub(crate) fn band_bytes_ratio(steps: u32) -> f64 {
 }
 
 /// Bytes the VarDCT encode of the same image would take at `distance`,
-/// from the cost of its edges: 1.16 bytes per 8 bits of
-/// sum log2(1 + delta / 4d) over neighboring pairs, falling as d^-0.41
-/// (fitted on flat art, within 0.78..1.39 of the measured size).
-/// Largest ratio of a measured VarDCT size to `vardct_bytes`.
+/// from the cost of its edges.
 pub(crate) const VARDCT_BYTES_MARGIN: f64 = 1.39;
 
 pub(crate) fn vardct_bytes(rgb: &[u8], width: usize, height: usize, distance: f32) -> f64 {
@@ -104,19 +103,20 @@ pub(crate) fn vardct_bytes(rgb: &[u8], width: usize, height: usize, distance: f3
 /// Open-addressing table from an exact color to a count or an index; far
 /// cheaper than a hash map for the few thousand colors of flat art.
 struct ColorTable {
-    keys: Vec<u32>,
-    values: Vec<u32>,
+    keys: Box<[u32; ColorTable::CAPACITY]>,
+    values: Box<[u32; ColorTable::CAPACITY]>,
     len: usize,
 }
 
 impl ColorTable {
     const BITS: u32 = 16;
+    const CAPACITY: usize = 1 << Self::BITS;
     const EMPTY: u32 = u32::MAX;
 
     fn new() -> Self {
         Self {
-            keys: vec![Self::EMPTY; 1 << Self::BITS],
-            values: vec![0; 1 << Self::BITS],
+            keys: heap_array(Self::EMPTY),
+            values: heap_array(0),
             len: 0,
         }
     }
@@ -131,7 +131,7 @@ impl ColorTable {
             if k == Self::EMPTY {
                 return None;
             }
-            i = (i + 1) & ((1 << Self::BITS) - 1);
+            i = (i + 1) & (Self::CAPACITY - 1);
         }
     }
 
@@ -150,7 +150,7 @@ impl ColorTable {
                 return true;
             }
             if k == Self::EMPTY {
-                if self.len >= 1 << (Self::BITS - 1) {
+                if self.len >= Self::CAPACITY / 2 {
                     return false;
                 }
                 self.keys[i] = key;
@@ -158,14 +158,14 @@ impl ColorTable {
                 self.len += 1;
                 return true;
             }
-            i = (i + 1) & ((1 << Self::BITS) - 1);
+            i = (i + 1) & (Self::CAPACITY - 1);
         }
     }
 
     fn entries(&self) -> impl Iterator<Item = ([u8; 3], usize)> + '_ {
         self.keys
             .iter()
-            .zip(&self.values)
+            .zip(self.values.iter())
             .filter(|(k, _)| **k != Self::EMPTY)
             .map(|(&k, &v)| (k.to_be_bytes()[1..].try_into().unwrap(), v as usize))
     }
@@ -286,20 +286,27 @@ pub(crate) fn split(rgb: &[u8], width: usize, height: usize, steps: u32) -> Opti
         }
         let (x, y) = (i % width, i / width);
         let mut m = 0;
-        for dy in -1i32..=1 {
-            for dx in -1i32..=1 {
-                if dx == 0 && dy == 0 {
-                    continue;
+        // Ring by ring until two region colors are in reach: an edge softer
+        // than one pixel has mixes whose 3x3 holds no region pixel at all.
+        for ring in 1..=MIX_REACH {
+            for dy in -ring..=ring {
+                for dx in -ring..=ring {
+                    if dx.abs().max(dy.abs()) != ring {
+                        continue;
+                    }
+                    let (xx, yy) = (x as i32 + dx, y as i32 + dy);
+                    if xx < 0 || yy < 0 || xx >= width as i32 || yy >= height as i32 {
+                        continue;
+                    }
+                    let l = labels[yy as usize * width + xx as usize];
+                    if l != NO_LABEL && m < neighbors.len() && !neighbors[..m].contains(&l) {
+                        neighbors[m] = l;
+                        m += 1;
+                    }
                 }
-                let (xx, yy) = (x as i32 + dx, y as i32 + dy);
-                if xx < 0 || yy < 0 || xx >= width as i32 || yy >= height as i32 {
-                    continue;
-                }
-                let l = labels[yy as usize * width + xx as usize];
-                if l != NO_LABEL && !neighbors[..m].contains(&l) {
-                    neighbors[m] = l;
-                    m += 1;
-                }
+            }
+            if m >= 2 {
+                break;
             }
         }
         if m == 0 {

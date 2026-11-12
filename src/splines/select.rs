@@ -213,9 +213,29 @@ impl<'a> BlockModel<'a> {
     }
 }
 
+#[derive(Clone)]
 struct TrialBlock {
     cell: usize,
     pixels: [[f32; 64]; 3],
+}
+
+impl TrialBlock {
+    fn load(current: &Image3F, cell: usize) -> Self {
+        let (w, h) = (current.xsize(), current.ysize());
+        let blocks_w = w.div_ceil(8);
+        let (x0, y0) = (cell % blocks_w * 8, cell / blocks_w * 8);
+        let width = (w - x0).min(8);
+        let mut pixels = [[0.0; 64]; 3];
+        for (c, plane) in pixels.iter_mut().enumerate() {
+            for (y, row) in plane.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                row[..width]
+                    .copy_from_slice(&current.plane_row(c, (y0 + y).min(h - 1))[x0..x0 + width]);
+                let edge = row[width - 1];
+                row[width..].fill(edge);
+            }
+        }
+        Self { cell, pixels }
+    }
 }
 
 /// A trial owns only affected blocks. Coordinates and sample accumulation stay
@@ -234,26 +254,38 @@ impl Trial {
             cells.sort_unstable();
             cells.dedup();
         }
-        let (w, h) = (current.xsize(), current.ysize());
-        let blocks_w = w.div_ceil(8);
         let blocks = cells
             .into_iter()
-            .map(|cell| {
-                let (x0, y0) = (cell % blocks_w * 8, cell / blocks_w * 8);
-                let width = (w - x0).min(8);
-                let mut pixels = [[0.0; 64]; 3];
-                for (c, plane) in pixels.iter_mut().enumerate() {
-                    for (y, row) in plane.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-                        row[..width].copy_from_slice(
-                            &current.plane_row(c, (y0 + y).min(h - 1))[x0..x0 + width],
-                        );
-                        let edge = row[width - 1];
-                        row[width..].fill(edge);
+            .map(|cell| TrialBlock::load(current, cell))
+            .collect();
+        Self { blocks }
+    }
+
+    /// Merge the restored incumbent and replacement's sorted cells. Only
+    /// cells outside the incumbent need to be read from the current image.
+    fn replacement(current: &Image3F, restored: &Self, plan: &TiledSpline) -> Self {
+        let mut cached = restored.blocks.iter().peekable();
+        let mut cells = plan.tiles.iter().map(|tile| tile.cell).peekable();
+        let merged = std::iter::from_fn(move || {
+            match (cached.peek(), cells.peek()) {
+                (Some(block), Some(&cell)) if cell <= block.cell => {
+                    cells.next();
+                    if cell < block.cell {
+                        return Some((cell, None));
                     }
                 }
-                TrialBlock { cell, pixels }
-            })
-            .collect();
+                (None, _) => return cells.next().map(|cell| (cell, None)),
+                _ => {}
+            }
+            cached.next().map(|block| (block.cell, Some(block)))
+        });
+        // Reserve the union size. Most replacements overlap the incumbent.
+        let mut blocks = Vec::with_capacity(merged.clone().count());
+        blocks.extend(merged.map(|(cell, cached)| {
+            cached
+                .cloned()
+                .unwrap_or_else(|| TrialBlock::load(current, cell))
+        }));
         Self { blocks }
     }
 
@@ -262,15 +294,6 @@ impl Trial {
         for tile in &plan.tiles {
             let block = blocks.find(|block| block.cell == tile.cell).unwrap();
             plan.draw_tile(tile, &mut block.pixels, sign);
-        }
-    }
-
-    /// Reuse a prepared residual on a subset of this trial's sorted blocks.
-    fn copy_blocks_from(&mut self, source: &Self) {
-        let mut blocks = self.blocks.iter_mut();
-        for source in &source.blocks {
-            let block = blocks.find(|block| block.cell == source.cell).unwrap();
-            block.pixels = source.pixels;
         }
     }
 
@@ -520,8 +543,7 @@ fn prune_selected(
             .thread_pool
             .steal_map(scratch, proposals.len(), |i, _| {
                 let (_, proposal, bits) = proposals[i].as_ref()?;
-                let mut trial = Trial::new(current, &[incumbent, proposal]);
-                trial.copy_blocks_from(restored_trial);
+                let mut trial = Trial::replacement(current, restored_trial, proposal);
                 trial.draw(proposal, -1.0);
                 let delta = trial.delta(model, current, quant_field, &cache, forbidden)?;
                 (delta + crate::ac_strategy::RD_LAMBDA * margin(model.distance) * bits < 0.0)
@@ -807,8 +829,7 @@ fn prune_dot_templates(
             let mut best: Option<(f32, &QuantizedSpline, Trial)> = None;
             for (alt, plan) in &alternatives {
                 cache_blocks(model, current, quant_field, &mut cache, plan);
-                let mut trial = Trial::new(current, &[&incumbent, plan]);
-                trial.copy_blocks_from(&restored);
+                let mut trial = Trial::replacement(current, &restored, plan);
                 trial.draw(plan, -1.0);
                 let Some(delta) = trial.delta(model, current, quant_field, &cache, forbidden)
                 else {
@@ -881,8 +902,7 @@ fn refine_selected_widths(
                     continue;
                 }
                 cache_blocks(model, current, quant_field, &mut cache, &plan);
-                let mut trial = Trial::new(current, &[&incumbent, &plan]);
-                trial.copy_blocks_from(&restored);
+                let mut trial = Trial::replacement(current, &restored, &plan);
                 trial.draw(&plan, -1.0);
                 let Some(delta) = trial.delta(model, current, quant_field, &cache, forbidden)
                 else {
@@ -1900,8 +1920,17 @@ mod tests {
         let b = RenderPlan::new(&kernels, &second, QUANT_ADJUST, w, h).tiled();
         let mut restored = Trial::new(&current, &[&a]);
         restored.draw(&a, 1.0);
-        let mut trial = Trial::new(&current, &[&a, &b]);
-        trial.copy_blocks_from(&restored);
+        let mut trial = Trial::replacement(&current, &restored, &b);
+        let union = Trial::new(&current, &[&a, &b]);
+        assert_eq!(trial.blocks.len(), union.blocks.len());
+        for (actual, original) in trial.blocks.iter().zip(&union.blocks) {
+            assert_eq!(actual.cell, original.cell);
+            let expected = restored
+                .blocks
+                .binary_search_by_key(&actual.cell, |block| block.cell)
+                .map_or(original, |index| &restored.blocks[index]);
+            assert_eq!(actual.pixels, expected.pixels);
+        }
         trial.draw(&b, -1.0);
         let mut full = current.clone();
         render_spline(&kernels, &first, QUANT_ADJUST, &mut full, 1.0);
