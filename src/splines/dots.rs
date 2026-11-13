@@ -450,6 +450,42 @@ pub(super) fn dot_candidates(
 
 const PEAK_CHUNK: usize = 1024;
 
+pub(crate) type DotContrastFn = fn(&[f32], usize, &mut [f32], usize, f32, [f32; 2]);
+
+/// Pair the source rows of a square patch with its packed destination rows.
+pub(crate) fn contrast_patch_rows<'a>(
+    src: &'a [f32],
+    stride: usize,
+    dst: &'a mut [f32],
+    side: usize,
+) -> impl Iterator<Item = (&'a [f32], &'a mut [f32])> {
+    assert!((1..=2 * RING as usize + 1).contains(&side) && side % 2 == 1);
+    assert!(stride >= side);
+    let src = &src[..(side - 1) * stride + side];
+    let dst = &mut dst[..side * side];
+    // The last source row only needs to contain the patch width.
+    src.chunks(stride)
+        .map(move |row| &row[..side])
+        .zip(dst.chunks_exact_mut(side))
+}
+
+pub(super) fn dot_contrast_scalar(
+    src: &[f32],
+    stride: usize,
+    dst: &mut [f32],
+    side: usize,
+    bg: f32,
+    [sx, sy]: [f32; 2],
+) {
+    let r = (side / 2) as i32;
+    for (y, (src, dst)) in contrast_patch_rows(src, stride, dst, side).enumerate() {
+        let vertical = sy * (y as i32 - r) as f32;
+        for (x, (&pixel, value)) in src.iter().zip(dst).enumerate() {
+            *value = pixel - bg - sx * (x as i32 - r) as f32 - vertical;
+        }
+    }
+}
+
 /// Fits dot alternatives to `peaks`, skipping peaks in busy surroundings.
 /// Returns each candidate's peak index and its alternatives' explained Y
 /// energy shares.
@@ -463,6 +499,8 @@ fn fit_peaks(
     let mut cache = FitKernels::new();
     let mut luma = [0.0; FIT_AREA];
     let mut chroma = [[0.0; FIT_AREA]; 2];
+    let fill_contrast = kernels.dot_contrast;
+    let stride = xyb.xsize();
     for (index, &(peak, x, y)) in peaks.iter().enumerate() {
         let polarity = peak.signum();
         let (xi, yi) = (x as isize, y as isize);
@@ -537,13 +575,9 @@ fn fit_peaks(
         let n0 = (var.sqrt() / sigma_step()).round().clamp(1.0, 10.0) as i32;
         let r = ((3.0 * (n0 + 1) as f32 * sigma_step() + 1.5).ceil() as isize).min(RING);
         let side = (2 * r + 1) as usize;
-        let target = |c, bg, values: &mut [f32; FIT_AREA]| {
-            for dy in -r..=r {
-                for dx in -r..=r {
-                    values[((dy + r) as usize) * side + (dx + r) as usize] =
-                        contrast(c, bg, dx, dy);
-                }
-            }
+        let start = (y - r as usize) * stride + x - r as usize;
+        let target = |c, (bg, slope), values: &mut [f32; FIT_AREA]| {
+            fill_contrast(&xyb.plane_data(c)[start..], stride, values, side, bg, slope);
         };
         target(1, luma_bg, &mut luma);
         let alts = dot_alts(

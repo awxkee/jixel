@@ -125,17 +125,20 @@ impl RenderPlan {
         }
         plan.samples.reserve(samples.len());
         let continuous_idct = ctx.spline_kernels.continuous_idct;
-        let constant = dct[1..]
+        // Interleaved rows include the Y contribution to X and B. Keep DC
+        // even when all four channels are zero.
+        let active = dct[1..]
             .iter()
-            .flatten()
-            .all(|&coefficient| coefficient == 0.0)
-            .then(|| continuous_idct(&dct, 0.0));
+            .rposition(|row| row.iter().any(|&coefficient| coefficient != 0.0))
+            .map_or(1, |last| last + 2);
+        let dct = &dct[..active];
+        let constant = (active == 1).then(|| continuous_idct(dct, 0.0));
         for (k, sample) in samples.iter().enumerate() {
             let Point { x: cx, y: cy } = sample.position;
             let mult = sample.multiplier;
             let [x, y, b, sigma] = constant.unwrap_or_else(|| {
                 let t = 31.0 * (k as f32 / arc).min(1.0);
-                continuous_idct(&dct, t)
+                continuous_idct(dct, t)
             });
             let color = [x, y, b];
             if !(sigma.is_finite() && sigma != 0.0 && (1.0 / sigma).is_finite()) {

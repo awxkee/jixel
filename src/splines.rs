@@ -55,6 +55,9 @@ mod lines;
 mod neon;
 mod render;
 mod select;
+#[cfg(target_arch = "aarch64")]
+#[path = "neon/spline_curve.rs"]
+mod spline_curve_neon;
 mod transform;
 mod trig;
 
@@ -82,6 +85,8 @@ use std::sync::OnceLock;
 
 pub(crate) type FitMatrix = [[f64; fit::MAX_COEFFS]; fit::MAX_COEFFS];
 pub(crate) type FitTargets = [[f64; fit::MAX_COEFFS]; 3];
+type FitAccumulateFn = fn(&mut FitMatrix, &mut FitTargets, &mut [f64; 3], &[f64], [f32; 3]);
+type FitScoreFn = fn(&FitMatrix, &[f64], &[f64]) -> (f64, f64);
 
 /// Spline kernels selected once for the process and shared by every encoder.
 pub(crate) struct SplinesContext {
@@ -89,14 +94,17 @@ pub(crate) struct SplinesContext {
     segment_distance: geometry::SegmentDistanceFn,
     render_row: render::RenderRowFn,
     continuous_idct: transform::ContinuousIdctFn,
+    dot_contrast: dots::DotContrastFn,
     /// Fitting and dot templates use a fused erf polynomial on SIMD targets.
     blob_weight_row: fn(BlobWeightRow, i32, &mut [f32]),
     add_scaled_f32: AddScaledFn,
     add_scaled_fma_f32: AddScaledFn,
     filter_vertical_row: filter::FilterVerticalRowFn,
     fit_add_scaled: fn(&mut [f64], &[f64], f64),
-    fit_accumulate: fn(&mut FitMatrix, &mut FitTargets, &[f64], [f64; 3]),
+    fit_accumulate: FitAccumulateFn,
     fit_sub_dot: fn(f64, &[f64], &[f64]) -> f64,
+    fit_score: FitScoreFn,
+    #[cfg(any(not(target_arch = "aarch64"), test))]
     cos: fn(f32) -> f32,
     sin_cos: fn(f32) -> (f32, f32),
     atan2: fn(f32, f32) -> f32,
@@ -115,6 +123,7 @@ impl SplinesContext {
             segment_distance: geometry::segment_distance_scalar,
             render_row: render::Sample::scalar_row,
             continuous_idct: transform::continuous_idct_scalar,
+            dot_contrast: dots::dot_contrast_scalar,
             blob_weight_row: BlobWeightRow::fill_scalar,
             add_scaled_f32,
             add_scaled_fma_f32: add_scaled_f32,
@@ -122,6 +131,8 @@ impl SplinesContext {
             fit_add_scaled: fit::add_scaled_scalar,
             fit_accumulate: fit::accumulate_fit_scalar,
             fit_sub_dot: fit::sub_dot_scalar,
+            fit_score: fit::fit_score_scalar,
+            #[cfg(any(not(target_arch = "aarch64"), test))]
             cos: trig::cos_scalar,
             sin_cos: trig::sin_cos_scalar,
             atan2: trig::atan2_scalar,
@@ -138,6 +149,9 @@ impl SplinesContext {
                 neon::spline_render_row_neon(sample, dy, x, rows, amp)
             },
             continuous_idct: |dct, t| unsafe { neon::continuous_idct_neon(dct, t) },
+            dot_contrast: |src, stride, dst, side, bg, slope| unsafe {
+                neon::dot_contrast_neon(src, stride, dst, side, bg, slope)
+            },
             blob_weight_row: |row, x, out| unsafe { neon::blob_weight_row_neon(row, x, out) },
             add_scaled_fma_f32: |dst, src, scale| unsafe {
                 crate::simd::neon_add_scaled::add_scaled_fma_neon(dst, src, scale)
@@ -146,10 +160,11 @@ impl SplinesContext {
                 neon::vertical_row_neon(src, w, bounds, taps, dst)
             },
             fit_add_scaled: |dst, src, scale| unsafe { fit_neon::add_scaled_neon(dst, src, scale) },
-            fit_accumulate: |ata, atb, row, target| unsafe {
-                fit_neon::accumulate_fit_neon(ata, atb, row, target)
+            fit_accumulate: |ata, atb, btb, row, target| unsafe {
+                fit_neon::accumulate_fit_neon(ata, atb, btb, row, target)
             },
             fit_sub_dot: |acc, left, right| unsafe { fit_neon::sub_dot_neon(acc, left, right) },
+            fit_score: |ata, rhs, sol| unsafe { fit_neon::fit_score_neon(ata, rhs, sol) },
             ..kernels
         };
 
@@ -174,9 +189,12 @@ impl SplinesContext {
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         let kernels = if avx2 {
             Self {
-                // SAFETY: the vertical kernel only requires AVX2.
+                // SAFETY: these kernels only require AVX2.
                 filter_vertical_row: |src, w, bounds, taps, dst| unsafe {
                     crate::avx::vertical_row_avx2(src, w, bounds, taps, dst)
+                },
+                dot_contrast: |src, stride, dst, side, bg, slope| unsafe {
+                    crate::avx::dot_contrast_avx2(src, stride, dst, side, bg, slope)
                 },
                 ..kernels
             }
@@ -203,10 +221,11 @@ impl SplinesContext {
                 fit_add_scaled: |dst, src, scale| unsafe {
                     avx::add_scaled_f64_avx2(dst, src, scale)
                 },
-                fit_accumulate: |ata, atb, row, target| unsafe {
-                    avx::accumulate_fit_avx2(ata, atb, row, target)
+                fit_accumulate: |ata, atb, btb, row, target| unsafe {
+                    avx::accumulate_fit_avx2(ata, atb, btb, row, target)
                 },
                 fit_sub_dot: |acc, left, right| unsafe { avx::sub_dot_avx2(acc, left, right) },
+                fit_score: |ata, rhs, sol| unsafe { avx::fit_score_avx2(ata, rhs, sol) },
                 ..kernels
             };
         }
@@ -350,6 +369,21 @@ pub(crate) fn catmull_rom(control: &[Point<f32>]) -> Vec<Point<f32>> {
 
 /// Samples only these spans, retaining the surrounding controls for their tangents.
 fn catmull_rom_spans(control: &[Point<f32>], spans: std::ops::Range<usize>) -> Vec<Point<f32>> {
+    #[cfg(target_arch = "aarch64")]
+    let sample_span = |q: &[Point<f32>; 4], d, t, out: &mut Vec<Point<f32>>| {
+        // SAFETY: NEON is part of the supported AArch64 target baseline.
+        unsafe { spline_curve_neon::sample_span_neon(q, d, t, out) }
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let sample_span = sample_span_scalar;
+    catmull_rom_spans_with(sample_span, control, spans)
+}
+
+fn catmull_rom_spans_with(
+    sample_span: impl Fn(&[Point<f32>; 4], [f32; 3], [f32; 4], &mut Vec<Point<f32>>),
+    control: &[Point<f32>],
+    spans: std::ops::Range<usize>,
+) -> Vec<Point<f32>> {
     if control.len() == 1 {
         return vec![control[0]];
     }
@@ -373,33 +407,36 @@ fn catmull_rom_spans(control: &[Point<f32>], spans: std::ops::Range<usize>) -> V
             d[k] = fast_hypot(q[k + 1].x - q[k].x, q[k + 1].y - q[k].y).sqrt();
             t[k + 1] = t[k] + d[k];
         }
-        for i in 1..16 {
-            let tt = d[0] + (i as f32 / 16.0) * d[1];
-            let mut a = [Point::default(); 3];
-            for k in 0..3 {
-                let f = (tt - t[k]) / d[k];
-                a[k] = Point::new(
-                    q[k].x + f * (q[k + 1].x - q[k].x),
-                    q[k].y + f * (q[k + 1].y - q[k].y),
-                );
-            }
-            let mut b = [Point::default(); 2];
-            for k in 0..2 {
-                let f = (tt - t[k]) / (d[k] + d[k + 1]);
-                b[k] = Point::new(
-                    a[k].x + f * (a[k + 1].x - a[k].x),
-                    a[k].y + f * (a[k + 1].y - a[k].y),
-                );
-            }
-            let f = (tt - t[1]) / d[1];
-            out.push(Point::new(
-                b[0].x + f * (b[1].x - b[0].x),
-                b[0].y + f * (b[1].y - b[0].y),
-            ));
-        }
+        sample_span(q, d, t, &mut out);
     }
     out.push(control[spans.end]);
     out
+}
+
+#[cfg(any(test, not(target_arch = "aarch64")))]
+fn sample_span_scalar(q: &[Point<f32>; 4], d: [f32; 3], t: [f32; 4], out: &mut Vec<Point<f32>>) {
+    let delta: [Point<f32>; 3] =
+        std::array::from_fn(|k| Point::new(q[k + 1].x - q[k].x, q[k + 1].y - q[k].y));
+    let adjacent = [d[0] + d[1], d[1] + d[2]];
+    for i in 1..16 {
+        let tt = d[0] + (i as f32 / 16.0) * d[1];
+        let f = (tt - t[1]) / d[1];
+        let a: [Point<f32>; 3] = std::array::from_fn(|k| {
+            let f = if k == 1 { f } else { (tt - t[k]) / d[k] };
+            Point::new(q[k].x + f * delta[k].x, q[k].y + f * delta[k].y)
+        });
+        let b: [Point<f32>; 2] = std::array::from_fn(|k| {
+            let f = (tt - t[k]) / adjacent[k];
+            Point::new(
+                a[k].x + f * (a[k + 1].x - a[k].x),
+                a[k].y + f * (a[k + 1].y - a[k].y),
+            )
+        });
+        out.push(Point::new(
+            b[0].x + f * (b[1].x - b[0].x),
+            b[0].y + f * (b[1].y - b[0].y),
+        ));
+    }
 }
 
 /// One arc sample: position and intensity multiplier.
@@ -941,6 +978,51 @@ mod tests {
         assert!(!candidates.touches(&blocks, 8));
         blocks[5] = true;
         assert!(candidates.touches(&blocks, 8));
+    }
+
+    #[test]
+    fn selected_catmull_rom_matches_scalar_points_and_arc() {
+        for control in [
+            [
+                Point::new(2.0, 7.0),
+                Point::new(11.0, 19.0),
+                Point::new(25.0, 4.0),
+                Point::new(33.0, 18.0),
+            ],
+            [
+                Point::new(16_777_216.0, 16_777_216.0),
+                Point::new(16_777_228.0, 16_777_226.0),
+                Point::new(16_777_232.0, 16_777_218.0),
+                Point::new(16_777_246.0, 16_777_220.0),
+            ],
+            [
+                Point::new(2.0, 7.0),
+                Point::new(11.0, 19.0),
+                Point::new(11.0, 19.0),
+                Point::new(33.0, 18.0),
+            ],
+        ] {
+            let selected = catmull_rom(&control);
+            let scalar = catmull_rom_spans_with(sample_span_scalar, &control, 0..3);
+            let same = |a: f32, b: f32| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+            let same_point = |a: Point<f32>, b: Point<f32>| same(a.x, b.x) && same(a.y, b.y);
+            assert_eq!(selected.len(), scalar.len());
+            assert!(
+                selected
+                    .iter()
+                    .zip(&scalar)
+                    .all(|(&a, &b)| same_point(a, b))
+            );
+            // The arc walker requires positions where adding a one-pixel step can progress.
+            if control[0].x < 1e6 {
+                let selected = equally_spaced(&selected);
+                let scalar = equally_spaced(&scalar);
+                assert_eq!(selected.len(), scalar.len());
+                assert!(selected.iter().zip(&scalar).all(|(a, b)| {
+                    same_point(a.position, b.position) && same(a.multiplier, b.multiplier)
+                }));
+            }
+        }
     }
 
     #[test]

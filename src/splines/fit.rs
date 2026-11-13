@@ -66,6 +66,15 @@ const BORDER: i32 = 3;
 const BACKGROUND_SIGMA: f32 = 3.0;
 const MASK_RADIUS: isize = 2;
 pub(super) const MAX_COEFFS: usize = 32;
+const BASIS_FREQUENCIES: [f32; MAX_COEFFS] = {
+    let mut frequencies = [0.0; MAX_COEFFS];
+    let mut i = 1;
+    while i < MAX_COEFFS {
+        frequencies[i] = (std::f32::consts::PI / 32.0) * i as f32;
+        i += 1;
+    }
+    frequencies
+};
 /// Refinement only needs the alignment signal: few color coefficients, tight window.
 const REFINE_COEFFS: usize = 3;
 const COMPACT_COEFFS: usize = 6;
@@ -538,14 +547,20 @@ impl FitScratch {
         if self.basis_coeffs == coeffs {
             return;
         }
+        #[cfg(not(target_arch = "aarch64"))]
         let cos = self.kernels.cos;
+        #[cfg(target_arch = "aarch64")]
+        let cos = super::trig::cos_scalar;
+
+        let frequencies = &BASIS_FREQUENCIES[1..coeffs];
         self.basis.clear();
+        self.basis.reserve(self.samples.len() * coeffs);
         for k in 0..self.samples.len() {
-            let t = 31.0 * (k as f32 / self.arc).min(1.0);
-            self.basis.extend((0..coeffs).map(|i| {
+            let phase = 31.0 * (k as f32 / self.arc).min(1.0) + 0.5;
+            self.basis.push(std::f64::consts::SQRT_2);
+            self.basis.extend(frequencies.iter().map(|&frequency| {
                 // Evaluate the angle in f32; retain f64 accumulation and solving.
-                std::f64::consts::SQRT_2
-                    * cos(std::f32::consts::PI / 32.0 * i as f32 * (t + 0.5)) as f64
+                std::f64::consts::SQRT_2 * cos(frequency * phase) as f64
             }));
         }
         self.basis_coeffs = coeffs;
@@ -627,14 +642,19 @@ pub(super) fn add_scaled_scalar(dst: &mut [f64], src: &[f64], scale: f64) {
 pub(super) fn accumulate_fit_scalar(
     ata: &mut FitMatrix,
     atb: &mut FitTargets,
+    btb: &mut [f64; 3],
     row: &[f64],
-    target: [f64; 3],
+    target: [f32; 3],
 ) {
+    let target = target.map(f64::from);
     for (i, (&value, ata_row)) in row.iter().zip(ata).enumerate() {
         add_scaled_scalar(&mut ata_row[..=i], &row[..=i], value);
     }
     for (atb, target) in atb.iter_mut().zip(target) {
         add_scaled_scalar(&mut atb[..row.len()], row, target);
+    }
+    for (energy, value) in btb.iter_mut().zip(target) {
+        *energy += value * value;
     }
 }
 
@@ -644,6 +664,18 @@ pub(super) fn sub_dot_scalar(mut acc: f64, left: &[f64], right: &[f64]) -> f64 {
         acc -= a * b;
     }
     acc
+}
+
+#[inline]
+pub(super) fn fit_score_scalar(ata: &FitMatrix, rhs: &[f64], sol: &[f64]) -> (f64, f64) {
+    let (mut lin, mut quad) = (0.0, 0.0);
+    for ((&value, &rhs), row) in sol.iter().zip(rhs).zip(ata) {
+        lin += value * rhs;
+        for (&a, &b) in row.iter().zip(sol) {
+            quad += value * a * b;
+        }
+    }
+    (lin, quad)
 }
 
 #[inline]
@@ -804,11 +836,8 @@ fn raster_system<const FIXED_COEFFS: usize>(
     let mut btb = [0f64; 3];
     let accumulate = scratch.kernels.fit_accumulate;
     for (&pix, row) in scratch.pixels.iter().zip(scratch.rows.chunks_exact(coeffs)) {
-        let target = targets.each_ref().map(|plane| plane[pix as usize] as f64);
-        accumulate(&mut ata, &mut atb, row, target);
-        for (energy, value) in btb.iter_mut().zip(target) {
-            *energy += value * value;
-        }
+        let target = targets.each_ref().map(|plane| plane[pix as usize]);
+        accumulate(&mut ata, &mut atb, &mut btb, row, target);
     }
     for i in 0..coeffs {
         for j in i + 1..coeffs {
@@ -940,7 +969,7 @@ fn splat_rows<const FIXED_COEFFS: usize, const TILED: bool>(
                         // Keep the addition to +0.0 for first contact, including signed zero.
                         scratch
                             .rows
-                            .extend(basis.iter().map(|&b| 0.0 + weight as f64 * b));
+                            .extend(basis.iter().map(|&b| weight as f64 * b));
                     } else {
                         let row = &mut scratch.rows
                             [*slot as usize * coeffs..(*slot as usize + 1) * coeffs];
@@ -999,11 +1028,14 @@ impl FitSystem {
                     *d = a - b;
                 }
                 let neighbor_pixel = ny * w + nx;
-                let target = planes.map(|plane| (plane[pixel] - plane[neighbor_pixel]) as f64);
-                accumulate(&mut result.ata, &mut result.atb, &diff[..k], target);
-                for (energy, value) in result.btb.iter_mut().zip(target) {
-                    *energy += value * value;
-                }
+                let target = planes.map(|plane| plane[pixel] - plane[neighbor_pixel]);
+                accumulate(
+                    &mut result.ata,
+                    &mut result.atb,
+                    &mut result.btb,
+                    &diff[..k],
+                    target,
+                );
             }
         }
         for i in 0..k {
@@ -1038,14 +1070,13 @@ impl FitSystem {
 
         let (mut err, mut e0) = (0f64, 0f64);
         for c in 0..3 {
-            let mut quad = 0f64;
-            let mut lin = 0f64;
-            for ((&value, &rhs), row) in sol[c][..coeffs].iter().zip(&atb[c]).zip(ata) {
-                lin += value * rhs;
-                for (&a, &b) in row[..coeffs].iter().zip(&sol[c]) {
-                    quad += value * a * b;
-                }
-            }
+            // Short fits retain scalar accumulation, including the common
+            // three- and six-coefficient budgets.
+            let (lin, quad) = if coeffs < 8 {
+                fit_score_scalar(ata, &atb[c][..coeffs], &sol[c][..coeffs])
+            } else {
+                (kernels.fit_score)(ata, &atb[c][..coeffs], &sol[c][..coeffs])
+            };
             let weight = FIT_CHANNEL_WEIGHT[c] * FIT_CHANNEL_WEIGHT[c];
             err += weight * (btb[c] - 2.0 * lin + quad).max(0.0);
             e0 += weight * btb[c];
@@ -1924,6 +1955,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prepared_basis_matches_selected_cosine() {
+        let mut scratch = FitScratch::default();
+        for points in [
+            &[Point::new(4, 8), Point::new(132, 36)][..],
+            &[Point::new(0, 0), Point::new(48, 89), Point::new(90, 71)],
+        ] {
+            scratch.geometry(points);
+            let cos = scratch.kernels.cos;
+            for coeffs in [1, 3, 6, 12, MAX_COEFFS] {
+                scratch.prepare_basis(coeffs);
+                assert_eq!(scratch.basis.len(), scratch.samples.len() * coeffs);
+                for (k, row) in scratch.basis.chunks_exact(coeffs).enumerate() {
+                    let t = 31.0 * (k as f32 / scratch.arc).min(1.0);
+                    for (i, &value) in row.iter().enumerate() {
+                        let expected = std::f64::consts::SQRT_2
+                            * cos(std::f32::consts::PI / 32.0 * i as f32 * (t + 0.5)) as f64;
+                        assert_eq!(value.to_bits(), expected.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn raster_slots_match_dense_lookup_across_tile_edges() {
         let (w, h) = (97, 65);
         let mut dense = RasterSlots::default();
@@ -2510,17 +2565,29 @@ mod tests {
             let basis = &row[1..=k];
             let mut dst = [0.53; MAX_COEFFS + 2];
             let mut expected = dst;
-            (kernels.fit_add_scaled)(&mut dst[1..=k], basis, target[0]);
-            add_scaled_scalar(&mut expected[1..=k], basis, target[0]);
+            (kernels.fit_add_scaled)(&mut dst[1..=k], basis, f64::from(target[0]));
+            add_scaled_scalar(&mut expected[1..=k], basis, f64::from(target[0]));
             for (actual, expected) in dst.into_iter().zip(expected) {
                 assert!((actual - expected).abs() <= 1e-14, "k={k}");
             }
 
             let mut ata = [[0.53; MAX_COEFFS]; MAX_COEFFS];
             let mut atb = [[-0.41; MAX_COEFFS]; 3];
-            let (mut expected_ata, mut expected_atb) = (ata, atb);
-            (kernels.fit_accumulate)(&mut ata, &mut atb, basis, target);
-            accumulate_fit_scalar(&mut expected_ata, &mut expected_atb, basis, target);
+            let mut btb = [0.13, 0.57, 0.81];
+            let (mut expected_ata, mut expected_atb, mut expected_btb) = (ata, atb, btb);
+            (kernels.fit_accumulate)(&mut ata, &mut atb, &mut btb, basis, target);
+            accumulate_fit_scalar(
+                &mut expected_ata,
+                &mut expected_atb,
+                &mut expected_btb,
+                basis,
+                target,
+            );
+            assert_eq!(
+                btb.map(f64::to_bits),
+                expected_btb.map(f64::to_bits),
+                "k={k}"
+            );
             for (actual, expected) in ata
                 .iter()
                 .chain(&atb)
@@ -2534,6 +2601,46 @@ mod tests {
             let actual = (kernels.fit_sub_dot)(5.2, left, basis);
             let expected = sub_dot_scalar(5.2, left, basis);
             assert!((actual - expected).abs() <= 1e-12, "k={k}");
+        }
+    }
+
+    #[test]
+    fn fit_score_matches_scalar_for_all_widths() {
+        let score = SplinesContext::get().fit_score;
+        let ata = std::array::from_fn(|i| {
+            std::array::from_fn(|j| {
+                let x = ((i * j + i + j) % 23) as f64 * 0.07 - 0.9;
+                if i == j { x + 1.0 } else { x }
+            })
+        });
+        let rhs: [f64; MAX_COEFFS] = std::array::from_fn(|i| (i as f64 * 0.31).sin());
+        let sol: [f64; MAX_COEFFS] = std::array::from_fn(|i| (i as f64 * 0.71).cos());
+        for k in 0..=MAX_COEFFS {
+            let (lin, quad) = score(&ata, &rhs[..k], &sol[..k]);
+            let (want_lin, want_quad) = fit_score_scalar(&ata, &rhs[..k], &sol[..k]);
+            assert!((lin - want_lin).abs() < 1e-12, "linear term, k={k}");
+            assert!((quad - want_quad).abs() < 1e-12, "quadratic term, k={k}");
+        }
+    }
+
+    #[test]
+    fn fit_energy_preserves_f32_squares_bitwise() {
+        let accumulate = SplinesContext::get().fit_accumulate;
+        let mut ata = [[0.0; MAX_COEFFS]; MAX_COEFFS];
+        let mut atb = [[0.0; MAX_COEFFS]; 3];
+        let mut btb = [-0.0f64, 0.0, 0.81];
+        let mut expected = btb;
+        for target in [
+            [-0.0, 0.0, -0.31],
+            [f32::from_bits(1), -f32::MIN_POSITIVE, 0.19],
+            [-0.91, 0.17, f32::MAX],
+            [f32::MAX, -f32::MAX, f32::MAX],
+        ] {
+            accumulate(&mut ata, &mut atb, &mut btb, &[1.0; 3], target);
+            for (energy, value) in expected.iter_mut().zip(target.map(f64::from)) {
+                *energy += value * value;
+            }
+            assert_eq!(btb.map(f64::to_bits), expected.map(f64::to_bits));
         }
     }
 

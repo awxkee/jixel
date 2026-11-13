@@ -95,6 +95,59 @@ pub(crate) fn vertical_row_avx2(
     }
 }
 
+#[target_feature(enable = "avx2")]
+pub(crate) fn dot_contrast_avx2(
+    src: &[f32],
+    stride: usize,
+    dst: &mut [f32],
+    side: usize,
+    bg: f32,
+    slope: [f32; 2],
+) {
+    let rows = crate::splines::dots::contrast_patch_rows(src, stride, dst, side);
+    let radius = (side / 2) as i32;
+    let dx = _mm256_sub_ps(
+        _mm256_setr_ps(0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0),
+        _mm256_set1_ps(radius as f32),
+    );
+    let x_term = _mm256_mul_ps(_mm256_set1_ps(slope[0]), dx);
+    let bg8 = _mm256_set1_ps(bg);
+    for (j, (src, dst)) in rows.enumerate() {
+        let y_term = slope[1] * (j as i32 - radius) as f32;
+        let y8 = _mm256_set1_ps(y_term);
+        let (src8, src) = src.as_chunks::<8>();
+        let (dst8, dst) = dst.as_chunks_mut::<8>();
+        if let ([src], [dst]) = (src8, dst8) {
+            // SAFETY: each array contains eight elements.
+            unsafe {
+                let pixels = _mm256_loadu_ps(src.as_ptr());
+                let contrast = _mm256_sub_ps(_mm256_sub_ps(pixels, bg8), x_term);
+                _mm256_storeu_ps(dst.as_mut_ptr(), _mm256_sub_ps(contrast, y8));
+            }
+        }
+        let (src4, src) = src.as_chunks::<4>();
+        let (dst4, dst) = dst.as_chunks_mut::<4>();
+        if let ([src], [dst]) = (src4, dst4) {
+            // SAFETY: each array contains four elements.
+            unsafe {
+                let pixels = _mm_loadu_ps(src.as_ptr());
+                let contrast = _mm_sub_ps(
+                    _mm_sub_ps(pixels, _mm256_castps256_ps128(bg8)),
+                    _mm256_castps256_ps128(x_term),
+                );
+                _mm_storeu_ps(
+                    dst.as_mut_ptr(),
+                    _mm_sub_ps(contrast, _mm256_castps256_ps128(y8)),
+                );
+            }
+        }
+        let x0 = (side - dst.len()) as i32 - radius;
+        for ((out, &pixel), dx) in dst.iter_mut().zip(src).zip(x0..) {
+            *out = pixel - bg - slope[0] * dx as f32 - y_term;
+        }
+    }
+}
+
 #[inline]
 #[target_feature(enable = "avx2,fma")]
 fn abs(x: __m256) -> __m256 {
@@ -243,28 +296,55 @@ fn fast_cos(x: __m256) -> __m256 {
 }
 
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn continuous_idct_avx2(dct: &[[f32; 4]; 32], t: f32) -> [f32; 4] {
+pub(crate) fn continuous_idct_avx2(dct: &[[f32; 4]], t: f32) -> [f32; 4] {
+    if dct.len() == 32 {
+        continuous_idct_impl(&dct[..32], t)
+    } else {
+        continuous_idct_impl(dct, t)
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn continuous_idct_impl(dct: &[[f32; 4]], t: f32) -> [f32; 4] {
     let mut result = _mm_setzero_ps();
     let mut indices = _mm256_setr_ps(0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0);
-    for rows in dct.as_chunks::<8>().0 {
+    let cosine = |indices| {
         let args = _mm256_mul_ps(
             _mm256_mul_ps(indices, _mm256_set1_ps(std::f32::consts::PI / 32.0)),
             _mm256_set1_ps(t + 0.5),
         );
-        let cos = fast_cos(args);
-        for (i, pair) in rows.as_chunks::<2>().0.iter().enumerate() {
-            let a = (i * 2) as i32;
-            let b = a + 1;
-            let cosines = _mm256_permutevar8x32_ps(cos, _mm256_setr_epi32(a, a, a, a, b, b, b, b));
+        fast_cos(args)
+    };
+    let mut accumulate_pairs = |rows: &[[[f32; 4]; 2]], cos| {
+        for (i, pair) in rows.iter().enumerate() {
+            let lo = (i * 2) as i32;
+            let hi = lo + 1;
+            let cosines =
+                _mm256_permutevar8x32_ps(cos, _mm256_setr_epi32(lo, lo, lo, lo, hi, hi, hi, hi));
             // SAFETY: two adjacent channel arrays contain exactly eight floats.
             let values = unsafe { _mm256_loadu_ps(pair.as_ptr().cast::<f32>()) };
             let product = _mm256_mul_ps(values, cosines);
-            // Keep all 32 frequency additions in decoder order; reducing
-            // separate even/odd accumulators would change rounding.
+            // Accumulate frequencies in decoder order.
             result = _mm_add_ps(result, _mm256_castps256_ps128(product));
             result = _mm_add_ps(result, _mm256_extractf128_ps::<1>(product));
         }
+    };
+    let (blocks, tail) = dct.as_chunks::<8>();
+    for rows in blocks {
+        accumulate_pairs(rows.as_chunks::<2>().0, cosine(indices));
         indices = _mm256_add_ps(indices, _mm256_set1_ps(8.0));
+    }
+    if !tail.is_empty() {
+        let cos = cosine(indices);
+        let (pairs, remainder) = tail.as_chunks::<2>();
+        accumulate_pairs(pairs, cos);
+        if let [row] = remainder {
+            let cos = _mm256_permutevar8x32_ps(cos, _mm256_set1_epi32((pairs.len() * 2) as i32));
+            // SAFETY: one channel array contains exactly four floats.
+            let values = unsafe { _mm_loadu_ps(row.as_ptr()) };
+            result = _mm_add_ps(result, _mm_mul_ps(values, _mm256_castps256_ps128(cos)));
+        }
     }
     let mut out = [0.0; 4];
     unsafe { _mm_storeu_ps(out.as_mut_ptr(), result) };

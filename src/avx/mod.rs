@@ -113,11 +113,13 @@ pub(crate) use yellow_opsin::sampled_b_gradient_ratio_avx2;
 pub(crate) use ytob::{accumulate_ytob_weights_avx2, fill_ytob_residuals_avx2, fill_ytob_row_avx2};
 
 #[cfg(feature = "splines")]
-pub(crate) use spline_fit::{accumulate_fit_avx2, add_scaled_f64_avx2, sub_dot_avx2};
+pub(crate) use spline_fit::{
+    accumulate_fit_avx2, add_scaled_f64_avx2, fit_score_avx2, sub_dot_avx2,
+};
 #[cfg(feature = "splines")]
 pub(crate) use splines::{
-    blob_weight_row_avx2, continuous_idct_avx2, spline_distance_avx2, spline_render_row_avx2,
-    spline_ridge_row_avx2, vertical_row_avx2,
+    blob_weight_row_avx2, continuous_idct_avx2, dot_contrast_avx2, spline_distance_avx2,
+    spline_render_row_avx2, spline_ridge_row_avx2, vertical_row_avx2,
 };
 
 #[cfg(feature = "extraslow")]

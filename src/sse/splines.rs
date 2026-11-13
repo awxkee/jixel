@@ -66,31 +66,53 @@ fn fast_cos(x: __m128, periods: __m128) -> __m128 {
 macro_rules! continuous_idct {
     ($name:ident, $feature:literal, $floor:expr) => {
         #[target_feature(enable = $feature)]
-        pub(crate) fn $name(dct: &[[f32; 4]; 32], t: f32) -> [f32; 4] {
-            let mut result = _mm_setzero_ps();
-            let mut indices = _mm_setr_ps(0.0, 1.0, 2.0, 3.0);
-            for rows in dct.as_chunks::<4>().0 {
-                let args = _mm_mul_ps(
-                    _mm_mul_ps(indices, _mm_set1_ps(std::f32::consts::PI / 32.0)),
-                    _mm_set1_ps(t + 0.5),
-                );
-                let periods = ($floor)(_mm_mul_ps(args, _mm_set1_ps(0.5 / std::f32::consts::PI)));
-                let cos = fast_cos(args, periods);
-                let cosines = [
-                    _mm_shuffle_ps::<0x00>(cos, cos),
-                    _mm_shuffle_ps::<0x55>(cos, cos),
-                    _mm_shuffle_ps::<0xaa>(cos, cos),
-                    _mm_shuffle_ps::<0xff>(cos, cos),
-                ];
-                for (row, cos) in rows.iter().zip(cosines) {
+        pub(crate) fn $name(dct: &[[f32; 4]], t: f32) -> [f32; 4] {
+            #[inline]
+            #[target_feature(enable = $feature)]
+            fn eval(dct: &[[f32; 4]], t: f32) -> [f32; 4] {
+                let mut result = _mm_setzero_ps();
+                let mut indices = _mm_setr_ps(0.0, 1.0, 2.0, 3.0);
+                let cosine = |indices| {
+                    let args = _mm_mul_ps(
+                        _mm_mul_ps(indices, _mm_set1_ps(std::f32::consts::PI / 32.0)),
+                        _mm_set1_ps(t + 0.5),
+                    );
+                    let periods =
+                        ($floor)(_mm_mul_ps(args, _mm_set1_ps(0.5 / std::f32::consts::PI)));
+                    let cos = fast_cos(args, periods);
+                    [
+                        _mm_shuffle_ps::<0x00>(cos, cos),
+                        _mm_shuffle_ps::<0x55>(cos, cos),
+                        _mm_shuffle_ps::<0xaa>(cos, cos),
+                        _mm_shuffle_ps::<0xff>(cos, cos),
+                    ]
+                };
+                let mut accumulate = |row: &[f32; 4], cos| {
                     let values = unsafe { _mm_loadu_ps(row.as_ptr()) };
                     result = _mm_add_ps(result, _mm_mul_ps(values, cos));
+                };
+                let (blocks, tail) = dct.as_chunks::<4>();
+                for rows in blocks {
+                    rows.iter()
+                        .zip(cosine(indices))
+                        .for_each(|(row, cos)| accumulate(row, cos));
+                    indices = _mm_add_ps(indices, _mm_set1_ps(4.0));
                 }
-                indices = _mm_add_ps(indices, _mm_set1_ps(4.0));
+                if !tail.is_empty() {
+                    tail.iter()
+                        .zip(cosine(indices))
+                        .for_each(|(row, cos)| accumulate(row, cos));
+                }
+                let mut out = [0.0; 4];
+                unsafe { _mm_storeu_ps(out.as_mut_ptr(), result) };
+                out
             }
-            let mut out = [0.0; 4];
-            unsafe { _mm_storeu_ps(out.as_mut_ptr(), result) };
-            out
+
+            if dct.len() == 32 {
+                eval(&dct[..32], t)
+            } else {
+                eval(dct, t)
+            }
         }
     };
 }

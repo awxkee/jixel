@@ -77,9 +77,19 @@ pub(crate) fn add_scaled_f64_avx2(dst: &mut [f64], src: &[f64], scale: f64) {
 pub(crate) fn accumulate_fit_avx2(
     ata: &mut FitMatrix,
     atb: &mut FitTargets,
+    btb: &mut [f64; 3],
     row: &[f64],
-    target: [f64; 3],
+    target: [f32; 3],
 ) {
+    let target = target.map(f64::from);
+    // A finite f32 square is exact in f64, so fusion preserves energy rounding.
+    // SAFETY: both arrays have at least two lanes.
+    unsafe {
+        let values = _mm_loadu_pd(target.as_ptr());
+        let energy = _mm_loadu_pd(btb.as_ptr());
+        _mm_storeu_pd(btb.as_mut_ptr(), _mm_fmadd_pd(values, values, energy));
+    }
+    btb[2] = target[2].mul_add(target[2], btb[2]);
     match row.len() {
         3 => accumulate_fit_fixed(ata, atb, row.first_chunk::<3>().unwrap(), target),
         6 => accumulate_fit_fixed(ata, atb, row.first_chunk::<6>().unwrap(), target),
@@ -112,6 +122,66 @@ fn accumulate_fit_rows(ata: &mut FitMatrix, atb: &mut FitTargets, row: &[f64], t
     for (dst, scale) in atb.iter_mut().zip(target) {
         add_scaled_f64_avx2(&mut dst[..row.len()], row, scale);
     }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn sum_lanes(value: __m256d) -> f64 {
+    let halves = _mm_add_pd(
+        _mm256_castpd256_pd128(value),
+        _mm256_extractf128_pd::<1>(value),
+    );
+    _mm_cvtsd_f64(_mm_add_sd(halves, _mm_unpackhi_pd(halves, halves)))
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn fit_score_avx2(ata: &FitMatrix, rhs: &[f64], sol: &[f64]) -> (f64, f64) {
+    assert_eq!(rhs.len(), sol.len());
+    let rows = &ata[..sol.len()];
+    let (sol_blocks, sol_tail) = sol.as_chunks::<4>();
+    let (rhs_blocks, rhs_tail) = rhs.as_chunks::<4>();
+    let mut lin = _mm256_setzero_pd();
+    for (values, rhs) in sol_blocks.iter().zip(rhs_blocks) {
+        // SAFETY: each array contains one complete vector.
+        unsafe {
+            lin = _mm256_fmadd_pd(
+                _mm256_loadu_pd(values.as_ptr()),
+                _mm256_loadu_pd(rhs.as_ptr()),
+                lin,
+            );
+        }
+    }
+
+    let (sol_pairs, sol_block) = sol_blocks.as_chunks::<2>();
+    let mut quad0 = _mm256_setzero_pd();
+    let mut quad1 = _mm256_setzero_pd();
+    let mut quad_tail = 0.0;
+    for (&value, row) in sol.iter().zip(rows) {
+        let scale = _mm256_set1_pd(value);
+        let (row_blocks, row_tail) = row[..sol.len()].as_chunks::<4>();
+        let (row_pairs, row_block) = row_blocks.as_chunks::<2>();
+        // SAFETY: each array contains one complete vector.
+        unsafe {
+            for ([a0, a1], [b0, b1]) in row_pairs.iter().zip(sol_pairs) {
+                let scaled0 = _mm256_mul_pd(scale, _mm256_loadu_pd(a0.as_ptr()));
+                let scaled1 = _mm256_mul_pd(scale, _mm256_loadu_pd(a1.as_ptr()));
+                quad0 = _mm256_fmadd_pd(scaled0, _mm256_loadu_pd(b0.as_ptr()), quad0);
+                quad1 = _mm256_fmadd_pd(scaled1, _mm256_loadu_pd(b1.as_ptr()), quad1);
+            }
+            if let ([a], [b]) = (row_block, sol_block) {
+                let scaled = _mm256_mul_pd(scale, _mm256_loadu_pd(a.as_ptr()));
+                quad0 = _mm256_fmadd_pd(scaled, _mm256_loadu_pd(b.as_ptr()), quad0);
+            }
+        }
+        for (&a, &b) in row_tail.iter().zip(sol_tail) {
+            quad_tail = (value * a).mul_add(b, quad_tail);
+        }
+    }
+    let mut lin = sum_lanes(lin);
+    for (&value, &rhs) in sol_tail.iter().zip(rhs_tail) {
+        lin = value.mul_add(rhs, lin);
+    }
+    (lin, sum_lanes(_mm256_add_pd(quad0, quad1)) + quad_tail)
 }
 
 #[target_feature(enable = "avx2,fma")]
@@ -151,9 +221,8 @@ pub(crate) fn sub_dot_avx2(initial: f64, left: &[f64], right: &[f64]) -> f64 {
                     sum1,
                 );
             }
-            let sum = _mm256_add_pd(sum0, sum1);
-            let halves = _mm_add_pd(_mm256_castpd256_pd128(sum), _mm256_extractf128_pd::<1>(sum));
-            result = _mm_sub_sd(result, _mm_add_sd(halves, _mm_unpackhi_pd(halves, halves)));
+            let sum = sum_lanes(_mm256_add_pd(sum0, sum1));
+            result = _mm_sub_sd(result, _mm_set_sd(sum));
         }
         let (left_blocks, left) = left.as_chunks::<2>();
         let (right_blocks, right) = right.as_chunks::<2>();

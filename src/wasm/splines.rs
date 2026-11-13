@@ -53,27 +53,47 @@ fn fast_cos_wasm(x: std::arch::wasm32::v128) -> std::arch::wasm32::v128 {
     v128_bitselect(f32x4_neg(s2), s2, above)
 }
 
-pub(crate) fn continuous_idct_wasm(dct: &[[f32; 4]; 32], t: f32) -> [f32; 4] {
+pub(crate) fn continuous_idct_wasm(dct: &[[f32; 4]], t: f32) -> [f32; 4] {
+    if dct.len() == 32 {
+        continuous_idct_impl(&dct[..32], t)
+    } else {
+        continuous_idct_impl(dct, t)
+    }
+}
+
+#[inline]
+fn continuous_idct_impl(dct: &[[f32; 4]], t: f32) -> [f32; 4] {
     use std::arch::wasm32::*;
     let mut result = f32x4_splat(0.0);
     let mut indices = f32x4(0.0, 1.0, 2.0, 3.0);
-    for rows in dct.as_chunks::<4>().0 {
+    let cosine = |indices| {
         let args = f32x4_mul(
             f32x4_mul(indices, f32x4_splat(std::f32::consts::PI / 32.0)),
             f32x4_splat(t + 0.5),
         );
         let cos = fast_cos_wasm(args);
-        let cosines = [
+        [
             f32x4_splat(f32x4_extract_lane::<0>(cos)),
             f32x4_splat(f32x4_extract_lane::<1>(cos)),
             f32x4_splat(f32x4_extract_lane::<2>(cos)),
             f32x4_splat(f32x4_extract_lane::<3>(cos)),
-        ];
-        for (row, cos) in rows.iter().zip(cosines) {
-            let values = unsafe { v128_load(row.as_ptr().cast()) };
-            result = f32x4_add(result, f32x4_mul(values, cos));
-        }
+        ]
+    };
+    let mut accumulate = |row: &[f32; 4], cos| {
+        let values = unsafe { v128_load(row.as_ptr().cast()) };
+        result = f32x4_add(result, f32x4_mul(values, cos));
+    };
+    let (blocks, tail) = dct.as_chunks::<4>();
+    for rows in blocks {
+        rows.iter()
+            .zip(cosine(indices))
+            .for_each(|(row, cos)| accumulate(row, cos));
         indices = f32x4_add(indices, f32x4_splat(4.0));
+    }
+    if !tail.is_empty() {
+        tail.iter()
+            .zip(cosine(indices))
+            .for_each(|(row, cos)| accumulate(row, cos));
     }
     let mut out = [0.0; 4];
     unsafe { v128_store(out.as_mut_ptr().cast(), result) };

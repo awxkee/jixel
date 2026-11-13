@@ -221,25 +221,46 @@ fn fast_cos_neon(x: float32x4_t) -> float32x4_t {
 }
 
 #[target_feature(enable = "neon")]
-pub(crate) fn continuous_idct_neon(dct: &[[f32; 4]; 32], t: f32) -> [f32; 4] {
+pub(crate) fn continuous_idct_neon(dct: &[[f32; 4]], t: f32) -> [f32; 4] {
+    if dct.len() == 32 {
+        continuous_idct_impl(&dct[..32], t)
+    } else {
+        continuous_idct_impl(dct, t)
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn continuous_idct_impl(dct: &[[f32; 4]], t: f32) -> [f32; 4] {
     let mut result = vdupq_n_f32(0.0);
     let indices = [0.0, 1.0, 2.0, 3.0];
     let mut indices = unsafe { vld1q_f32(indices.as_ptr()) };
-    for rows in dct.as_chunks::<4>().0 {
+    let cosine = |indices| {
         let args = vmulq_n_f32(vmulq_n_f32(indices, std::f32::consts::PI / 32.0), t + 0.5);
         let cos = fast_cos_neon(args);
-        let cosines = [
+        [
             vdupq_laneq_f32::<0>(cos),
             vdupq_laneq_f32::<1>(cos),
             vdupq_laneq_f32::<2>(cos),
             vdupq_laneq_f32::<3>(cos),
-        ];
-        // Accumulate frequencies in order, retaining scalar rounding in each channel.
-        for (row, cos) in rows.iter().zip(cosines) {
-            let values = unsafe { vld1q_f32(row.as_ptr()) };
-            result = vaddq_f32(result, vmulq_f32(values, cos));
-        }
+        ]
+    };
+    // Accumulate frequencies in order, retaining scalar rounding in each channel.
+    let mut accumulate = |row: &[f32; 4], cos| {
+        let values = unsafe { vld1q_f32(row.as_ptr()) };
+        result = vaddq_f32(result, vmulq_f32(values, cos));
+    };
+    let (blocks, tail) = dct.as_chunks::<4>();
+    for rows in blocks {
+        rows.iter()
+            .zip(cosine(indices))
+            .for_each(|(row, cos)| accumulate(row, cos));
         indices = vaddq_f32(indices, vdupq_n_f32(4.0));
+    }
+    if !tail.is_empty() {
+        tail.iter()
+            .zip(cosine(indices))
+            .for_each(|(row, cos)| accumulate(row, cos));
     }
     let mut out = [0.0; 4];
     unsafe { vst1q_f32(out.as_mut_ptr(), result) };
@@ -362,6 +383,46 @@ pub(crate) fn blob_weight_row_neon(row: BlobWeightRow, x0: i32, weights: &mut [f
             )
         };
         tail.copy_from_slice(&padded[..tail.len()]);
+    }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dot_contrast_neon(
+    src: &[f32],
+    stride: usize,
+    dst: &mut [f32],
+    side: usize,
+    bg: f32,
+    slope: [f32; 2],
+) {
+    let radius = (side / 2) as i32;
+    let [sx, sy] = slope;
+    let background = vdupq_n_f32(bg);
+    let horizontal = [
+        vmulq_n_f32(dx_lanes(-radius, 0.0), sx),
+        vmulq_n_f32(dx_lanes(4 - radius, 0.0), sx),
+    ];
+    let rows = crate::splines::dots::contrast_patch_rows(src, stride, dst, side);
+    for (y, (src, dst)) in rows.enumerate() {
+        let row_slope = sy * (y as i32 - radius) as f32;
+        let vertical = vdupq_n_f32(row_slope);
+        let (src, src_tail) = src.as_chunks::<4>();
+        let (dst, dst_tail) = dst.as_chunks_mut::<4>();
+        for ((src, dst), horizontal) in src.iter().zip(dst).zip(horizontal) {
+            // SAFETY: each array contains four readable or writable pixels.
+            unsafe {
+                let pixels = vld1q_f32(src.as_ptr());
+                let contrast = vsubq_f32(
+                    vsubq_f32(vsubq_f32(pixels, background), horizontal),
+                    vertical,
+                );
+                vst1q_f32(dst.as_mut_ptr(), contrast);
+            }
+        }
+        let x0 = 4 * src.len() as i32 - radius;
+        for ((dst, &pixel), dx) in dst_tail.iter_mut().zip(src_tail).zip(x0..) {
+            *dst = pixel - bg - sx * dx as f32 - row_slope;
+        }
     }
 }
 

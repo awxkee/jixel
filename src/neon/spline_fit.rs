@@ -68,9 +68,19 @@ pub(super) fn add_scaled_neon(dst: &mut [f64], src: &[f64], scale: f64) {
 pub(super) fn accumulate_fit_neon(
     ata: &mut FitMatrix,
     atb: &mut FitTargets,
+    btb: &mut [f64; 3],
     row: &[f64],
-    target: [f64; 3],
+    target: [f32; 3],
 ) {
+    let target = target.map(f64::from);
+    // A finite f32 square is exact in f64, so fusion preserves energy rounding.
+    // SAFETY: both arrays have at least two lanes.
+    unsafe {
+        let values = vld1q_f64(target.as_ptr());
+        let energy = vld1q_f64(btb.as_ptr());
+        vst1q_f64(btb.as_mut_ptr(), vfmaq_f64(energy, values, values));
+    }
+    btb[2] = target[2].mul_add(target[2], btb[2]);
     match row.len() {
         3 => accumulate_fit_fixed(ata, atb, row.first_chunk::<3>().unwrap(), target),
         6 => accumulate_fit_fixed(ata, atb, row.first_chunk::<6>().unwrap(), target),
@@ -103,6 +113,62 @@ fn accumulate_fit_rows(ata: &mut FitMatrix, atb: &mut FitTargets, row: &[f64], t
     for (out, value) in atb.iter_mut().zip(target) {
         add_scaled_neon(&mut out[..row.len()], row, value);
     }
+}
+
+#[target_feature(enable = "neon")]
+pub(super) fn fit_score_neon(ata: &FitMatrix, rhs: &[f64], sol: &[f64]) -> (f64, f64) {
+    assert_eq!(rhs.len(), sol.len());
+    let rows = &ata[..sol.len()];
+    let (sol_vectors, sol_tail) = sol.as_chunks::<2>();
+    let (sol_pairs, sol_vector_tail) = sol_vectors.as_chunks::<2>();
+    let (rhs_vectors, rhs_tail) = rhs.as_chunks::<2>();
+    let (rhs_pairs, rhs_vector_tail) = rhs_vectors.as_chunks::<2>();
+
+    let zero = vdupq_n_f64(0.0);
+    let (mut lin0, mut lin1) = (zero, zero);
+    for ([s0, s1], [r0, r1]) in sol_pairs.iter().zip(rhs_pairs) {
+        // SAFETY: each array contains two lanes.
+        unsafe {
+            lin0 = vfmaq_f64(lin0, vld1q_f64(s0.as_ptr()), vld1q_f64(r0.as_ptr()));
+            lin1 = vfmaq_f64(lin1, vld1q_f64(s1.as_ptr()), vld1q_f64(r1.as_ptr()));
+        }
+    }
+    if let ([s], [r]) = (sol_vector_tail, rhs_vector_tail) {
+        // SAFETY: each array contains two lanes.
+        unsafe { lin0 = vfmaq_f64(lin0, vld1q_f64(s.as_ptr()), vld1q_f64(r.as_ptr())) };
+    }
+    let mut lin = vaddvq_f64(vaddq_f64(lin0, lin1));
+    if let (&[s], &[r]) = (sol_tail, rhs_tail) {
+        lin = s.mul_add(r, lin);
+    }
+
+    let (mut quad0, mut quad1) = (zero, zero);
+    let mut quad_tail = 0.0;
+    for (&value, row) in sol.iter().zip(rows) {
+        let (row_vectors, row_tail) = row[..sol.len()].as_chunks::<2>();
+        let (row_pairs, row_vector_tail) = row_vectors.as_chunks::<2>();
+        for ([a0, a1], [b0, b1]) in row_pairs.iter().zip(sol_pairs) {
+            // SAFETY: each array contains two lanes.
+            unsafe {
+                // Round value * a before multiplying by b, as in the scalar score.
+                let scaled0 = vmulq_n_f64(vld1q_f64(a0.as_ptr()), value);
+                let scaled1 = vmulq_n_f64(vld1q_f64(a1.as_ptr()), value);
+                quad0 = vfmaq_f64(quad0, scaled0, vld1q_f64(b0.as_ptr()));
+                quad1 = vfmaq_f64(quad1, scaled1, vld1q_f64(b1.as_ptr()));
+            }
+        }
+        if let ([a], [b]) = (row_vector_tail, sol_vector_tail) {
+            // SAFETY: each array contains two lanes.
+            unsafe {
+                let scaled = vmulq_n_f64(vld1q_f64(a.as_ptr()), value);
+                quad0 = vfmaq_f64(quad0, scaled, vld1q_f64(b.as_ptr()));
+            }
+        }
+        if let (&[a], &[b]) = (row_tail, sol_tail) {
+            quad_tail = (value * a).mul_add(b, quad_tail);
+        }
+    }
+    (lin, vaddvq_f64(vaddq_f64(quad0, quad1)) + quad_tail)
 }
 
 #[target_feature(enable = "neon")]
