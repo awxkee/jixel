@@ -29,15 +29,16 @@
 
 //! Spline fitting: the decoder's render is linear in the color DCT, so color
 //! is one least-squares solve per candidate width; widths live on the format's
-//! quantized lattice and are seeded from the ridge scale; integer control
-//! points are refined by +-1 px coordinate descent. Every candidate leaves with
-//! a few alternative parametrisations for the RD gate to choose from.
+//! quantized lattice and are seeded from the ridge scale. Integer control
+//! points are aligned to the traced ridge; the primary curve's points are then
+//! refined by +-1 px coordinate descent on the raster fit. Candidates carry
+//! several alternatives for the RD gate to choose from.
 
 use super::detect::{Chain, gaussian_kernels};
 use super::filter::FilterPlan;
 use super::geometry::Polyline;
 use super::lines::{LineIndex, curve_samples, unit_tangents};
-use super::select::{BlockModel, pretest};
+use super::select::Pretest;
 use super::{
     BlobWeightRow, CHANNEL_WEIGHT, FitMatrix, FitTargets, Point, QUANT_ADJUST, QuantizedSpline,
     SplinesContext, adjusted_quant, catmull_rom_spans, round_i32, sample_curve,
@@ -89,7 +90,7 @@ const LONG_LINE_SPANS: f32 = 3.0;
 const LONG_LINE_MAX_COEFFS: usize = 3;
 static LONG_LINE_WIDTHS: [i32; 5] = [2, 3, 4, 5, 6];
 /// Long-line widths tried, nearest to the ridge-scale prediction first.
-const LONG_LINE_SEEDED_WIDTHS: usize = 3;
+const LONG_LINE_SEEDED_WIDTHS: usize = 2;
 /// A long line touches many blocks, and the DCT8 proxy's optimism adds up over
 /// them: long splines must clear a higher bar on textured ground.
 const LONG_LINE_BITS_FACTOR: f32 = 4.0;
@@ -112,6 +113,35 @@ pub(super) struct Candidate {
     pub(super) bits_factor: f32,
     /// Star dot (see `dots`): priced by position and template, selected after lines.
     pub(super) dot: bool,
+}
+
+/// Coefficient count the Full fit would use for this geometry.
+fn full_coeffs(points: &[Point<i32>], scratch: &mut FitScratch) -> usize {
+    scratch.geometry(points);
+    ((scratch.arc / ARC_PER_COEFF + 0.5) as usize).clamp(1, MAX_COEFFS)
+}
+
+/// Width with the best Compact gain; None when no width fits. On long chains
+/// six coefficients rank widths like the full budget at a fraction of the
+/// raster cost.
+fn compact_width(
+    targets: &[Vec<f32>; 3],
+    w: usize,
+    h: usize,
+    points: &[Point<i32>],
+    widths: &[i32],
+    scratch: &mut FitScratch,
+) -> Option<(i32, f64)> {
+    let mut best: Option<(i32, f64)> = None;
+    for &n in widths {
+        if let Some(system) = fit_system(targets, w, h, points, n, Precision::Compact, scratch) {
+            let gain = system.solve(None).gain();
+            if best.is_none_or(|(_, b)| gain > b) {
+                best = Some((n, gain));
+            }
+        }
+    }
+    best
 }
 
 #[inline]
@@ -166,7 +196,7 @@ fn line_targets(
     // The last channel can take ownership of the mask's storage.
     let b = xyb.plane_data(2);
     for (mask, &v) in keep.iter_mut().zip(b) {
-        *mask = v * *mask;
+        *mask *= v;
     }
     [x, y, residual(b, keep)]
 }
@@ -837,6 +867,20 @@ fn raster_system<const FIXED_COEFFS: usize>(
     let accumulate = scratch.kernels.fit_accumulate;
     for (&pix, row) in scratch.pixels.iter().zip(scratch.rows.chunks_exact(coeffs)) {
         let target = targets.each_ref().map(|plane| plane[pix as usize]);
+        #[cfg(target_arch = "aarch64")]
+        if FIXED_COEFFS != 0 {
+            // SAFETY: NEON is part of the supported AArch64 target baseline.
+            unsafe {
+                super::fit_neon::accumulate_fit_fixed_neon(
+                    &mut ata,
+                    &mut atb,
+                    &mut btb,
+                    row.first_chunk::<FIXED_COEFFS>().unwrap(),
+                    target,
+                );
+            }
+            continue;
+        }
         accumulate(&mut ata, &mut atb, &mut btb, row, target);
     }
     for i in 0..coeffs {
@@ -973,6 +1017,17 @@ fn splat_rows<const FIXED_COEFFS: usize, const TILED: bool>(
                     } else {
                         let row = &mut scratch.rows
                             [*slot as usize * coeffs..(*slot as usize + 1) * coeffs];
+                        #[cfg(target_arch = "aarch64")]
+                        if FIXED_COEFFS != 0 {
+                            // The AArch64 kernel uses a fused multiply-add
+                            // even in the tail. Keep small rows in this loop.
+                            let row = row.first_chunk_mut::<FIXED_COEFFS>().unwrap();
+                            let basis = basis.first_chunk::<FIXED_COEFFS>().unwrap();
+                            for (dst, &src) in row.iter_mut().zip(basis) {
+                                *dst = src.mul_add(weight as f64, *dst);
+                            }
+                            continue;
+                        }
                         add_scaled(row, basis, weight as f64);
                     }
                 }
@@ -1306,6 +1361,8 @@ fn refine_geometric(
     let slack = (3 * sm.len() / points.len().max(1) + 8) as f32;
     let mut points = points.to_vec();
     let mut control: Vec<_> = points.iter().map(|&p| p.as_f32()).collect();
+    let mut distinct = !points.array_windows::<2>().any(|p| p[0] == p[1]);
+    let mut last_cost = None;
     for _ in 0..sweeps {
         let mut moved = false;
         for i in 0..points.len() {
@@ -1315,10 +1372,7 @@ fn refine_geometric(
             let last = spans.end * 16;
             let lo = ((first as f32 * per_point - slack).max(0.0) as usize).min(sm.len() - 2);
             let hi = ((last as f32 * per_point + slack) as usize + 2).min(sm.len());
-            let cost = |pts: &[Point<i32>], control: &[Point<f32>], cutoff| {
-                if pts.array_windows::<2>().any(|p| p[0] == p[1]) {
-                    return f32::INFINITY;
-                }
+            let cost = |control: &[Point<f32>], cutoff| {
                 let mut cost = -0.0f32;
                 for p in catmull_rom_spans(control, spans.clone()) {
                     cost += distance.distance_range(p, lo..hi - 1);
@@ -1329,7 +1383,15 @@ fn refine_geometric(
                 }
                 cost
             };
-            let mut best = cost(&points, &control, f32::INFINITY);
+            // Adjacent controls can affect the same spans and use the same
+            // segment range. The previous accepted cost is already exact.
+            let mut best = match last_cost {
+                Some((start, end, value)) if (start, end) == (spans.start, spans.end) => value,
+                _ if distinct => cost(&control, f32::INFINITY),
+                _ => f32::INFINITY,
+            };
+            let left = points[..i].last().copied();
+            let right = points.get(i + 1).copied();
             for (dx, dy) in [
                 (1, 0),
                 (-1, 0),
@@ -1341,18 +1403,28 @@ fn refine_geometric(
                 (-1, -1),
             ] {
                 let previous = points[i];
-                points[i] = Point::new(previous.x + dx, previous.y + dy);
-                control[i] = points[i].as_f32();
+                let trial = Point::new(previous.x + dx, previous.y + dy);
+                if left == Some(trial) || right == Some(trial) {
+                    continue;
+                }
+                points[i] = trial;
+                if !distinct && points.array_windows::<2>().any(|p| p[0] == p[1]) {
+                    points[i] = previous;
+                    continue;
+                }
+                control[i] = trial.as_f32();
                 let cutoff = best - 1e-6;
-                let value = cost(&points, &control, cutoff);
+                let value = cost(&control, cutoff);
                 if value < cutoff {
                     best = value;
+                    distinct = true;
                     moved = true;
                 } else {
                     points[i] = previous;
                     control[i] = previous.as_f32();
                 }
             }
+            last_cost = Some((spans.start, spans.end, best));
         }
         if !moved {
             break;
@@ -1374,7 +1446,8 @@ struct Primary {
     spline: QuantizedSpline,
 }
 
-/// Seeded-width fit of the unrefined control points.
+/// Seeded-width fit of the unrefined control points. Long chains pick the
+/// width on a Compact fit and build the full system only for the winner.
 fn quick_primary(
     ctx: &EncodingContext,
     targets: &[Vec<f32>; 3],
@@ -1394,7 +1467,13 @@ fn quick_primary(
             .abs()
             .total_cmp(&(b as f32 * sigma_step() - predicted).abs())
     });
-    let (fit, system) = fit_best(targets, w, h, &points, &seeds[..SEEDED_WIDTHS], scratch)?;
+    let seeds = &seeds[..SEEDED_WIDTHS];
+    let (fit, system) = if full_coeffs(&points, scratch) > COMPACT_COEFFS {
+        let (n, _) = compact_width(targets, w, h, &points, seeds, scratch)?;
+        fit_best(targets, w, h, &points, &[n], scratch)?
+    } else {
+        fit_best(targets, w, h, &points, seeds, scratch)?
+    };
     if fit.explained() < QUICK_MIN_EXPLAINED {
         return None;
     }
@@ -1425,6 +1504,9 @@ fn expand(
         ..
     } = primary;
     if fit.explained() > REFINE_MIN_EXPLAINED {
+        // Align the knots against the ridge, then nudge them on the raster
+        // fit. Sparse variants skip the raster pass: it costs time there
+        // without changing what the RD gate picks.
         let aligned = refine_geometric(ctx, &points, &chain.points, 2);
         let refined = refine(targets, w, h, &aligned, fit.sigma_n, 1, scratch);
         let at = SIGMA_LATTICE
@@ -1432,9 +1514,30 @@ fn expand(
             .position(|&n| n == fit.sigma_n)
             .unwrap_or(0);
         let nearby = &SIGMA_LATTICE[at.saturating_sub(1)..(at + 2).min(SIGMA_LATTICE.len())];
-        // Width and geometry change pixel support, so compare error removed
-        // rather than raw residual errors over different sets of pixels.
-        if let Some((better, better_system)) = fit_best(targets, w, h, &refined, nearby, scratch)
+        let same_geometry = refined == points;
+        let mut best_gain = None;
+        let mut best_fit = None;
+        for &width in nearby {
+            let (gain, fitted) = if same_geometry && width == fit.sigma_n {
+                // Keep the incumbent's place in the width search without
+                // rebuilding its equations.
+                (fit.gain(), None)
+            } else {
+                let Some(system) =
+                    fit_system(targets, w, h, &refined, width, Precision::Full, scratch)
+                else {
+                    continue;
+                };
+                let fit = system.solve(None);
+                (fit.gain(), Some((fit, system)))
+            };
+            if best_gain.is_none_or(|best| gain > best) {
+                best_gain = Some(gain);
+                best_fit = fitted;
+            }
+        }
+        // Width and geometry change pixel support, so compare energy removed.
+        if let Some((better, better_system)) = best_fit
             && better.gain() > fit.gain()
         {
             (points, fit, system) = (refined, better, better_system);
@@ -1456,12 +1559,7 @@ fn expand(
     let mut geometries = vec![points];
     for sparse in curve_control_variants(ctx, &chain.points) {
         if sparse.len() >= 2 {
-            let aligned = refine_geometric(ctx, &sparse, &chain.points, 2);
-            let refined = if aligned.len() < geometries[0].len() {
-                refine(targets, w, h, &aligned, fit.sigma_n, 1, scratch)
-            } else {
-                aligned
-            };
+            let refined = refine_geometric(ctx, &sparse, &chain.points, 2);
             if !geometries.contains(&refined) {
                 geometries.push(refined);
             }
@@ -1633,25 +1731,20 @@ fn fit_extension(
     })
 }
 
-/// Lean luma-only alternatives for a long straight line. Coding value is left
-/// to the RD tests: a faint line's explained fraction is dominated by grain.
-fn fit_long_line(
-    ctx: &EncodingContext,
-    targets: &[Vec<f32>; 3],
-    w: usize,
-    h: usize,
-    chain: &Chain,
-    scratch: &mut FitScratch,
-) -> Option<Candidate> {
-    let spacing = LONG_LINE_MIN_SPACING.max(chain.points.len() as f32 / LONG_LINE_SPANS);
-    let points = uniform_control_points(&chain.points, spacing);
-    if points.len() < 2 || !inside(&points, w, h) {
-        return None;
-    }
-    let points = refine_geometric(ctx, &points, &chain.points, 2);
-    if !inside(&points, w, h) || points.array_windows::<2>().any(|p| p[0] == p[1]) {
-        return None;
-    }
+/// Whole-line alternatives of a long line's uniform-spacing geometry. The
+/// lean stand-in fit builds the same systems, so it solves these up front
+/// for the group fit instead of rasterizing that geometry twice.
+pub(super) struct UniformLine {
+    points: Vec<Point<i32>>,
+    alts: Vec<QuantizedSpline>,
+}
+
+fn long_line_spacing(chain: &Chain) -> f32 {
+    LONG_LINE_MIN_SPACING.max(chain.points.len() as f32 / LONG_LINE_SPANS)
+}
+
+/// Long-line widths, nearest the ridge scale first.
+fn long_line_widths(chain: &Chain) -> [i32; LONG_LINE_WIDTHS.len()] {
     let predicted = SCALE_TO_SIGMA.0 * chain.scale + SCALE_TO_SIGMA.1;
     let mut widths = LONG_LINE_WIDTHS;
     widths.sort_by(|&a, &b| {
@@ -1659,11 +1752,41 @@ fn fit_long_line(
             .abs()
             .total_cmp(&(b as f32 * sigma_step() - predicted).abs())
     });
+    widths
+}
+
+/// Lean luma-only alternatives for a long straight line. Coding value is left
+/// to the RD tests: a faint line's explained fraction is dominated by grain.
+/// Also returns the uniform geometry's whole-line alternatives for
+/// `fit_whole_line`; `None` there means that geometry is unusable.
+fn fit_long_line(
+    ctx: &EncodingContext,
+    targets: &[Vec<f32>; 3],
+    w: usize,
+    h: usize,
+    chain: &Chain,
+    scratch: &mut FitScratch,
+) -> (Option<Candidate>, Option<UniformLine>) {
+    let points = uniform_control_points(&chain.points, long_line_spacing(chain));
+    if points.len() < 2 || !inside(&points, w, h) {
+        return (None, None);
+    }
+    let points = refine_geometric(ctx, &points, &chain.points, 2);
+    if !inside(&points, w, h) || points.array_windows::<2>().any(|p| p[0] == p[1]) {
+        return (None, None);
+    }
+    let widths = long_line_widths(chain);
     // Geometry and width determine the system; coefficient budgets only solve it.
     let systems: Vec<FitSystem> = widths[..LONG_LINE_SEEDED_WIDTHS]
         .iter()
         .filter_map(|&n| fit_system(targets, w, h, &points, n, Precision::Lean, scratch))
         .collect();
+    let mut uniform_alts = Vec::new();
+    whole_line_alts(&points, &systems, &mut uniform_alts);
+    let uniform = Some(UniformLine {
+        points: points.clone(),
+        alts: uniform_alts,
+    });
     let mut alts: Vec<QuantizedSpline> = Vec::new();
     for k in 1..=LONG_LINE_MAX_COEFFS {
         let mut best: Option<Fit> = None;
@@ -1681,11 +1804,12 @@ fn fit_long_line(
             alts.push(spline);
         }
     }
-    (!alts.is_empty()).then_some(Candidate {
+    let candidate = (!alts.is_empty()).then_some(Candidate {
         alts,
         bits_factor: LONG_LINE_BITS_FACTOR,
         dot: false,
-    })
+    });
+    (candidate, uniform)
 }
 
 /// Fit a well-supported join as a single straight, colored spline. These
@@ -1742,16 +1866,21 @@ fn fit_whole_line(
     w: usize,
     h: usize,
     chain: &Chain,
+    uniform_fit: Option<&UniformLine>,
     scratch: &mut FitScratch,
 ) -> Vec<QuantizedSpline> {
-    let spacing = LONG_LINE_MIN_SPACING.max(chain.points.len() as f32 / LONG_LINE_SPANS);
-    let uniform = uniform_control_points(&chain.points, spacing);
+    let uniform = uniform_control_points(&chain.points, long_line_spacing(chain));
     let [tight, loose] = curve_controls(ctx, &chain.points, CURVE_TOLERANCES, MAX_CURVE_POINTS);
     let loose = (loose != tight && loose != uniform).then_some(loose);
     let tight = (tight != uniform).then_some(tight);
-    let sources = std::iter::once(uniform).chain(tight).chain(loose);
+    // The uniform geometry comes first; `fit_long_line` already fitted it.
     let mut geometries: Vec<Vec<Point<i32>>> = Vec::new();
-    for points in sources {
+    let mut alts: Vec<QuantizedSpline> = Vec::new();
+    if let Some(fitted) = uniform_fit {
+        geometries.push(fitted.points.clone());
+        alts.extend_from_slice(&fitted.alts);
+    }
+    for points in tight.into_iter().chain(loose) {
         if points.len() < 2 || !inside(&points, w, h) {
             continue;
         }
@@ -1763,45 +1892,45 @@ fn fit_whole_line(
             geometries.push(points);
         }
     }
-    let predicted = SCALE_TO_SIGMA.0 * chain.scale + SCALE_TO_SIGMA.1;
-    let mut widths = LONG_LINE_WIDTHS;
-    widths.sort_by(|&a, &b| {
-        (a as f32 * sigma_step() - predicted)
-            .abs()
-            .total_cmp(&(b as f32 * sigma_step() - predicted).abs())
-    });
-    let mut alts: Vec<QuantizedSpline> = Vec::new();
-    for points in &geometries {
+    let widths = long_line_widths(chain);
+    let fitted = usize::from(uniform_fit.is_some());
+    for points in &geometries[fitted..] {
         let systems: Vec<FitSystem> = widths[..LONG_LINE_SEEDED_WIDTHS]
             .iter()
             .filter_map(|&n| fit_system(targets, w, h, points, n, Precision::Lean, scratch))
             .collect();
-        for k in 1..=LONG_LINE_MAX_COEFFS {
-            for chroma in [0, 1] {
-                let mut best: Option<Fit> = None;
-                for system in &systems {
-                    let fit = system.solve(Some((chroma, k, chroma)));
-                    if best.as_ref().is_none_or(|b| fit.gain() > b.gain()) {
-                        best = Some(fit);
-                    }
+        whole_line_alts(points, &systems, &mut alts);
+    }
+    alts
+}
+
+/// Luma-only and lean color alternatives of one whole-line geometry, best
+/// width per coefficient budget, appended unless already present.
+fn whole_line_alts(points: &[Point<i32>], systems: &[FitSystem], alts: &mut Vec<QuantizedSpline>) {
+    for k in 1..=LONG_LINE_MAX_COEFFS {
+        for chroma in [0, 1] {
+            let mut best: Option<Fit> = None;
+            for system in systems {
+                let fit = system.solve(Some((chroma, k, chroma)));
+                if best.as_ref().is_none_or(|b| fit.gain() > b.gain()) {
+                    best = Some(fit);
                 }
-                let Some(fit) = best else { continue };
-                let mut spline = quantize(points, &fit);
-                if chroma == 0 {
-                    spline.dct[0] = [0; 32];
-                    spline.dct[2] = [0; 32];
-                }
-                if spline.dct[1].iter().any(|&v| v != 0)
-                    && !alts
-                        .iter()
-                        .any(|a| a.points == spline.points && a.dct == spline.dct)
-                {
-                    alts.push(spline);
-                }
+            }
+            let Some(fit) = best else { continue };
+            let mut spline = quantize(points, &fit);
+            if chroma == 0 {
+                spline.dct[0] = [0; 32];
+                spline.dct[2] = [0; 32];
+            }
+            if spline.dct[1].iter().any(|&v| v != 0)
+                && !alts
+                    .iter()
+                    .any(|a| a.points == spline.points && a.dct == spline.dct)
+            {
+                alts.push(spline);
             }
         }
     }
-    alts
 }
 
 /// Whole-line alternatives for the groups that some candidate lies on; no
@@ -1813,28 +1942,40 @@ fn fit_groups(
     w: usize,
     h: usize,
     long_lines: &super::lines::LongLines,
+    uniform: &[Option<UniformLine>],
     candidates: &[Candidate],
 ) -> Vec<LineGroup> {
     if long_lines.chains.is_empty() {
         return Vec::new();
     }
-    let alts: Vec<&QuantizedSpline> = candidates.iter().flat_map(|c| c.alts.iter()).collect();
-    let curves = ctx.thread_pool.steal_map(scratch, alts.len(), |i, _| {
-        let (lo, hi) = alts[i].points.iter().fold(
-            (
-                Point::new(i32::MAX, i32::MAX),
-                Point::new(i32::MIN, i32::MIN),
-            ),
-            |(lo, hi), p| {
+    // Group membership depends on the control points alone. Color and
+    // width alternatives of the same curve share its geometry.
+    let mut seen = std::collections::HashSet::new();
+    let geometries: Vec<_> = candidates
+        .iter()
+        .flat_map(|candidate| candidate.alts.iter())
+        .map(|alt| alt.points.as_slice())
+        .filter(|&points| seen.insert(points))
+        .collect();
+    let curves = ctx
+        .thread_pool
+        .steal_map(scratch, geometries.len(), |i, _| {
+            let points = geometries[i];
+            let (lo, hi) = points.iter().fold(
                 (
-                    Point::new(lo.x.min(p.x), lo.y.min(p.y)),
-                    Point::new(hi.x.max(p.x), hi.y.max(p.y)),
-                )
-            },
-        );
-        let (positions, tangents) = curve_samples(&alts[i].points);
-        (lo, hi, positions, tangents)
-    });
+                    Point::new(i32::MAX, i32::MAX),
+                    Point::new(i32::MIN, i32::MIN),
+                ),
+                |(lo, hi), p| {
+                    (
+                        Point::new(lo.x.min(p.x), lo.y.min(p.y)),
+                        Point::new(hi.x.max(p.x), hi.y.max(p.y)),
+                    )
+                },
+            );
+            let (positions, tangents) = curve_samples(points);
+            (lo, hi, positions, tangents)
+        });
     ctx.thread_pool
         .steal_map(scratch, long_lines.chains.len(), |i, worker| {
             let chain = &long_lines.chains[i];
@@ -1862,7 +2003,15 @@ fn fit_groups(
             if !held {
                 return None;
             }
-            let alts = fit_whole_line(ctx, targets, w, h, chain, &mut worker.spline_fit);
+            let alts = fit_whole_line(
+                ctx,
+                targets,
+                w,
+                h,
+                chain,
+                uniform[i].as_ref(),
+                &mut worker.spline_fit,
+            );
             worker.spline_fit.trim();
             (!alts.is_empty()).then(|| LineGroup {
                 points: chain.points.clone(),
@@ -1887,66 +2036,77 @@ pub(super) fn fit_candidates(
     let (w, h) = (xyb.xsize(), xyb.ysize());
     let targets = line_targets(ctx, scratch, xyb, chains);
     let targets = &targets;
-    let model = BlockModel::new(ctx, distance);
-    let model = &model;
-    let candidates: Vec<Candidate> = ctx
-        .thread_pool
-        .steal_map(
-            scratch,
-            long_lines.joined.len() + chains.len() + extensions.len() + long_lines.chains.len(),
-            |i, worker| {
-                let fit_scratch = &mut worker.spline_fit;
-                let result = (|| {
-                    if i < long_lines.joined.len() {
-                        let line = &long_lines.chains[long_lines.joined[i]];
-                        let candidate = fit_joined_line(ctx, targets, w, h, line, fit_scratch)?;
-                        return candidate
-                            .alts
-                            .iter()
-                            .any(|alt| pretest(model, xyb, quant_field, alt))
-                            .then_some(candidate);
-                    }
-                    let i = i - long_lines.joined.len();
-                    // Lean stand-ins still come last, after the colored and
-                    // curved candidates and the well-supported straight joins.
-                    if i >= chains.len() + extensions.len() {
-                        let line = &long_lines.chains[i - chains.len() - extensions.len()];
-                        let candidate = fit_long_line(ctx, targets, w, h, line, fit_scratch)?;
-                        return candidate
-                            .alts
-                            .iter()
-                            .any(|alt| pretest(model, xyb, quant_field, alt))
-                            .then_some(candidate);
-                    }
-                    if i >= chains.len() {
-                        let candidate = fit_extension(
-                            ctx,
-                            targets,
-                            w,
-                            h,
-                            &extensions[i - chains.len()],
-                            fit_scratch,
-                        )?;
-                        return candidate
-                            .alts
-                            .iter()
-                            .any(|alt| pretest(model, xyb, quant_field, alt))
-                            .then_some(candidate);
-                    }
-                    let primary = quick_primary(ctx, targets, w, h, &chains[i], fit_scratch)?;
-                    if !pretest(model, xyb, quant_field, &primary.spline) {
-                        return None;
-                    }
-                    expand(ctx, targets, xyb, w, h, &chains[i], primary, fit_scratch)
-                })();
+    let pretest = Pretest::new(ctx, distance, xyb, quant_field);
+    let lean_start = long_lines.joined.len() + chains.len() + extensions.len();
+    let fitted: Vec<(Option<Candidate>, Option<UniformLine>)> = ctx.thread_pool.steal_map(
+        scratch,
+        lean_start + long_lines.chains.len(),
+        |i, worker| {
+            let fit_scratch = &mut worker.spline_fit;
+            if i >= lean_start {
+                // Lean stand-ins still come last, after the colored and
+                // curved candidates and the well-supported straight joins.
+                let line = &long_lines.chains[i - lean_start];
+                let (candidate, uniform) = fit_long_line(ctx, targets, w, h, line, fit_scratch);
                 fit_scratch.trim();
-                result
-            },
-        )
-        .into_iter()
-        .flatten()
-        .collect();
-    let groups = fit_groups(ctx, scratch, targets, w, h, long_lines, &candidates);
+                let candidate = candidate
+                    .filter(|candidate| candidate.alts.iter().any(|alt| pretest.accepts(alt)));
+                return (candidate, uniform);
+            }
+            let result = (|| {
+                if i < long_lines.joined.len() {
+                    let line = &long_lines.chains[long_lines.joined[i]];
+                    let candidate = fit_joined_line(ctx, targets, w, h, line, fit_scratch)?;
+                    return candidate
+                        .alts
+                        .iter()
+                        .any(|alt| pretest.accepts(alt))
+                        .then_some(candidate);
+                }
+                let i = i - long_lines.joined.len();
+                if i >= chains.len() {
+                    let candidate = fit_extension(
+                        ctx,
+                        targets,
+                        w,
+                        h,
+                        &extensions[i - chains.len()],
+                        fit_scratch,
+                    )?;
+                    return candidate
+                        .alts
+                        .iter()
+                        .any(|alt| pretest.accepts(alt))
+                        .then_some(candidate);
+                }
+                let primary = quick_primary(ctx, targets, w, h, &chains[i], fit_scratch)?;
+                if !pretest.accepts(&primary.spline) {
+                    return None;
+                }
+                expand(ctx, targets, xyb, w, h, &chains[i], primary, fit_scratch)
+            })();
+            fit_scratch.trim();
+            (result, None)
+        },
+    );
+    let mut uniform = Vec::with_capacity(long_lines.chains.len());
+    let mut candidates = Vec::with_capacity(fitted.len());
+    for (i, (candidate, line)) in fitted.into_iter().enumerate() {
+        candidates.extend(candidate);
+        if i >= lean_start {
+            uniform.push(line);
+        }
+    }
+    let groups = fit_groups(
+        ctx,
+        scratch,
+        targets,
+        w,
+        h,
+        long_lines,
+        &uniform,
+        &candidates,
+    );
     (candidates, groups)
 }
 
@@ -2149,12 +2309,12 @@ mod tests {
         });
         let points = [Point::new(2, 4), Point::new(33, 53), Point::new(88, 58)];
         let mut scratch = FitScratch::default();
-        for precision in [Precision::Probe, Precision::Compact] {
+        for precision in [Precision::Lean, Precision::Compact] {
             for sigma_n in SIGMA_LATTICE {
                 let fixed =
                     fit_system(&targets, w, h, &points, sigma_n, precision, &mut scratch).unwrap();
-                let coeffs = if precision == Precision::Probe {
-                    REFINE_COEFFS
+                let coeffs = if precision == Precision::Lean {
+                    LONG_LINE_MAX_COEFFS
                 } else {
                     COMPACT_COEFFS
                 };
@@ -2189,16 +2349,7 @@ mod tests {
         for points in shapes {
             let (fit, system) = fit_best(&targets, w, h, &points, &[2, 4, 6], &mut scratch)
                 .expect("candidate fits");
-            fit_system(
-                &targets,
-                w,
-                h,
-                &shapes[0],
-                2,
-                Precision::Probe,
-                &mut scratch,
-            )
-            .unwrap();
+            fit_system(&targets, w, h, &shapes[0], 2, Precision::Lean, &mut scratch).unwrap();
             let params =
                 prepare_raster(&points, fit.sigma_n, Precision::Full, &mut scratch).unwrap();
             raster_rows::<0>(w, h, &params, &mut scratch).unwrap();
@@ -2238,7 +2389,7 @@ mod tests {
         });
         let points = [Point::new(0, 1), Point::new(52, 45), Point::new(108, 93)];
         for sigma_n in SIGMA_LATTICE {
-            for precision in [Precision::Full, Precision::Probe] {
+            for precision in [Precision::Full, Precision::Lean] {
                 let mut scratch = FitScratch::default();
                 let bounded =
                     fit_system(&targets, w, h, &points, sigma_n, precision, &mut scratch).unwrap();
@@ -2273,7 +2424,7 @@ mod tests {
             (0, 1, Precision::Full),
             (0, 6, Precision::Full),
             (0, 6, Precision::Compact),
-            (1, 4, Precision::Probe),
+            (1, 4, Precision::Lean),
             (1, 4, Precision::Full),
             (0, 1, Precision::Full),
         ] {

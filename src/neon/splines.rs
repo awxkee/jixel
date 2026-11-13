@@ -341,7 +341,18 @@ fn blob_weights<const FUSED: bool>(
     inv_sigma: f32,
     amp: f32,
 ) -> float32x4_t {
-    let dist = vsqrtq_f32(vaddq_f32(vmulq_f32(dx, dx), vdupq_n_f32(dy * dy)));
+    blob_weights_from_squares::<FUSED>(vmulq_f32(dx, dx), dy * dy, inv_sigma, amp)
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn blob_weights_from_squares<const FUSED: bool>(
+    dx_squared: float32x4_t,
+    dy_squared: f32,
+    inv_sigma: f32,
+    amp: f32,
+) -> float32x4_t {
+    let dist = vsqrtq_f32(vaddq_f32(dx_squared, vdupq_n_f32(dy_squared)));
     let half = vmulq_n_f32(dist, 0.5);
     let a = vmulq_n_f32(vaddq_f32(half, vdupq_n_f32(0.353_553_39)), inv_sigma);
     let b = vmulq_n_f32(vsubq_f32(half, vdupq_n_f32(0.353_553_39)), inv_sigma);
@@ -461,5 +472,70 @@ pub(crate) fn spline_render_row_neon(
         }
     } else {
         sample.scalar_row(dy, x0 + n, [tx, ty, tb], amp);
+    }
+}
+
+/// Draw one clipped sample into an 8x8 tile. Each four-column vector
+/// shares its x distances and clipping mask across the covered rows.
+#[cfg(feature = "neon")]
+#[target_feature(enable = "neon")]
+pub(crate) fn spline_render_tile_neon(
+    sample: &Sample,
+    tx: usize,
+    ty: usize,
+    (x0, x1, y0, y1): (usize, usize, usize, usize),
+    pixels: &mut [[f32; 64]; 3],
+    sign: f32,
+) {
+    debug_assert!(x0 >= tx && x1 <= tx + 8 && x0 < x1);
+    debug_assert!(y0 >= ty && y1 <= ty + 8 && y0 < y1);
+    let local_x0 = x0 - tx;
+    let local_x1 = x1 - tx;
+    let local_y = y0 - ty..y1 - ty;
+    let amp = sample.amp * sign;
+    let [rx, ry, rb] = pixels;
+    let rx = rx.as_chunks_mut::<8>().0;
+    let ry = ry.as_chunks_mut::<8>().0;
+    let rb = rb.as_chunks_mut::<8>().0;
+    // SAFETY: the offsets array has four lanes.
+    let offsets = unsafe { vld1q_s32([0, 1, 2, 3].as_ptr()) };
+    let split = (local_x0 + 4).min(local_x1);
+    for (start, end) in [(local_x0, split), (split, local_x1)] {
+        if start == end {
+            break;
+        }
+        let col = start.min(4);
+        let dx = dx_lanes((tx + col) as i32, sample.position.x);
+        let dx_squared = vmulq_f32(dx, dx);
+        let columns = vaddq_s32(vdupq_n_s32(col as i32), offsets);
+        let active = vandq_u32(
+            vcgeq_s32(columns, vdupq_n_s32(start as i32)),
+            vcltq_s32(columns, vdupq_n_s32(end as i32)),
+        );
+        let clipped = col < start || col + 4 > end;
+        for (((rx, ry), rb), y) in rx[local_y.clone()]
+            .iter_mut()
+            .zip(&mut ry[local_y.clone()])
+            .zip(&mut rb[local_y.clone()])
+            .zip(y0..)
+        {
+            let dy = y as f32 - sample.position.y;
+            let li = blob_weights_from_squares::<false>(dx_squared, dy * dy, sample.inv_sigma, amp);
+            for (row, color) in [rx, ry, rb].into_iter().zip(sample.color) {
+                let block = row[col..].first_chunk_mut::<4>().unwrap();
+                // SAFETY: each block holds four readable and writable pixels.
+                unsafe {
+                    let ptr = block.as_mut_ptr();
+                    let original = vld1q_f32(ptr);
+                    let drawn = vaddq_f32(original, vmulq_n_f32(li, color));
+                    let out = if clipped {
+                        vbslq_f32(active, drawn, original)
+                    } else {
+                        drawn
+                    };
+                    vst1q_f32(ptr, out);
+                }
+            }
+        }
     }
 }

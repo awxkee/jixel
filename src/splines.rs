@@ -68,7 +68,12 @@ pub(crate) use filter::{FilterBounds, vertical_row_scalar_tail};
 pub(crate) use fit::FitScratch;
 #[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", feature = "avx")))]
 pub(crate) use geometry::Segments;
-#[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", feature = "avx")))]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", feature = "avx"),
+    all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"),
+    all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+))]
 pub(crate) use render::Sample;
 
 use crate::bit_writer::BitWriter;
@@ -93,6 +98,7 @@ pub(crate) struct SplinesContext {
     ridge_row: detect::RidgeRowFn,
     segment_distance: geometry::SegmentDistanceFn,
     render_row: render::RenderRowFn,
+    render_tile: render::RenderTileFn,
     continuous_idct: transform::ContinuousIdctFn,
     dot_contrast: dots::DotContrastFn,
     /// Fitting and dot templates use a fused erf polynomial on SIMD targets.
@@ -122,6 +128,7 @@ impl SplinesContext {
             ridge_row: detect::ridge_row_scalar,
             segment_distance: geometry::segment_distance_scalar,
             render_row: render::Sample::scalar_row,
+            render_tile: render::Sample::scalar_tile,
             continuous_idct: transform::continuous_idct_scalar,
             dot_contrast: dots::dot_contrast_scalar,
             blob_weight_row: BlobWeightRow::fill_scalar,
@@ -147,6 +154,10 @@ impl SplinesContext {
             segment_distance: |p, blocks| unsafe { neon::spline_distance_neon(p, blocks) },
             render_row: |sample, dy, x, rows, amp| unsafe {
                 neon::spline_render_row_neon(sample, dy, x, rows, amp)
+            },
+            #[cfg(feature = "neon")]
+            render_tile: |sample, tx, ty, bounds, pixels, sign| unsafe {
+                neon::spline_render_tile_neon(sample, tx, ty, bounds, pixels, sign)
             },
             continuous_idct: |dct, t| unsafe { neon::continuous_idct_neon(dct, t) },
             dot_contrast: |src, stride, dst, side, bg, slope| unsafe {
@@ -184,12 +195,31 @@ impl SplinesContext {
             kernels
         };
 
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+        let kernels = if std::arch::is_x86_feature_detected!("sse2") {
+            Self {
+                // SAFETY: SSE2 support was checked above.
+                render_tile: |sample, tx, ty, bounds, pixels, sign| unsafe {
+                    crate::sse::spline_render_tile_sse2(sample, tx, ty, bounds, pixels, sign)
+                },
+                ..kernels
+            }
+        } else {
+            kernels
+        };
+
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         let avx2 = std::arch::is_x86_feature_detected!("avx2");
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         let kernels = if avx2 {
             Self {
                 // SAFETY: these kernels only require AVX2.
+                render_row: |sample, dy, x, rows, amp| unsafe {
+                    crate::avx::spline_render_row_avx2(sample, dy, x, rows, amp)
+                },
+                render_tile: |sample, tx, ty, bounds, pixels, sign| unsafe {
+                    crate::avx::spline_render_tile_avx2(sample, tx, ty, bounds, pixels, sign)
+                },
                 filter_vertical_row: |src, w, bounds, taps, dst| unsafe {
                     crate::avx::vertical_row_avx2(src, w, bounds, taps, dst)
                 },
@@ -210,9 +240,6 @@ impl SplinesContext {
                     avx::spline_ridge_row_avx2(s, derivatives, out)
                 },
                 segment_distance: |p, blocks| unsafe { avx::spline_distance_avx2(p, blocks) },
-                render_row: |sample, dy, x, rows, amp| unsafe {
-                    avx::spline_render_row_avx2(sample, dy, x, rows, amp)
-                },
                 continuous_idct: |dct, t| unsafe { avx::continuous_idct_avx2(dct, t) },
                 blob_weight_row: |row, x, out| unsafe { avx::blob_weight_row_avx2(row, x, out) },
                 add_scaled_fma_f32: |dst, src, scale| unsafe {
@@ -249,6 +276,7 @@ impl SplinesContext {
         #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
         let kernels = Self {
             continuous_idct: crate::wasm::continuous_idct_wasm,
+            render_tile: crate::wasm::spline_render_tile_wasm,
             ..kernels
         };
         kernels
@@ -281,7 +309,7 @@ const MAX_DISTANCE: f32 = 16.0;
 const PALETTE_LIKE_COLORS: usize = 32;
 
 /// A spline control point or sampled position.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Point<T> {
     pub(crate) x: T,
     pub(crate) y: T,
@@ -363,18 +391,37 @@ pub(crate) fn fast_erf(x: f32) -> f32 {
     if x <= 0.0 { -r } else { r }
 }
 
+pub(crate) const SPAN_STEPS: [f32; 16] = [
+    0.0, 0.0625, 0.125, 0.1875, 0.25, 0.3125, 0.375, 0.4375, 0.5, 0.5625, 0.625, 0.6875, 0.75,
+    0.8125, 0.875, 0.9375,
+];
+
 pub(crate) fn catmull_rom(control: &[Point<f32>]) -> Vec<Point<f32>> {
     catmull_rom_spans(control, 0..control.len() - 1)
 }
 
 /// Samples only these spans, retaining the surrounding controls for their tangents.
 fn catmull_rom_spans(control: &[Point<f32>], spans: std::ops::Range<usize>) -> Vec<Point<f32>> {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return catmull_rom_spans_with(
+            // SAFETY: AVX2 support was checked above.
+            |q, d, t, out| unsafe { crate::avx::sample_span_avx2(q, d, t, out) },
+            control,
+            spans,
+        );
+    }
     #[cfg(target_arch = "aarch64")]
     let sample_span = |q: &[Point<f32>; 4], d, t, out: &mut Vec<Point<f32>>| {
         // SAFETY: NEON is part of the supported AArch64 target baseline.
         unsafe { spline_curve_neon::sample_span_neon(q, d, t, out) }
     };
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    let sample_span = crate::wasm::sample_span_wasm;
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    )))]
     let sample_span = sample_span_scalar;
     catmull_rom_spans_with(sample_span, control, spans)
 }
@@ -398,7 +445,7 @@ fn catmull_rom_spans_with(
         control[n - 1].x + (control[n - 1].x - control[n - 2].x),
         control[n - 1].y + (control[n - 1].y - control[n - 2].y),
     ));
-    let mut out = Vec::with_capacity(spans.len() * 16 + 1);
+    let mut out = Vec::with_capacity(spans.len() * SPAN_STEPS.len() + 1);
     for q in p.array_windows::<4>().skip(spans.start).take(spans.len()) {
         out.push(q[1]);
         let mut d = [0f32; 3];
@@ -413,13 +460,19 @@ fn catmull_rom_spans_with(
     out
 }
 
-#[cfg(any(test, not(target_arch = "aarch64")))]
+#[cfg(any(
+    test,
+    not(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    ))
+))]
 fn sample_span_scalar(q: &[Point<f32>; 4], d: [f32; 3], t: [f32; 4], out: &mut Vec<Point<f32>>) {
     let delta: [Point<f32>; 3] =
         std::array::from_fn(|k| Point::new(q[k + 1].x - q[k].x, q[k + 1].y - q[k].y));
     let adjacent = [d[0] + d[1], d[1] + d[2]];
-    for i in 1..16 {
-        let tt = d[0] + (i as f32 / 16.0) * d[1];
+    for &step in &SPAN_STEPS[1..] {
+        let tt = d[0] + step * d[1];
         let f = (tt - t[1]) / d[1];
         let a: [Point<f32>; 3] = std::array::from_fn(|k| {
             let f = if k == 1 { f } else { (tt - t[k]) / d[k] };
@@ -1040,7 +1093,7 @@ mod tests {
             for end in start..control.len() {
                 assert_eq!(
                     catmull_rom_spans(&control, start..end),
-                    full[start * 16..=end * 16],
+                    full[start * SPAN_STEPS.len()..=end * SPAN_STEPS.len()],
                     "spans {start}..{end}",
                 );
             }

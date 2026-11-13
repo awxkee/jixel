@@ -105,8 +105,10 @@ impl Polyline {
         }
         let bounds = if blocks.len() >= 3 * BOUNDS_BLOCKS {
             blocks
-                .chunks_exact(BOUNDS_BLOCKS)
-                .map(SegmentBounds::new)
+                .as_chunks::<BOUNDS_BLOCKS>()
+                .0
+                .iter()
+                .map(|chunk| SegmentBounds::new(chunk))
                 .collect()
         } else {
             Vec::new()

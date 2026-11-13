@@ -282,6 +282,7 @@ pub(crate) mod f32 {
     }
 }
 
+#[cfg(feature = "sse")]
 #[target_feature(enable = "sse4.1")]
 pub(crate) fn add_scaled_sse41(out: &mut [f32], src: &[f32], factor: f32) {
     let (src_blocks, src) = src[..out.len()].as_chunks::<4>();

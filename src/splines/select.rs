@@ -50,7 +50,7 @@ use crate::encoding_context::EncodingContext;
 use crate::entropy::uint_encode;
 use crate::image::Image3F;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const START_POSITION_BITS: f32 = 20.0;
 /// Spline bits are charged `margin` times: the DCT8 proxy is optimistic where
@@ -294,6 +294,12 @@ struct TrialBlock {
     pixels: [[f32; 64]; 3],
 }
 
+#[derive(Clone, Copy)]
+enum BlockCosts<'a> {
+    Current(&'a [Option<(f32, f32)>]),
+    Original(&'a [OnceLock<(f32, f32)>]),
+}
+
 impl TrialBlock {
     fn load(current: &Image3F, cell: usize) -> Self {
         let (w, h) = (current.xsize(), current.ysize());
@@ -318,7 +324,7 @@ impl TrialBlock {
         model: &BlockModel,
         current: &Image3F,
         quant_field: &[f32],
-        cache: &[Option<(f32, f32)>],
+        cache: BlockCosts<'_>,
         forbidden: Option<&[bool]>,
         pixels_cost: &mut impl FnMut(&[[f32; 64]; 3], f32, usize, usize) -> (f32, f32),
         delta: &mut f32,
@@ -363,11 +369,15 @@ impl TrialBlock {
             }
         }
         let qac = quant_field[self.cell];
-        let (d0, r0) = cache
-            .get(self.cell)
-            .copied()
-            .flatten()
-            .unwrap_or_else(|| model.cost(current, bx, by, qac));
+        let base_cost = || model.cost(current, bx, by, qac);
+        let (d0, r0) = match cache {
+            BlockCosts::Current(cache) => cache
+                .get(self.cell)
+                .copied()
+                .flatten()
+                .unwrap_or_else(base_cost),
+            BlockCosts::Original(cache) => *cache[self.cell].get_or_init(base_cost),
+        };
         let (d1, r1) = pixels_cost(&self.pixels, qac, bx, by);
         *delta += (d1 - d0) + crate::ac_strategy::RD_LAMBDA * (r1 - r0);
         Some(())
@@ -510,7 +520,7 @@ impl Trial {
                 model,
                 current,
                 quant_field,
-                cache,
+                BlockCosts::Current(cache),
                 forbidden,
                 &mut pixels_cost,
                 &mut delta,
@@ -1095,11 +1105,10 @@ fn refine_selected_widths(
             continue;
         }
         let mut incumbent = RenderPlan::new(model.ctx, sp, QUANT_ADJUST, w, h).tiled();
+        let mut restored = None;
         for i in 1..=2 {
-            let mut restored = Trial::new(current, &[&incumbent]);
-            restored.draw(&incumbent, 1.0);
-            cache_blocks(model, current, quant_field, &mut cache, &incumbent);
             let mut best: Option<(f32, QuantizedSpline, TiledSpline, Trial)> = None;
+            let incumbent_bits = prices.spline_bits(sp);
             for step in [-1, 1] {
                 let mut proposal = sp.clone();
                 let Some(value) = proposal.dct[3][i].checked_add(step) else {
@@ -1121,14 +1130,20 @@ fn refine_selected_widths(
                 if plan.bounds().is_none() {
                     continue;
                 }
+                let restored = restored.get_or_insert_with(|| {
+                    cache_blocks(model, current, quant_field, &mut cache, &incumbent);
+                    let mut trial = Trial::new(current, &[&incumbent]);
+                    trial.draw(&incumbent, 1.0);
+                    trial
+                });
                 cache_blocks(model, current, quant_field, &mut cache, &plan);
-                let mut trial = Trial::replacement(current, &restored, &plan);
+                let mut trial = Trial::replacement(current, restored, &plan);
                 trial.draw(&plan, -1.0);
                 let Some(delta) = trial.delta(model, current, quant_field, &cache, forbidden)
                 else {
                     continue;
                 };
-                let bits = prices.spline_bits(&proposal) - prices.spline_bits(sp);
+                let bits = prices.spline_bits(&proposal) - incumbent_bits;
                 let delta = delta + crate::ac_strategy::RD_LAMBDA * margin(model.distance) * bits;
                 if delta < -1e-6 && best.as_ref().is_none_or(|(d, _, _, _)| delta < *d) {
                     best = Some((delta, proposal, plan, trial));
@@ -1141,6 +1156,7 @@ fn refine_selected_widths(
                 }
                 *sp = proposal;
                 incumbent = plan;
+                restored = None;
             }
         }
     }
@@ -1150,25 +1166,75 @@ fn refine_selected_widths(
 /// VarDCT saving covers only this share of their (prior-priced) bits.
 const PRETEST_BITS_SHARE: f32 = 0.25;
 
-/// Independent, state-free RD pre-test of one spline against the untouched
-/// image. Works on the blocks the spline covers only, so it can run in parallel.
-pub(super) fn pretest(
-    model: &BlockModel,
-    xyb: &Image3F,
-    quant_field: &[f32],
-    spline: &QuantizedSpline,
-) -> bool {
-    let plan = RenderPlan::new(model.ctx, spline, QUANT_ADJUST, xyb.xsize(), xyb.ysize()).tiled();
-    if plan.bounds().is_none() {
-        return false;
+/// RD pre-tests all read the untouched image, so fitting workers can share
+/// its block costs. A block is transformed only when a trial changes it.
+pub(crate) struct Pretest<'a> {
+    model: BlockModel<'a>,
+    xyb: &'a Image3F,
+    quant_field: &'a [f32],
+    prices: CostModel,
+    costs: Vec<OnceLock<(f32, f32)>>,
+}
+
+impl<'a> Pretest<'a> {
+    pub(crate) fn new(
+        ctx: &'a EncodingContext,
+        distance: f32,
+        xyb: &'a Image3F,
+        quant_field: &'a [f32],
+    ) -> Self {
+        let blocks = xyb.xsize().div_ceil(8) * xyb.ysize().div_ceil(8);
+        Self {
+            model: BlockModel::new(ctx, distance),
+            xyb,
+            quant_field,
+            prices: CostModel::prior(1.0),
+            costs: vec![OnceLock::new(); blocks],
+        }
     }
-    let mut trial = Trial::new(xyb, &[&plan]);
-    trial.draw(&plan, -1.0);
-    let Some(dj) = trial.delta(model, xyb, quant_field, &[], None) else {
-        return false;
-    };
-    let bits = CostModel::prior(1.0).spline_bits(spline);
-    dj + crate::ac_strategy::RD_LAMBDA * PRETEST_BITS_SHARE * margin(model.distance) * bits < 0.0
+
+    pub(crate) fn accepts(&self, spline: &QuantizedSpline) -> bool {
+        let xyb = self.xyb;
+        let plan = RenderPlan::new(
+            self.model.ctx,
+            spline,
+            QUANT_ADJUST,
+            xyb.xsize(),
+            xyb.ysize(),
+        )
+        .tiled();
+        if plan.bounds().is_none() {
+            return false;
+        }
+        let mut delta = 0.0;
+        let mut pixels_cost =
+            |pixels: &[[f32; 64]; 3], qac, _, _| self.model.pixels_cost(pixels, qac);
+        for tile in &plan.tiles {
+            let mut block = TrialBlock::load(xyb, tile.cell);
+            plan.draw_tile(tile, &mut block.pixels, -1.0);
+            if block
+                .add_delta(
+                    &self.model,
+                    xyb,
+                    self.quant_field,
+                    BlockCosts::Original(&self.costs),
+                    None,
+                    &mut pixels_cost,
+                    &mut delta,
+                )
+                .is_none()
+            {
+                return false;
+            }
+        }
+        let bits = self.prices.spline_bits(spline);
+        delta
+            + crate::ac_strategy::RD_LAMBDA
+                * PRETEST_BITS_SHARE
+                * margin(self.model.distance)
+                * bits
+            < 0.0
+    }
 }
 
 // Residual distortion and rate are nonnegative in the DCT8 proxy. Even
@@ -1565,7 +1631,7 @@ pub(super) fn rd_select(
                     &model,
                     current,
                     quant_field,
-                    cache,
+                    BlockCosts::Current(cache),
                     forbidden,
                     &mut cost,
                     &mut delta,

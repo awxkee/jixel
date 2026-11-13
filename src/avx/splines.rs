@@ -31,10 +31,66 @@
 //! the scalar order of operations.
 
 use crate::splines::{
-    ALONG_PENALTY, BlobWeightRow, FilterBounds, MAX_SUBPIXEL_OFFSET, Point, RidgeRow, Sample,
-    Segments, ridge_row_scalar, vertical_row_scalar_tail,
+    ALONG_PENALTY, BlobWeightRow, FilterBounds, MAX_SUBPIXEL_OFFSET, Point, RidgeRow, SPAN_STEPS,
+    Sample, Segments, ridge_row_scalar, vertical_row_scalar_tail,
 };
 use std::arch::x86_64::*;
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn sample_span_avx2(
+    controls: &[Point<f32>; 4],
+    distances: [f32; 3],
+    knots: [f32; 4],
+    out: &mut Vec<Point<f32>>,
+) {
+    let [d0, d1, d2] = distances;
+    let sums = [_mm256_set1_ps(d0 + d1), _mm256_set1_ps(d1 + d2)];
+    let distances = distances.map(|d| _mm256_set1_ps(d));
+    let knots = knots.map(|t| _mm256_set1_ps(t));
+    let q = controls.map(|p| [_mm256_set1_ps(p.x), _mm256_set1_ps(p.y)]);
+    let mut points = [Point::default(); SPAN_STEPS.len()];
+
+    let lerp = |a: [__m256; 2], b: [__m256; 2], f| {
+        [
+            _mm256_add_ps(a[0], _mm256_mul_ps(f, _mm256_sub_ps(b[0], a[0]))),
+            _mm256_add_ps(a[1], _mm256_mul_ps(f, _mm256_sub_ps(b[1], a[1]))),
+        ]
+    };
+    for (points, steps) in points
+        .as_chunks_mut::<8>()
+        .0
+        .iter_mut()
+        .zip(SPAN_STEPS.as_chunks::<8>().0)
+    {
+        // SAFETY: the step array holds eight elements.
+        let step = unsafe { _mm256_loadu_ps(steps.as_ptr()) };
+        let tt = _mm256_add_ps(distances[0], _mm256_mul_ps(step, distances[1]));
+        let dt0 = _mm256_sub_ps(tt, knots[0]);
+        let dt1 = _mm256_sub_ps(tt, knots[1]);
+        let dt2 = _mm256_sub_ps(tt, knots[2]);
+        // Keep the scalar division and interpolation rounding in each lane.
+        let f1 = _mm256_div_ps(dt1, distances[1]);
+        let a0 = lerp(q[0], q[1], _mm256_div_ps(dt0, distances[0]));
+        let a1 = lerp(q[1], q[2], f1);
+        let a2 = lerp(q[2], q[3], _mm256_div_ps(dt2, distances[2]));
+        let b0 = lerp(a0, a1, _mm256_div_ps(dt0, sums[0]));
+        let b1 = lerp(a1, a2, _mm256_div_ps(dt1, sums[1]));
+        let [x, y] = lerp(b0, b1, f1);
+        let mut xs = [0.0; 8];
+        let mut ys = [0.0; 8];
+        // SAFETY: each array holds one full vector.
+        unsafe {
+            _mm256_storeu_ps(xs.as_mut_ptr(), x);
+            _mm256_storeu_ps(ys.as_mut_ptr(), y);
+        }
+        for (point, (x, y)) in points.iter_mut().zip(xs.into_iter().zip(ys)) {
+            *point = Point { x, y };
+        }
+    }
+
+    // The caller writes the span's first control point directly.
+    out.extend_from_slice(&points[1..]);
+}
 
 #[inline]
 #[target_feature(enable = "avx2")]
@@ -149,13 +205,13 @@ pub(crate) fn dot_contrast_avx2(
 }
 
 #[inline]
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2")]
 fn abs(x: __m256) -> __m256 {
     _mm256_andnot_ps(_mm256_set1_ps(-0.0), x)
 }
 
 #[inline]
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2")]
 fn neg(x: __m256) -> __m256 {
     _mm256_xor_ps(x, _mm256_set1_ps(-0.0))
 }
@@ -402,24 +458,23 @@ pub(crate) fn spline_distance_avx2(p: Point<f32>, blocks: &[Segments]) -> f32 {
 }
 
 #[inline]
-#[target_feature(enable = "avx2,fma")]
-fn horner_step<const FUSED: bool>(a: __m256, b: __m256, c: f32) -> __m256 {
-    let c = _mm256_set1_ps(c);
-    if FUSED {
-        _mm256_fmadd_ps(a, b, c)
-    } else {
-        _mm256_add_ps(_mm256_mul_ps(a, b), c)
-    }
+#[target_feature(enable = "avx2")]
+fn horner_step(a: __m256, b: __m256, c: __m256) -> __m256 {
+    _mm256_add_ps(_mm256_mul_ps(a, b), c)
 }
 
 #[inline]
-#[target_feature(enable = "avx2,fma")]
-fn erf<const FUSED: bool>(x: __m256) -> __m256 {
+#[target_feature(enable = "avx2")]
+fn erf(x: __m256, step: impl Fn(__m256, __m256, __m256) -> __m256) -> __m256 {
     let a = abs(x);
-    let d1 = horner_step::<FUSED>(a, _mm256_set1_ps(7.77394369e-02), 2.05260015e-04);
-    let d2 = horner_step::<FUSED>(d1, a, 2.32120216e-01);
-    let d3 = horner_step::<FUSED>(d2, a, 2.77820801e-01);
-    let d4 = horner_step::<FUSED>(d3, a, 1.0);
+    let d1 = step(
+        a,
+        _mm256_set1_ps(7.77394369e-02),
+        _mm256_set1_ps(2.05260015e-04),
+    );
+    let d2 = step(d1, a, _mm256_set1_ps(2.32120216e-01));
+    let d3 = step(d2, a, _mm256_set1_ps(2.77820801e-01));
+    let d4 = step(d3, a, _mm256_set1_ps(1.0));
     let d5 = _mm256_mul_ps(d4, d4);
     let inv = _mm256_div_ps(_mm256_set1_ps(1.0), d5);
     let r = _mm256_sub_ps(_mm256_set1_ps(1.0), _mm256_mul_ps(inv, inv));
@@ -431,7 +486,7 @@ fn erf<const FUSED: bool>(x: __m256) -> __m256 {
 }
 
 #[inline]
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2")]
 fn dx_lanes(x: i32, center: f32) -> __m256 {
     // Add in integer lanes before conversion to preserve rounding above 2^24.
     debug_assert!(x <= i32::MAX - 7);
@@ -443,40 +498,49 @@ fn dx_lanes(x: i32, center: f32) -> __m256 {
 }
 
 #[inline]
-#[target_feature(enable = "avx2,fma")]
-fn blob_weights<const FUSED: bool>(dx: __m256, dy: f32, inv_sigma: f32, amp: f32) -> __m256 {
-    let dist = _mm256_sqrt_ps(_mm256_add_ps(
-        _mm256_mul_ps(dx, dx),
-        _mm256_set1_ps(dy * dy),
-    ));
+#[target_feature(enable = "avx2")]
+fn blob_weights(
+    dx_squared: __m256,
+    dy_squared: f32,
+    inv_sigma: __m256,
+    amp: __m256,
+    step: impl Fn(__m256, __m256, __m256) -> __m256 + Copy,
+) -> __m256 {
+    let dist = _mm256_sqrt_ps(_mm256_add_ps(dx_squared, _mm256_set1_ps(dy_squared)));
     let half = _mm256_mul_ps(dist, _mm256_set1_ps(0.5));
-    let a = _mm256_mul_ps(
-        _mm256_add_ps(half, _mm256_set1_ps(0.353_553_39)),
-        _mm256_set1_ps(inv_sigma),
-    );
-    let b = _mm256_mul_ps(
-        _mm256_sub_ps(half, _mm256_set1_ps(0.353_553_39)),
-        _mm256_set1_ps(inv_sigma),
-    );
-    let e = _mm256_sub_ps(erf::<FUSED>(a), erf::<FUSED>(b));
-    _mm256_mul_ps(_mm256_mul_ps(e, _mm256_set1_ps(amp)), e)
+    let a = _mm256_mul_ps(_mm256_add_ps(half, _mm256_set1_ps(0.353_553_39)), inv_sigma);
+    let b = _mm256_mul_ps(_mm256_sub_ps(half, _mm256_set1_ps(0.353_553_39)), inv_sigma);
+    let e = _mm256_sub_ps(erf(a, step), erf(b, step));
+    _mm256_mul_ps(_mm256_mul_ps(e, amp), e)
 }
 
 #[inline]
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2")]
 fn intensity(sample: &Sample, dy: f32, x: usize, amp: f32) -> __m256 {
     // Image dimensions are at most 30 bits, so padded coordinates fit in i32.
     debug_assert!(x <= i32::MAX as usize - 7);
     let dx = dx_lanes(x as i32, sample.position.x);
     // Match the scalar renderer's polynomial rounding.
-    blob_weights::<false>(dx, dy, sample.inv_sigma, amp)
+    blob_weights(
+        _mm256_mul_ps(dx, dx),
+        dy * dy,
+        _mm256_set1_ps(sample.inv_sigma),
+        _mm256_set1_ps(amp),
+        |a, b, c| horner_step(a, b, c),
+    )
 }
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
 fn row_weights(row: BlobWeightRow, x: i32) -> __m256 {
     let dx = _mm256_mul_ps(dx_lanes(x, row.center), _mm256_set1_ps(row.step));
-    blob_weights::<true>(dx, row.dy, row.inv_sigma, row.amp)
+    blob_weights(
+        _mm256_mul_ps(dx, dx),
+        row.dy * row.dy,
+        _mm256_set1_ps(row.inv_sigma),
+        _mm256_set1_ps(row.amp),
+        |a, b, c| _mm256_fmadd_ps(a, b, c),
+    )
 }
 
 #[target_feature(enable = "avx2,fma")]
@@ -499,7 +563,7 @@ pub(crate) fn blob_weight_row_avx2(row: BlobWeightRow, x0: i32, weights: &mut [f
     }
 }
 
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2")]
 pub(crate) fn spline_render_row_avx2(
     sample: &Sample,
     dy: f32,
@@ -539,5 +603,59 @@ pub(crate) fn spline_render_row_avx2(
         }
     } else {
         sample.scalar_row(dy, x0 + n, [tx, ty, tb], amp);
+    }
+}
+
+/// Draw a clipped sample with one vector per tile row. Horizontal distances
+/// and the mask are shared by every covered row.
+#[target_feature(enable = "avx2")]
+pub(crate) fn spline_render_tile_avx2(
+    sample: &Sample,
+    tx: usize,
+    ty: usize,
+    (x0, x1, y0, y1): (usize, usize, usize, usize),
+    pixels: &mut [[f32; 64]; 3],
+    sign: f32,
+) {
+    debug_assert!(x0 >= tx && x0 < x1 && x1 <= tx + 8);
+    debug_assert!(y0 >= ty && y0 < y1 && y1 <= ty + 8);
+    let first = (x0 - tx) as i32;
+    let end = (x1 - tx) as i32;
+    let columns = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let mask = _mm256_castsi256_ps(_mm256_and_si256(
+        _mm256_cmpgt_epi32(columns, _mm256_set1_epi32(first - 1)),
+        _mm256_cmpgt_epi32(_mm256_set1_epi32(end), columns),
+    ));
+    let clipped = first != 0 || end != 8;
+    let dx = dx_lanes(tx as i32, sample.position.x);
+    let dx_squared = _mm256_mul_ps(dx, dx);
+    let inv_sigma = _mm256_set1_ps(sample.inv_sigma);
+    let amp = _mm256_set1_ps(sample.amp * sign);
+    let colors = sample.color.map(|color| _mm256_set1_ps(color));
+    let [rx, ry, rb] = pixels;
+    let [rx, ry, rb] = [rx, ry, rb].map(|plane| plane.as_chunks_mut::<8>().0);
+    for y in y0..y1 {
+        let dy = y as f32 - sample.position.y;
+        let li = blob_weights(dx_squared, dy * dy, inv_sigma, amp, |a, b, c| {
+            horner_step(a, b, c)
+        });
+        let row = y - ty;
+        for (pixels, color) in [&mut rx[row], &mut ry[row], &mut rb[row]]
+            .into_iter()
+            .zip(colors)
+        {
+            // SAFETY: each block contains eight readable and writable pixels.
+            unsafe {
+                let ptr = pixels.as_mut_ptr();
+                let original = _mm256_loadu_ps(ptr);
+                let drawn = _mm256_add_ps(original, _mm256_mul_ps(color, li));
+                let out = if clipped {
+                    _mm256_blendv_ps(original, drawn, mask)
+                } else {
+                    drawn
+                };
+                _mm256_storeu_ps(ptr, out);
+            }
+        }
     }
 }

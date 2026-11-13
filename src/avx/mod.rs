@@ -118,8 +118,9 @@ pub(crate) use spline_fit::{
 };
 #[cfg(feature = "splines")]
 pub(crate) use splines::{
-    blob_weight_row_avx2, continuous_idct_avx2, dot_contrast_avx2, spline_distance_avx2,
-    spline_render_row_avx2, spline_ridge_row_avx2, vertical_row_avx2,
+    blob_weight_row_avx2, continuous_idct_avx2, dot_contrast_avx2, sample_span_avx2,
+    spline_distance_avx2, spline_render_row_avx2, spline_render_tile_avx2, spline_ridge_row_avx2,
+    vertical_row_avx2,
 };
 
 #[cfg(feature = "extraslow")]

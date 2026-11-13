@@ -63,20 +63,51 @@ impl Sample {
             *rb += self.color[2] * li;
         }
     }
+
+    pub(crate) fn scalar_tile(
+        &self,
+        tx: usize,
+        ty: usize,
+        (x0, x1, y0, y1): (usize, usize, usize, usize),
+        pixels: &mut [[f32; 64]; 3],
+        sign: f32,
+    ) {
+        let amp = self.amp * sign;
+        for y in y0..y1 {
+            let start = (y - ty) * 8 + x0 - tx;
+            let end = start + x1 - x0;
+            let [rx, ry, rb] = &mut *pixels;
+            self.scalar_row(
+                y as f32 - self.position.y,
+                x0,
+                [
+                    &mut rx[start..end],
+                    &mut ry[start..end],
+                    &mut rb[start..end],
+                ],
+                amp,
+            );
+        }
+    }
 }
 
 pub(crate) type RenderRowFn = fn(&Sample, f32, usize, [&mut [f32]; 3], f32);
+/// The tile callback receives an absolute, half-open sample window clipped
+/// to the tile at `(tx, ty)`. Pixels outside that window are left alone.
+pub(crate) type RenderTileFn =
+    fn(&Sample, usize, usize, (usize, usize, usize, usize), &mut [[f32; 64]; 3], f32);
 
-pub(super) struct RenderPlan {
+pub(crate) struct RenderPlan {
     samples: Vec<Sample>,
     dot: Option<DotPlacement>,
-    pub(super) bounds: Option<PixelBox>,
+    pub(crate) bounds: Option<PixelBox>,
     width: usize,
     row: RenderRowFn,
+    tile: RenderTileFn,
 }
 
 impl RenderPlan {
-    pub(super) fn new(
+    pub(crate) fn new(
         ctx: &EncodingContext,
         sp: &QuantizedSpline,
         adjust: i32,
@@ -119,6 +150,7 @@ impl RenderPlan {
             bounds: None,
             width: w,
             row: ctx.spline_kernels.render_row,
+            tile: ctx.spline_kernels.render_tile,
         };
         if arc <= 0.0 {
             return plan;
@@ -174,7 +206,7 @@ impl RenderPlan {
 
     /// Shared Gaussian proposal. The retained set is checked using the
     /// quantized pixels before it is accepted.
-    pub(super) fn dot(
+    pub(crate) fn dot(
         ctx: &EncodingContext,
         sp: &QuantizedSpline,
         template: Arc<super::dots::DotTemplate>,
@@ -184,7 +216,7 @@ impl RenderPlan {
         Self::dot_impl(ctx, sp, template, w, h, false)
     }
 
-    pub(super) fn quantized_dot(
+    pub(crate) fn quantized_dot(
         ctx: &EncodingContext,
         sp: &QuantizedSpline,
         template: Arc<super::dots::DotTemplate>,
@@ -215,6 +247,7 @@ impl RenderPlan {
             bounds: None,
             width: w,
             row: ctx.spline_kernels.render_row,
+            tile: ctx.spline_kernels.render_tile,
         };
         let left = x0.clamp(0, w as i32) as usize;
         let top = y0.clamp(0, h as i32) as usize;
@@ -233,7 +266,7 @@ impl RenderPlan {
         plan
     }
 
-    pub(super) fn draw(&self, image: &mut Image3F, sign: f32) {
+    pub(crate) fn draw(&self, image: &mut Image3F, sign: f32) {
         if let Some(dot) = &self.dot {
             let (x0, y0, x1, y1) = self.bounds.unwrap();
             for y in y0..=y1 {
@@ -262,7 +295,7 @@ impl RenderPlan {
         }
     }
 
-    pub(super) fn tiled(self) -> TiledSpline {
+    pub(crate) fn tiled(self) -> TiledSpline {
         let blocks_w = self.width.div_ceil(8);
         if self.dot.is_some() {
             let (x0, y0, x1, y1) = self.bounds.unwrap();
@@ -352,28 +385,28 @@ impl RenderPlan {
     }
 }
 
-pub(super) struct Tile {
-    pub(super) cell: usize,
+pub(crate) struct Tile {
+    pub(crate) cell: usize,
     start: usize,
     end: usize,
 }
 
-pub(super) struct TiledSpline {
+pub(crate) struct TiledSpline {
     plan: RenderPlan,
-    pub(super) tiles: Vec<Tile>,
+    pub(crate) tiles: Vec<Tile>,
     sample_indices: Vec<usize>,
 }
 
 impl TiledSpline {
-    pub(super) fn bounds(&self) -> Option<PixelBox> {
+    pub(crate) fn bounds(&self) -> Option<PixelBox> {
         self.plan.bounds
     }
 
-    pub(super) fn draw(&self, image: &mut Image3F, sign: f32) {
+    pub(crate) fn draw(&self, image: &mut Image3F, sign: f32) {
         self.plan.draw(image, sign);
     }
 
-    pub(super) fn draw_tile(&self, tile: &Tile, pixels: &mut [[f32; 64]; 3], sign: f32) {
+    pub(crate) fn draw_tile(&self, tile: &Tile, pixels: &mut [[f32; 64]; 3], sign: f32) {
         let blocks_w = self.plan.width.div_ceil(8);
         let (tx, ty) = (tile.cell % blocks_w * 8, tile.cell / blocks_w * 8);
         if let Some(dot) = &self.plan.dot {
@@ -400,22 +433,8 @@ impl TiledSpline {
             let sample = &self.plan.samples[index];
             let (sx0, sx1, sy0, sy1) = sample.window;
             let (x0, x1) = (sx0.max(tx), sx1.min(tx + 8));
-            for y in sy0.max(ty)..sy1.min(ty + 8) {
-                let start = (y - ty) * 8 + x0 - tx;
-                let end = start + x1 - x0;
-                let [rx, ry, rb] = &mut *pixels;
-                sample.row(
-                    self.plan.row,
-                    y,
-                    x0,
-                    [
-                        &mut rx[start..end],
-                        &mut ry[start..end],
-                        &mut rb[start..end],
-                    ],
-                    sign,
-                );
-            }
+            let (y0, y1) = (sy0.max(ty), sy1.min(ty + 8));
+            (self.plan.tile)(sample, tx, ty, (x0, x1, y0, y1), pixels, sign);
         }
     }
 }
@@ -577,6 +596,7 @@ mod tests {
                 bounds: None,
                 width,
                 row: ctx.spline_kernels.render_row,
+                tile: ctx.spline_kernels.render_tile,
             };
             for i in 0..count {
                 let (x, y) = if i % 2 == 0 {

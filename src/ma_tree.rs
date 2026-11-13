@@ -240,6 +240,8 @@ impl MaSamples {
         self
     }
 
+    // `i32::from` widens the i16 `Narrow` rows; it is a no-op on `Wide` rows.
+    #[allow(clippy::useless_conversion)]
     fn partition(&mut self, start: usize, end: usize, prop: u8, threshold: i32) -> usize {
         with_ma_properties!(&mut self.props, |rows| {
             let tokens = &mut self.tok[start..end];
@@ -258,6 +260,8 @@ impl MaSamples {
     }
 
     /// Compute the partition order without copying or moving any sample rows.
+    // `i32::from` widens the i16 `Narrow` rows; it is a no-op on `Wide` rows.
+    #[allow(clippy::useless_conversion)]
     fn partition_indices(
         &self,
         start: usize,

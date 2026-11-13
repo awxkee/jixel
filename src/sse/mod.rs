@@ -90,7 +90,7 @@ pub(crate) use xyb::xyb_lattice_sse41;
 pub(crate) use xyb::{to_linear_rows_sse41, to_xyb_sse41_band};
 
 #[cfg(feature = "splines")]
-pub(crate) use splines::{continuous_idct_sse2, continuous_idct_sse41};
+pub(crate) use splines::{continuous_idct_sse2, continuous_idct_sse41, spline_render_tile_sse2};
 
 #[cfg(feature = "extraslow")]
 pub(crate) use coef_polish::polish_count_nonzero_sse41;

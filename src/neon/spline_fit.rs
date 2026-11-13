@@ -72,6 +72,19 @@ pub(super) fn accumulate_fit_neon(
     row: &[f64],
     target: [f32; 3],
 ) {
+    match row.len() {
+        3 => accumulate_fit_fixed_neon(ata, atb, btb, row.first_chunk::<3>().unwrap(), target),
+        6 => accumulate_fit_fixed_neon(ata, atb, btb, row.first_chunk::<6>().unwrap(), target),
+        _ => {
+            let target = accumulate_energy(btb, target);
+            accumulate_fit_rows(ata, atb, row, target);
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn accumulate_energy(btb: &mut [f64; 3], target: [f32; 3]) -> [f64; 3] {
     let target = target.map(f64::from);
     // A finite f32 square is exact in f64, so fusion preserves energy rounding.
     // SAFETY: both arrays have at least two lanes.
@@ -81,21 +94,19 @@ pub(super) fn accumulate_fit_neon(
         vst1q_f64(btb.as_mut_ptr(), vfmaq_f64(energy, values, values));
     }
     btb[2] = target[2].mul_add(target[2], btb[2]);
-    match row.len() {
-        3 => accumulate_fit_fixed(ata, atb, row.first_chunk::<3>().unwrap(), target),
-        6 => accumulate_fit_fixed(ata, atb, row.first_chunk::<6>().unwrap(), target),
-        _ => accumulate_fit_rows(ata, atb, row, target),
-    }
+    target
 }
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn accumulate_fit_fixed<const N: usize>(
+pub(super) fn accumulate_fit_fixed_neon<const N: usize>(
     ata: &mut FitMatrix,
     atb: &mut FitTargets,
+    btb: &mut [f64; 3],
     row: &[f64; N],
-    target: [f64; 3],
+    target: [f32; 3],
 ) {
+    let target = accumulate_energy(btb, target);
     for i in 0..N {
         add_scaled_neon(&mut ata[i][..=i], &row[..=i], row[i]);
     }

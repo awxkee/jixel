@@ -85,7 +85,7 @@ pub(crate) use xyb::{to_linear_rows_wasm, to_xyb_wasm_band};
 pub(crate) use ytob::{fill_ytob_residuals_wasm, fill_ytob_row_wasm};
 
 #[cfg(feature = "splines")]
-pub(crate) use splines::continuous_idct_wasm;
+pub(crate) use splines::{continuous_idct_wasm, sample_span_wasm, spline_render_tile_wasm};
 
 #[cfg(feature = "extraslow")]
 pub(crate) use coef_polish::polish_count_nonzero_wasm;

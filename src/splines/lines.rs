@@ -38,6 +38,7 @@ use super::detect::{Chain, MIN_CHAIN_LEN};
 use super::{Point, SplinesContext, sample_curve};
 use crate::util::fast_hypot;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 const MIN_FRAGMENT: usize = 20;
 /// RMS distance of a fragment's points from its own line.
@@ -500,9 +501,41 @@ const ON_LINE_CELL: f32 = 4.0;
 const MEMBER_SHARE: f32 = 0.6;
 const MEMBER_SAMPLES: usize = 24;
 
+/// Multiplicative hash of a packed cell coordinate. `near` probes nine cells
+/// per query, so SipHash dominated it; membership answers do not depend on
+/// bucket order.
+#[derive(Default)]
+struct CellHasher(u64);
+
+impl Hasher for CellHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("cells hash as one u64");
+    }
+
+    fn write_u64(&mut self, key: u64) {
+        // Fold the high half into the bits hashbrown reads for its control byte.
+        let h = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 29);
+    }
+}
+
+type CellMap = HashMap<u64, Vec<usize>, BuildHasherDefault<CellHasher>>;
+
+#[inline]
+fn cell_key(cx: i32, cy: i32) -> u64 {
+    ((cy as u32 as u64) << 32) | cx as u32 as u64
+}
+
 /// Points with unit tangents, bucketed for "lies on this line" queries.
 pub(super) struct LineIndex {
-    cells: HashMap<(i32, i32), Vec<usize>>,
+    cells: CellMap,
+    /// Cell range holding points, for rejecting far queries without probes.
+    lo: (i32, i32),
+    hi: (i32, i32),
     points: Vec<Point<f32>>,
     tangents: Vec<Point<f32>>,
 }
@@ -529,15 +562,18 @@ pub(super) fn curve_samples(points: &[Point<i32>]) -> (Vec<Point<f32>>, Vec<Poin
 
 impl LineIndex {
     pub(super) fn new(points: &[Point<f32>], tangents: &[Point<f32>]) -> Self {
-        let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        let mut cells = CellMap::default();
+        let (mut lo, mut hi) = ((i32::MAX, i32::MAX), (i32::MIN, i32::MIN));
         for (i, p) in points.iter().enumerate() {
-            cells
-                .entry(((p.x / ON_LINE_CELL) as i32, (p.y / ON_LINE_CELL) as i32))
-                .or_default()
-                .push(i);
+            let (cx, cy) = ((p.x / ON_LINE_CELL) as i32, (p.y / ON_LINE_CELL) as i32);
+            lo = (lo.0.min(cx), lo.1.min(cy));
+            hi = (hi.0.max(cx), hi.1.max(cy));
+            cells.entry(cell_key(cx, cy)).or_default().push(i);
         }
         Self {
             cells,
+            lo,
+            hi,
             points: points.to_vec(),
             tangents: tangents.to_vec(),
         }
@@ -553,9 +589,12 @@ impl LineIndex {
 
     pub(super) fn near(&self, q: Point<f32>, t: Point<f32>) -> bool {
         let (cx, cy) = ((q.x / ON_LINE_CELL) as i32, (q.y / ON_LINE_CELL) as i32);
+        if cx < self.lo.0 - 1 || cx > self.hi.0 + 1 || cy < self.lo.1 - 1 || cy > self.hi.1 + 1 {
+            return false;
+        }
         for dy in -1..=1 {
             for dx in -1..=1 {
-                let Some(list) = self.cells.get(&(cx + dx, cy + dy)) else {
+                let Some(list) = self.cells.get(&cell_key(cx + dx, cy + dy)) else {
                     continue;
                 };
                 for &i in list {
