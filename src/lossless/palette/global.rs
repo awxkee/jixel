@@ -736,6 +736,9 @@ pub(in crate::lossless) fn build_global_palette(
     let mut best_order = 0usize;
     let mut best_cost = f32::INFINITY;
     for (k, order) in orders.iter().enumerate() {
+        if orders[..k].contains(order) {
+            continue;
+        }
         let cost = estimate_index_plane_cost(&indices, xsize, ysize, order, pool, scratch);
         if cost < best_cost {
             best_cost = cost;

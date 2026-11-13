@@ -59,8 +59,8 @@ pub(crate) use cfl::{
     cfl_regression_wasm,
 };
 pub(crate) use dc_ops::{
-    add_scaled_wasm, adjust_b_dc_wasm, compensate_b_dc_wasm, dc_distortion_row_wasm,
-    dc_error_row_wasm, reconstruct_dc_wasm,
+    adjust_b_dc_wasm, compensate_b_dc_wasm, dc_distortion_row_wasm, dc_error_row_wasm,
+    reconstruct_dc_wasm,
 };
 pub(crate) use dct::*;
 pub(crate) use divide::rounded_quotients_wasm;
@@ -85,7 +85,7 @@ pub(crate) use xyb::{to_linear_rows_wasm, to_xyb_wasm_band};
 pub(crate) use ytob::{fill_ytob_residuals_wasm, fill_ytob_row_wasm};
 
 #[cfg(feature = "splines")]
-pub(crate) use splines::continuous_idct_wasm;
+pub(crate) use splines::{continuous_idct_wasm, sample_span_wasm, spline_render_tile_wasm};
 
 #[cfg(feature = "extraslow")]
-pub(crate) use coef_polish::{polish_add_scaled_wasm, polish_count_nonzero_wasm};
+pub(crate) use coef_polish::polish_count_nonzero_wasm;

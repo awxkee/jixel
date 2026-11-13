@@ -32,6 +32,7 @@
 use super::alpha::ExtraSqueeze;
 use super::closed_loop::{Rounding, closed_h_squeeze, closed_v_squeeze};
 use crate::encode_image::AlphaPlane;
+use crate::util::fast_hypot;
 
 /// A soft-edged disc: the anti-aliased, feathered alpha lossy coding is for.
 fn soft_disc(w: usize, h: usize) -> AlphaPlane {
@@ -39,7 +40,7 @@ fn soft_disc(w: usize, h: usize) -> AlphaPlane {
         (0..w * h)
             .map(|i| {
                 let (x, y) = ((i % w) as f32, (i / w) as f32);
-                let r = ((x - w as f32 / 2.0).hypot(y - h as f32 / 2.0)) / (w.min(h) as f32);
+                let r = fast_hypot(x - w as f32 / 2.0, y - h as f32 / 2.0) / w.min(h) as f32;
                 (255.0 * ((0.45 - r) / 0.2).clamp(0.0, 1.0)).round() as u8
             })
             .collect(),

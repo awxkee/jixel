@@ -42,7 +42,9 @@ use crate::coder_scratch::CoderScratch;
 use crate::encoding_context::EncodingContext;
 use crate::entropy::pack_signed;
 use crate::image::Image3F;
+use crate::util::fast_hypot;
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 const MAX_CONTOURS: usize = 256;
 const MAX_PAIRS: usize = 64;
@@ -60,6 +62,7 @@ const DP_LAMBDA: f64 = 16.0;
 const DP_MAX_DEVIATION: f32 = 1.0;
 const MAX_PROFILE_SECTIONS: usize = 32;
 const PROFILE_REACH: i32 = 8;
+const PROFILE_LEN: usize = (2 * PROFILE_REACH + 1) as usize;
 const PROFILE_COHERENCE: f64 = 0.65;
 const FIT_EXPLAINED: f64 = 0.05;
 const UNIT: i32 = 1024;
@@ -68,6 +71,21 @@ static WEIGHTS: [f64; 3] = [14.0, 1.0, 0.6];
 static WIDTHS: [i32; 4] = [2, 3, 4, 5];
 static OFFSETS: [f32; 3] = [0.5, 1.0, 1.5];
 static AMPLITUDES: [f32; 3] = [0.5, 0.75, 1.0];
+
+// Every contour is scored against the same width and offset combinations.
+static PROFILE_TEMPLATES: LazyLock<[[[f64; PROFILE_LEN]; OFFSETS.len()]; WIDTHS.len()]> =
+    LazyLock::new(|| {
+        WIDTHS.map(|width| {
+            let sigma = width as f32 * CHANNEL_WEIGHT[3] / adjusted_quant(QUANT_ADJUST);
+            OFFSETS.map(|offset| {
+                std::array::from_fn(|i| {
+                    let t = (i as i32 - PROFILE_REACH) as f32 * 0.5;
+                    ((-0.5 * ((t - offset) / sigma).powi(2)).exp()
+                        - (-0.5 * ((t + offset) / sigma).powi(2)).exp()) as f64
+                })
+            })
+        })
+    });
 
 #[derive(Clone, Debug)]
 pub(super) struct EdgePair {
@@ -141,7 +159,7 @@ fn smooth(contour: &Contour) -> (Vec<Point<f32>>, Vec<Point<f32>>) {
         } else {
             Point::new(p.x / weight, p.y / weight)
         });
-        let norm = normal.x.hypot(normal.y).max(1e-8);
+        let norm = fast_hypot(normal.x, normal.y).max(1e-8);
         normals.push(Point::new(normal.x / norm, normal.y / norm));
     }
     (points, normals)
@@ -181,16 +199,17 @@ fn delta_bits(value: i32) -> f64 {
 const DELTA_TABLE_REACH: i32 = 1024;
 
 /// `delta_bits` tabulated for the double deltas the DP prices in bulk.
-fn table_delta_bits(value: i32) -> f64 {
-    static TABLE: std::sync::LazyLock<Vec<f64>> = std::sync::LazyLock::new(|| {
-        (-DELTA_TABLE_REACH..=DELTA_TABLE_REACH)
-            .map(delta_bits)
-            .collect()
-    });
-    match TABLE.get((value + DELTA_TABLE_REACH) as usize) {
-        Some(&bits) if value.abs() <= DELTA_TABLE_REACH => bits,
-        _ => delta_bits(value),
-    }
+static DELTA_TABLE: LazyLock<Vec<f64>> = LazyLock::new(|| {
+    (-DELTA_TABLE_REACH..=DELTA_TABLE_REACH)
+        .map(delta_bits)
+        .collect()
+});
+
+fn table_delta_bits(table: &[f64], value: i32) -> f64 {
+    table
+        .get(value.wrapping_add(DELTA_TABLE_REACH) as usize)
+        .copied()
+        .unwrap_or_else(|| delta_bits(value))
 }
 
 struct DpState {
@@ -220,7 +239,7 @@ fn dp_controls(
             curve[(i + reach).min(n - 1)],
         );
         let (dx, dy) = (b.x - a.x, b.y - a.y);
-        let length = dx.hypot(dy).max(1e-6);
+        let length = fast_hypot(dx, dy).max(1e-6);
         Point::new(dx / length, dy / length)
     };
     let normal_error = |i: usize, p: Point<f32>| {
@@ -237,13 +256,10 @@ fn dp_controls(
         first.push(nodes.len());
         let p = curve[i];
         let (fx, fy) = (p.x.floor() as i32, p.y.floor() as i32);
-        let mut options: Vec<(f32, Point<i32>)> = [(0, 0), (1, 0), (0, 1), (1, 1)]
-            .into_iter()
-            .map(|(dx, dy)| {
-                let q = Point::new(fx + dx, fy + dy);
-                ((q.x as f32 - p.x).powi(2) + (q.y as f32 - p.y).powi(2), q)
-            })
-            .collect();
+        let mut options = [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(dx, dy)| {
+            let q = Point::new(fx + dx, fy + dy);
+            ((q.x as f32 - p.x).powi(2) + (q.y as f32 - p.y).powi(2), q)
+        });
         options.sort_by(|a, b| {
             a.0.total_cmp(&b.0)
                 .then_with(|| (a.1.y, a.1.x).cmp(&(b.1.y, b.1.x)))
@@ -255,55 +271,33 @@ fn dp_controls(
     }
     first.push(nodes.len());
     let limit = max_deviation * max_deviation;
-    // Successors of each node with the summed squared deviation of the curve
-    // samples the chord replaces (the far endpoint's own rounding included).
-    let successors: Vec<Vec<(u32, f64)>> = (0..nodes.len())
-        .map(|q| {
-            let (cq, a) = nodes[q];
-            let mut out = Vec::new();
-            for cr in cq + 1..samples.len().min(cq + 1 + DP_WINDOW) {
-                let mut any = false;
-                for r in first[cr]..first[cr + 1] {
-                    let b = nodes[r].1;
-                    let (i0, i1) = (samples[cq], samples[cr]);
-                    let (ax, ay, bx, by) = (a.x as f32, a.y as f32, b.x as f32, b.y as f32);
-                    let length = (bx - ax).hypot(by - ay);
-                    let reach = ((i1 - i0) / 2).max(1);
-                    let (ta, tb) = (secant(i0, reach), secant(i1, reach));
-                    let mut error = 0.0f64;
-                    let mut feasible = true;
-                    for i in i0 + 1..=i1 {
-                        let u = (i - i0) as f32 / (i1 - i0) as f32;
-                        let (u2, u3) = (u * u, u * u * u);
-                        let (h00, h10, h01, h11) = (
-                            2.0 * u3 - 3.0 * u2 + 1.0,
-                            u3 - 2.0 * u2 + u,
-                            -2.0 * u3 + 3.0 * u2,
-                            u3 - u2,
-                        );
-                        let p = Point::new(
-                            h00 * ax + h10 * length * ta.x + h01 * bx + h11 * length * tb.x,
-                            h00 * ay + h10 * length * ta.y + h01 * by + h11 * length * tb.y,
-                        );
-                        let d = normal_error(i, p).powi(2);
-                        if d > limit {
-                            feasible = false;
-                            break;
-                        }
-                        error += d as f64;
-                    }
-                    if feasible {
-                        any = true;
-                        out.push((r as u32, error));
-                    }
-                }
-                if !any {
-                    break;
-                }
+    // Include the far endpoint's own rounding in the span error.
+    let span_error = |i0: usize, i1: usize, a: Point<i32>, b: Point<i32>, tangents| {
+        let (ta, tb): (Point<f32>, Point<f32>) = tangents;
+        let (ax, ay, bx, by) = (a.x as f32, a.y as f32, b.x as f32, b.y as f32);
+        let length = fast_hypot(bx - ax, by - ay);
+        let mut error = 0.0f64;
+        for i in i0 + 1..=i1 {
+            let u = (i - i0) as f32 / (i1 - i0) as f32;
+            let (u2, u3) = (u * u, u * u * u);
+            let (h00, h10, h01, h11) = (
+                2.0 * u3 - 3.0 * u2 + 1.0,
+                u3 - 2.0 * u2 + u,
+                -2.0 * u3 + 3.0 * u2,
+                u3 - u2,
+            );
+            let p = Point::new(
+                h00 * ax + h10 * length * ta.x + h01 * bx + h11 * length * tb.x,
+                h00 * ay + h10 * length * ta.y + h01 * by + h11 * length * tb.y,
+            );
+            let d = normal_error(i, p).powi(2);
+            if d > limit {
+                return None;
             }
-            out
-        })
-        .collect();
+            error += d as f64;
+        }
+        Some(error)
+    };
     let mut states: Vec<Vec<DpState>> = (0..nodes.len()).map(|_| Vec::new()).collect();
     for q in first[0]..first[1] {
         let start = nodes[q].1;
@@ -314,41 +308,56 @@ fn dp_controls(
             parent: NONE,
         });
     }
+    let prices: &[f64] = &DELTA_TABLE;
+    let mut incoming = Vec::new();
     for q in 0..nodes.len() {
         if states[q].is_empty() {
             continue;
         }
-        let current = std::mem::take(&mut states[q]);
-        let qp = nodes[q].1;
-        let incoming: Vec<(i32, i32, f64, u32)> = current
-            .iter()
-            .map(|state| {
-                let (pdx, pdy) = if state.previous == NONE {
-                    (0, 0)
-                } else {
-                    let pp = nodes[state.previous as usize].1;
-                    (qp.x - pp.x, qp.y - pp.y)
+        let (cq, qp) = nodes[q];
+        incoming.clear();
+        incoming.extend(states[q].iter().map(|state| {
+            let (pdx, pdy) = if state.previous == NONE {
+                (0, 0)
+            } else {
+                let pp = nodes[state.previous as usize].1;
+                (qp.x - pp.x, qp.y - pp.y)
+            };
+            (pdx, pdy, state.cost, state.previous)
+        }));
+        // Generate successors only for reachable nodes and consume each span
+        // as soon as its error is known.
+        for cr in cq + 1..samples.len().min(cq + 1 + DP_WINDOW) {
+            let (i0, i1) = (samples[cq], samples[cr]);
+            let reach = ((i1 - i0) / 2).max(1);
+            let tangents = (secant(i0, reach), secant(i1, reach));
+            let mut any = false;
+            for r in first[cr]..first[cr + 1] {
+                let rp = nodes[r].1;
+                let Some(error) = span_error(i0, i1, qp, rp, tangents) else {
+                    continue;
                 };
-                (pdx, pdy, state.cost, state.previous)
-            })
-            .collect();
-        for &(r, error) in &successors[q] {
-            let rp = nodes[r as usize].1;
-            let (dx, dy) = (rp.x - qp.x, rp.y - qp.y);
-            let mut best = (f64::INFINITY, NONE);
-            for &(pdx, pdy, cost, previous) in &incoming {
-                let cost = cost + table_delta_bits(dx - pdx) + table_delta_bits(dy - pdy);
-                if cost < best.0 {
-                    best = (cost, previous);
+                any = true;
+                let (dx, dy) = (rp.x - qp.x, rp.y - qp.y);
+                let mut best = (f64::INFINITY, NONE);
+                for &(pdx, pdy, cost, previous) in &incoming {
+                    let cost = cost
+                        + table_delta_bits(prices, dx - pdx)
+                        + table_delta_bits(prices, dy - pdy);
+                    if cost < best.0 {
+                        best = (cost, previous);
+                    }
                 }
+                states[r].push(DpState {
+                    previous: q as u32,
+                    cost: best.0 + lambda * error,
+                    parent: best.1,
+                });
             }
-            states[r as usize].push(DpState {
-                previous: q as u32,
-                cost: best.0 + lambda * error,
-                parent: best.1,
-            });
+            if !any {
+                break;
+            }
         }
-        states[q] = current;
     }
     let last = samples.len() - 1;
     let (mut node, mut state) = (first[last]..first[last + 1])
@@ -408,12 +417,9 @@ fn build_points(
     Some(sides)
 }
 
-fn profile_gain(profiles: &[[f32; 3]], sigma: f32, offset: f32) -> f64 {
+fn profile_gain(profiles: &[[f32; 3]], template: &[f64; PROFILE_LEN]) -> f64 {
     let (mut dot, mut norm) = ([0.0; 3], 0.0f64);
-    for (i, target) in profiles.iter().enumerate() {
-        let t = (i % (2 * PROFILE_REACH + 1) as usize) as f32 * 0.5 - PROFILE_REACH as f32 * 0.5;
-        let value = ((-0.5 * ((t - offset) / sigma).powi(2)).exp()
-            - (-0.5 * ((t + offset) / sigma).powi(2)).exp()) as f64;
+    for (target, &value) in profiles.iter().zip(template.iter().cycle()) {
         norm += value * value;
         for c in 0..3 {
             dot[c] += value * target[c] as f64;
@@ -461,10 +467,9 @@ fn shortlist(source: &Image3F, target: &Target, contour: &Contour) -> Option<Geo
     }
     let (w, h) = (source.xsize(), source.ysize());
     let mut best: Option<Geometry> = None;
-    for width in WIDTHS {
-        let sigma = width as f32 * CHANNEL_WEIGHT[3] / adjusted_quant(QUANT_ADJUST);
-        for offset in OFFSETS {
-            let gain = profile_gain(&profiles, sigma, offset);
+    for (width, templates) in WIDTHS.into_iter().zip(PROFILE_TEMPLATES.iter()) {
+        for (offset, template) in OFFSETS.into_iter().zip(templates) {
+            let gain = profile_gain(&profiles, template);
             if gain / energy < PROFILE_COHERENCE
                 || best.as_ref().is_some_and(|old| old.score >= gain)
                 || [1.0, -1.0]
@@ -780,25 +785,28 @@ mod tests {
 
     #[test]
     fn incoherent_normal_residuals_have_no_shared_profile_gain() {
+        let sigma = WIDTHS[2] as f32 * CHANNEL_WEIGHT[3] / adjusted_quant(QUANT_ADJUST);
+        let offset = OFFSETS[1];
+        let template = &PROFILE_TEMPLATES[2][1];
         let section: Vec<_> = (-PROFILE_REACH..=PROFILE_REACH)
             .map(|j| {
                 let t = j as f32 * 0.5;
                 [
                     0.0,
-                    (-0.5 * ((t - 1.0) / 0.8).powi(2)).exp()
-                        - (-0.5 * ((t + 1.0) / 0.8).powi(2)).exp(),
+                    (-0.5 * ((t - offset) / sigma).powi(2)).exp()
+                        - (-0.5 * ((t + offset) / sigma).powi(2)).exp(),
                     0.0,
                 ]
             })
             .collect();
-        let coherent = profile_gain(&section, 0.8, 1.0) / profile_energy(&section);
+        let coherent = profile_gain(&section, template) / profile_energy(&section);
         assert!(coherent > 0.99);
         let incoherent: Vec<_> = section
             .iter()
             .copied()
             .chain(section.iter().map(|v| v.map(|x| -x)))
             .collect();
-        assert!(profile_gain(&incoherent, 0.8, 1.0) / profile_energy(&incoherent) < 1e-12);
+        assert!(profile_gain(&incoherent, template) / profile_energy(&incoherent) < 1e-12);
     }
 
     #[test]
@@ -866,7 +874,7 @@ mod dp_tests {
                     curve[(i + 1).min(curve.len() - 1)],
                 );
                 let (dx, dy) = (b.x - a.x, b.y - a.y);
-                let length = dx.hypot(dy);
+                let length = fast_hypot(dx, dy);
                 Point::new(-dy / length, dx / length)
             })
             .collect()
@@ -888,7 +896,7 @@ mod dp_tests {
                         let (dx, dy) = (w[1].x - w[0].x, w[1].y - w[0].y);
                         let l2 = (dx * dx + dy * dy).max(1e-9);
                         let t = (((p.x - w[0].x) * dx + (p.y - w[0].y) * dy) / l2).clamp(0.0, 1.0);
-                        (p.x - w[0].x - t * dx).hypot(p.y - w[0].y - t * dy)
+                        fast_hypot(p.x - w[0].x - t * dx, p.y - w[0].y - t * dy)
                     })
                     .fold(f32::INFINITY, f32::min)
             })

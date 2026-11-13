@@ -43,8 +43,15 @@ pub(crate) struct LossyPatches {
 #[derive(Clone, Copy)]
 pub(crate) enum VarDctFrameKind<'a> {
     Regular,
-    ReferenceOnly { width: usize, height: usize },
-    Patched(&'a [PatchReference], Option<&'a EpfPatchAtlases>),
+    ReferenceOnly {
+        width: usize,
+        height: usize,
+    },
+    Patched(
+        &'a [PatchReference],
+        Option<&'a EpfPatchAtlases>,
+        Option<&'a crate::bit_writer::BitWriter>,
+    ),
 }
 
 pub(crate) struct GlyphAtlasLuma {
@@ -2050,7 +2057,7 @@ struct Occurrence {
 }
 
 /// Glyph groups that share a blend-above template (see
-/// [`TEMPLATE_MIN_BASE_WEIGHT`]): same mask and foreground colour, coverage
+/// [`TEMPLATE_MIN_BASE_WEIGHT`]): same mask and foreground color, coverage
 /// that agrees, two or more backgrounds.
 struct TemplatePlan<'a> {
     shapes: &'a [GlyphShape],
@@ -2194,7 +2201,7 @@ fn plan_glyph_templates<'a>(
         }
         true
     };
-    // Shapes with one support and colour may still differ inside (coverage):
+    // Shapes with one support and color may still differ inside (coverage):
     // split each bucket into clusters whose coverage agrees with their seed.
     let agrees = |a: &[f32], b: &[f32]| -> bool {
         let (mut diff, mut count) = (0.0f32, 0usize);
@@ -2277,7 +2284,7 @@ fn plan_glyph_templates<'a>(
     })
 }
 
-/// The template atlas (colour tiles, coverage in alpha), placements and the
+/// The template atlas (color tiles, coverage in alpha), placements and the
 /// base with the template glyphs un-premultiplied out of it.
 fn build_glyph_templates(plan: TemplatePlan<'_>, xyb: &Image3F) -> Option<GlyphTemplates> {
     let lattice = TEMPLATE_LATTICE;

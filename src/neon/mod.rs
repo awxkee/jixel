@@ -48,8 +48,6 @@ mod modular;
 mod noise;
 mod quant;
 mod quantize_xyb;
-#[cfg(feature = "splines")]
-mod splines;
 mod xyb;
 mod yellow_opsin;
 mod ytob;
@@ -63,8 +61,8 @@ pub(crate) use cfl::{
 };
 pub(crate) use color::color_matrix_shaper_neon;
 pub(crate) use dc_ops::{
-    add_scaled_neon, adjust_b_dc_neon, compensate_b_dc_neon, dc_distortion_row_neon,
-    dc_error_row_neon, reconstruct_dc_neon,
+    adjust_b_dc_neon, compensate_b_dc_neon, dc_distortion_row_neon, dc_error_row_neon,
+    reconstruct_dc_neon,
 };
 pub(crate) use dct::{
     dc_from_dct8x32_neon, dc_from_dct16x32_neon, dc_from_dct32x16_neon, dc_from_dct32x32_neon,
@@ -110,10 +108,5 @@ pub(crate) use xyb::{to_linear_rows_neon, to_xyb_neon_band};
 pub(crate) use yellow_opsin::sampled_b_gradient_ratio_neon;
 pub(crate) use ytob::{accumulate_ytob_weights_neon, fill_ytob_residuals_neon, fill_ytob_row_neon};
 
-#[cfg(feature = "splines")]
-pub(crate) use splines::{
-    continuous_idct_neon, spline_distance_neon, spline_render_row_neon, spline_ridge_row_neon,
-};
-
 #[cfg(feature = "extraslow")]
-pub(crate) use coef_polish::{polish_add_scaled_neon, polish_count_nonzero_neon};
+pub(crate) use coef_polish::polish_count_nonzero_neon;

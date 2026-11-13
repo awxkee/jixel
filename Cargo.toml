@@ -26,9 +26,9 @@ splines = []
 extraslow = ["dep:cvvdp-lite", "dep:ssimu2-lite"]
 
 [dependencies]
-cvvdp-lite = { version = "0.1.3", optional = true }
-ssimu2-lite = { version = "0.1.3", optional = true }
-msssim-lite = { version = "0.1.0" }
+cvvdp-lite = { version = "0.1.4", optional = true }
+ssimu2-lite = { version = "0.1.4", optional = true }
+msssim-lite = { version = "0.1.1" }
 
 [profile.test]
 opt-level = 1

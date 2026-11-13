@@ -488,21 +488,3 @@ pub(crate) fn dc_distortion_row_avx2(
     }
     sum
 }
-
-#[target_feature(enable = "avx2")]
-pub(crate) fn add_scaled_avx2(out: &mut [f32], src: &[f32], factor: f32) {
-    assert!(src.len() >= out.len());
-    let end = out.len() / 8 * 8;
-    for x in (0..end).step_by(8) {
-        unsafe {
-            _mm256_storeu_ps(
-                out.as_mut_ptr().add(x),
-                _mm256_add_ps(
-                    _mm256_loadu_ps(out.as_ptr().add(x)),
-                    _mm256_mul_ps(_mm256_set1_ps(factor), _mm256_loadu_ps(src.as_ptr().add(x))),
-                ),
-            );
-        }
-    }
-    crate::dc_ops::add_scaled_scalar(&mut out[end..], &src[end..], factor);
-}

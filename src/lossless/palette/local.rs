@@ -481,6 +481,8 @@ pub(in crate::lossless) fn local_palette_order_candidates(
     if tour != chain {
         orders.push(order_of_path(&tour));
     }
+    // Both callers already price the color-sorted order.
+    orders.retain(|order| order.iter().enumerate().any(|(i, &v)| v as usize != i));
     orders
 }
 
@@ -499,16 +501,16 @@ pub(in crate::lossless) fn apply_palette_order(group: &mut LocalPaletteGroup, or
     }
 }
 
-/// Re-indexes a group palette by whichever of its candidate orders the
-/// index-plane estimator prices lowest, keeping the color sort when none
-/// beats it. The learned-tree path's per-group arm: the estimator's pick is
-/// raced against the color sort by a first-stage learn there, since it
-/// cannot see what the tree makes of either.
-pub(in crate::lossless) fn order_local_palette(group: &mut LocalPaletteGroup) {
+/// Returns a reordered palette when the index-plane estimator prefers it
+/// to the color sort. The learned-tree path races the result against the
+/// original using a first-stage learn.
+pub(in crate::lossless) fn ordered_local_palette(
+    group: &LocalPaletteGroup,
+) -> Option<LocalPaletteGroup> {
     let n = group.nb_colors;
     let orders = local_palette_order_candidates(group);
     if orders.is_empty() {
-        return;
+        return None;
     }
     let entropy_of_hist = selected_entropy_of_hist_fn();
     let identity: Vec<i32> = (0..n as i32).collect();
@@ -523,9 +525,10 @@ pub(in crate::lossless) fn order_local_palette(group: &mut LocalPaletteGroup) {
             best = Some(order);
         }
     }
-    if let Some(order) = best {
-        apply_palette_order(group, order);
-    }
+    let order = best?;
+    let mut reordered = group.clone();
+    apply_palette_order(&mut reordered, order);
+    Some(reordered)
 }
 
 /// Group step of the local-palette frame's plain-channel predictor costs

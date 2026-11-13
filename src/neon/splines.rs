@@ -30,9 +30,68 @@
 //! Spline detection, transforms, rendering and geometry kernels.
 
 use crate::splines::{
-    ALONG_PENALTY, MAX_SUBPIXEL_OFFSET, Point, RidgeRow, Sample, Segments, ridge_row_scalar,
+    ALONG_PENALTY, BlobWeightRow, FilterBounds, MAX_SUBPIXEL_OFFSET, Point, RidgeRow, Sample,
+    Segments, ridge_row_scalar, vertical_row_scalar_tail,
 };
 use std::arch::aarch64::*;
+
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn vertical_block<const VECTORS: usize>(
+    src: &[f32],
+    w: usize,
+    bounds: FilterBounds,
+    kernel: &[f32],
+    x: usize,
+    dst: &mut [[f32; 4]; VECTORS],
+) {
+    let mut sums = [vdupq_n_f32(0.0); VECTORS];
+    for (tap, &weight) in kernel.iter().enumerate() {
+        let start = bounds.index(tap) * w + x;
+        // SAFETY: the caller checked every source row contains this block.
+        let pixels = unsafe { src.get_unchecked(start..start + 4 * VECTORS) };
+        let (pixels, _) = pixels.as_chunks::<4>();
+        for (sum, pixels) in sums.iter_mut().zip(pixels) {
+            // SAFETY: each chunk contains four readable pixels.
+            let pixels = unsafe { vld1q_f32(pixels.as_ptr()) };
+            *sum = vaddq_f32(*sum, vmulq_n_f32(pixels, weight));
+        }
+    }
+    for (block, sum) in dst.iter_mut().zip(sums) {
+        // SAFETY: each chunk contains four writable pixels.
+        unsafe { vst1q_f32(block.as_mut_ptr(), sum) };
+    }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn vertical_row_neon(
+    src: &[f32],
+    w: usize,
+    bounds: FilterBounds,
+    kernel: &[f32],
+    dst: &mut [f32],
+) {
+    if dst.is_empty() {
+        return;
+    }
+    assert!(dst.len() <= w && bounds.index(kernel.len().saturating_sub(1)) < src.len() / w);
+    let (blocks, tail) = dst.as_chunks_mut::<4>();
+    let (groups, blocks) = blocks.as_chunks_mut::<4>();
+    let mut x = 0;
+    for group in groups {
+        // SAFETY: validated above, and each block contains 16 pixels.
+        unsafe { vertical_block(src, w, bounds, kernel, x, group) };
+        x += 16;
+    }
+    for block in blocks {
+        // SAFETY: validated above, and each block contains four pixels.
+        unsafe { vertical_block(src, w, bounds, kernel, x, std::array::from_mut(block)) };
+        x += 4;
+    }
+    if !tail.is_empty() {
+        vertical_row_scalar_tail(src, w, bounds, kernel, x, tail);
+    }
+}
 
 /// Evaluate four independent Hessians without changing scalar rounding or
 /// scale tie-breaking. Rejected lanes retain all of their previous attributes.
@@ -162,25 +221,46 @@ fn fast_cos_neon(x: float32x4_t) -> float32x4_t {
 }
 
 #[target_feature(enable = "neon")]
-pub(crate) fn continuous_idct_neon(dct: &[[f32; 4]; 32], t: f32) -> [f32; 4] {
+pub(crate) fn continuous_idct_neon(dct: &[[f32; 4]], t: f32) -> [f32; 4] {
+    if dct.len() == 32 {
+        continuous_idct_impl(&dct[..32], t)
+    } else {
+        continuous_idct_impl(dct, t)
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn continuous_idct_impl(dct: &[[f32; 4]], t: f32) -> [f32; 4] {
     let mut result = vdupq_n_f32(0.0);
     let indices = [0.0, 1.0, 2.0, 3.0];
     let mut indices = unsafe { vld1q_f32(indices.as_ptr()) };
-    for rows in dct.as_chunks::<4>().0 {
+    let cosine = |indices| {
         let args = vmulq_n_f32(vmulq_n_f32(indices, std::f32::consts::PI / 32.0), t + 0.5);
         let cos = fast_cos_neon(args);
-        let cosines = [
+        [
             vdupq_laneq_f32::<0>(cos),
             vdupq_laneq_f32::<1>(cos),
             vdupq_laneq_f32::<2>(cos),
             vdupq_laneq_f32::<3>(cos),
-        ];
-        // Accumulate frequencies in order, retaining scalar rounding in each channel.
-        for (row, cos) in rows.iter().zip(cosines) {
-            let values = unsafe { vld1q_f32(row.as_ptr()) };
-            result = vaddq_f32(result, vmulq_f32(values, cos));
-        }
+        ]
+    };
+    // Accumulate frequencies in order, retaining scalar rounding in each channel.
+    let mut accumulate = |row: &[f32; 4], cos| {
+        let values = unsafe { vld1q_f32(row.as_ptr()) };
+        result = vaddq_f32(result, vmulq_f32(values, cos));
+    };
+    let (blocks, tail) = dct.as_chunks::<4>();
+    for rows in blocks {
+        rows.iter()
+            .zip(cosine(indices))
+            .for_each(|(row, cos)| accumulate(row, cos));
         indices = vaddq_f32(indices, vdupq_n_f32(4.0));
+    }
+    if !tail.is_empty() {
+        tail.iter()
+            .zip(cosine(indices))
+            .for_each(|(row, cos)| accumulate(row, cos));
     }
     let mut out = [0.0; 4];
     unsafe { vst1q_f32(out.as_mut_ptr(), result) };
@@ -220,14 +300,22 @@ pub(crate) fn spline_distance_neon(p: Point<f32>, blocks: &[Segments]) -> f32 {
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn erf(x: float32x4_t) -> float32x4_t {
+fn horner_step<const FUSED: bool>(a: float32x4_t, b: float32x4_t, c: f32) -> float32x4_t {
+    if FUSED {
+        vfmaq_f32(vdupq_n_f32(c), a, b)
+    } else {
+        vaddq_f32(vmulq_f32(a, b), vdupq_n_f32(c))
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn erf<const FUSED: bool>(x: float32x4_t) -> float32x4_t {
     let a = vabsq_f32(x);
-    // Deliberately separate multiplication and addition, including the
-    // reciprocal, to match the scalar renderer's rounding exactly.
-    let d1 = vaddq_f32(vmulq_n_f32(a, 7.77394369e-02), vdupq_n_f32(2.05260015e-04));
-    let d2 = vaddq_f32(vmulq_f32(d1, a), vdupq_n_f32(2.32120216e-01));
-    let d3 = vaddq_f32(vmulq_f32(d2, a), vdupq_n_f32(2.77820801e-01));
-    let d4 = vaddq_f32(vmulq_f32(d3, a), vdupq_n_f32(1.0));
+    let d1 = horner_step::<FUSED>(a, vdupq_n_f32(7.77394369e-02), 2.05260015e-04);
+    let d2 = horner_step::<FUSED>(d1, a, 2.32120216e-01);
+    let d3 = horner_step::<FUSED>(d2, a, 2.77820801e-01);
+    let d4 = horner_step::<FUSED>(d3, a, 1.0);
     let d5 = vmulq_f32(d4, d4);
     let inv = vdivq_f32(vdupq_n_f32(1.0), d5);
     let r = vsubq_f32(vdupq_n_f32(1.0), vmulq_f32(inv, inv));
@@ -236,19 +324,117 @@ fn erf(x: float32x4_t) -> float32x4_t {
 
 #[inline]
 #[target_feature(enable = "neon")]
+fn dx_lanes(x: i32, center: f32) -> float32x4_t {
+    // Add in integer lanes before conversion to preserve rounding above 2^24.
+    debug_assert!(x <= i32::MAX - 3);
+    // SAFETY: the constant array contains four readable lanes.
+    let offsets = unsafe { vld1q_s32([0, 1, 2, 3].as_ptr()) };
+    let indices = vcvtq_f32_s32(vaddq_s32(vdupq_n_s32(x), offsets));
+    vsubq_f32(indices, vdupq_n_f32(center))
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn blob_weights<const FUSED: bool>(
+    dx: float32x4_t,
+    dy: f32,
+    inv_sigma: f32,
+    amp: f32,
+) -> float32x4_t {
+    blob_weights_from_squares::<FUSED>(vmulq_f32(dx, dx), dy * dy, inv_sigma, amp)
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn blob_weights_from_squares<const FUSED: bool>(
+    dx_squared: float32x4_t,
+    dy_squared: f32,
+    inv_sigma: f32,
+    amp: f32,
+) -> float32x4_t {
+    let dist = vsqrtq_f32(vaddq_f32(dx_squared, vdupq_n_f32(dy_squared)));
+    let half = vmulq_n_f32(dist, 0.5);
+    let a = vmulq_n_f32(vaddq_f32(half, vdupq_n_f32(0.353_553_39)), inv_sigma);
+    let b = vmulq_n_f32(vsubq_f32(half, vdupq_n_f32(0.353_553_39)), inv_sigma);
+    let e = vsubq_f32(erf::<FUSED>(a), erf::<FUSED>(b));
+    vmulq_f32(vmulq_n_f32(e, amp), e)
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
 fn intensity(sample: &Sample, dy: f32, x: usize, amp: f32) -> float32x4_t {
     // Image dimensions are at most 30 bits, so padded coordinates fit in i32.
-    // Add in integer lanes before conversion to preserve rounding above 2^24.
     debug_assert!(x <= i32::MAX as usize - 3);
-    let offsets = unsafe { vld1q_s32([0, 1, 2, 3].as_ptr()) };
-    let indices = vcvtq_f32_s32(vaddq_s32(vdupq_n_s32(x as i32), offsets));
-    let dx = vsubq_f32(indices, vdupq_n_f32(sample.position.x));
-    let dist = vsqrtq_f32(vaddq_f32(vmulq_f32(dx, dx), vdupq_n_f32(dy * dy)));
-    let half = vmulq_n_f32(dist, 0.5);
-    let a = vmulq_n_f32(vaddq_f32(half, vdupq_n_f32(0.353_553_39)), sample.inv_sigma);
-    let b = vmulq_n_f32(vsubq_f32(half, vdupq_n_f32(0.353_553_39)), sample.inv_sigma);
-    let e = vsubq_f32(erf(a), erf(b));
-    vmulq_f32(vmulq_n_f32(e, amp), e)
+    let dx = dx_lanes(x as i32, sample.position.x);
+    // Match the scalar renderer's polynomial rounding.
+    blob_weights::<false>(dx, dy, sample.inv_sigma, amp)
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn row_weights(row: BlobWeightRow, x: i32) -> float32x4_t {
+    let dx = vmulq_n_f32(dx_lanes(x, row.center), row.step);
+    blob_weights::<true>(dx, row.dy, row.inv_sigma, row.amp)
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn blob_weight_row_neon(row: BlobWeightRow, x0: i32, weights: &mut [f32]) {
+    let (blocks, tail) = weights.as_chunks_mut::<4>();
+    for (i, block) in blocks.iter_mut().enumerate() {
+        // SAFETY: each block has room for all four lanes.
+        unsafe { vst1q_f32(block.as_mut_ptr(), row_weights(row, x0 + 4 * i as i32)) };
+    }
+    if !tail.is_empty() {
+        let mut padded = [0.0; 4];
+        // SAFETY: write the full vector to the local array and copy only the tail.
+        unsafe {
+            vst1q_f32(
+                padded.as_mut_ptr(),
+                row_weights(row, x0 + 4 * blocks.len() as i32),
+            )
+        };
+        tail.copy_from_slice(&padded[..tail.len()]);
+    }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dot_contrast_neon(
+    src: &[f32],
+    stride: usize,
+    dst: &mut [f32],
+    side: usize,
+    bg: f32,
+    slope: [f32; 2],
+) {
+    let radius = (side / 2) as i32;
+    let [sx, sy] = slope;
+    let background = vdupq_n_f32(bg);
+    let horizontal = [
+        vmulq_n_f32(dx_lanes(-radius, 0.0), sx),
+        vmulq_n_f32(dx_lanes(4 - radius, 0.0), sx),
+    ];
+    let rows = crate::splines::dots::contrast_patch_rows(src, stride, dst, side);
+    for (y, (src, dst)) in rows.enumerate() {
+        let row_slope = sy * (y as i32 - radius) as f32;
+        let vertical = vdupq_n_f32(row_slope);
+        let (src, src_tail) = src.as_chunks::<4>();
+        let (dst, dst_tail) = dst.as_chunks_mut::<4>();
+        for ((src, dst), horizontal) in src.iter().zip(dst).zip(horizontal) {
+            // SAFETY: each array contains four readable or writable pixels.
+            unsafe {
+                let pixels = vld1q_f32(src.as_ptr());
+                let contrast = vsubq_f32(
+                    vsubq_f32(vsubq_f32(pixels, background), horizontal),
+                    vertical,
+                );
+                vst1q_f32(dst.as_mut_ptr(), contrast);
+            }
+        }
+        let x0 = 4 * src.len() as i32 - radius;
+        for ((dst, &pixel), dx) in dst_tail.iter_mut().zip(src_tail).zip(x0..) {
+            *dst = pixel - bg - sx * dx as f32 - row_slope;
+        }
+    }
 }
 
 #[target_feature(enable = "neon")]
@@ -262,35 +448,94 @@ pub(crate) fn spline_render_row_neon(
     let [rx, ry, rb] = rows;
     assert_eq!(rx.len(), ry.len());
     assert_eq!(rx.len(), rb.len());
-    let n = rx.len() / 4 * 4;
-    let mut x = 0;
-    while x < n {
-        let li = intensity(sample, dy, x0 + x, amp);
-        // SAFETY: n is rounded down to full vectors; all three rows have
-        // equal lengths.
-        unsafe {
-            let add = |row: &mut [f32], color| {
-                let ptr = row.as_mut_ptr().add(x);
+    let [(rx, tx), (ry, ty), (rb, tb)] = [rx, ry, rb].map(|row| row.as_chunks_mut::<4>());
+    let n = rx.len() * 4;
+    for (i, ((rx, ry), rb)) in rx.iter_mut().zip(ry).zip(rb).enumerate() {
+        let li = intensity(sample, dy, x0 + i * 4, amp);
+        for (block, color) in [rx, ry, rb].into_iter().zip(sample.color) {
+            // SAFETY: each block contains four readable and writable pixels.
+            unsafe {
+                let ptr = block.as_mut_ptr();
                 vst1q_f32(ptr, vaddq_f32(vld1q_f32(ptr), vmulq_n_f32(li, color)));
-            };
-            add(rx, sample.color[0]);
-            add(ry, sample.color[1]);
-            add(rb, sample.color[2]);
+            }
         }
-        x += 4;
     }
-    if rx.len() - n >= 2 {
+    if tx.len() >= 2 {
         let mut weights = [0.0; 4];
         // SAFETY: the incomplete vector writes only to a local array; no
         // image load or store extends past the end of a row.
         unsafe { vst1q_f32(weights.as_mut_ptr(), intensity(sample, dy, x0 + n, amp)) };
-        for x in n..rx.len() {
-            let li = weights[x - n];
-            rx[x] += sample.color[0] * li;
-            ry[x] += sample.color[1] * li;
-            rb[x] += sample.color[2] * li;
+        for (tail, color) in [tx, ty, tb].into_iter().zip(sample.color) {
+            for (out, li) in tail.iter_mut().zip(weights) {
+                *out += color * li;
+            }
         }
     } else {
-        sample.scalar_row(dy, x0 + n, [&mut rx[n..], &mut ry[n..], &mut rb[n..]], amp);
+        sample.scalar_row(dy, x0 + n, [tx, ty, tb], amp);
+    }
+}
+
+/// Draw one clipped sample into an 8x8 tile. Each four-column vector
+/// shares its x distances and clipping mask across the covered rows.
+#[cfg(feature = "neon")]
+#[target_feature(enable = "neon")]
+pub(crate) fn spline_render_tile_neon(
+    sample: &Sample,
+    tx: usize,
+    ty: usize,
+    (x0, x1, y0, y1): (usize, usize, usize, usize),
+    pixels: &mut [[f32; 64]; 3],
+    sign: f32,
+) {
+    debug_assert!(x0 >= tx && x1 <= tx + 8 && x0 < x1);
+    debug_assert!(y0 >= ty && y1 <= ty + 8 && y0 < y1);
+    let local_x0 = x0 - tx;
+    let local_x1 = x1 - tx;
+    let local_y = y0 - ty..y1 - ty;
+    let amp = sample.amp * sign;
+    let [rx, ry, rb] = pixels;
+    let rx = rx.as_chunks_mut::<8>().0;
+    let ry = ry.as_chunks_mut::<8>().0;
+    let rb = rb.as_chunks_mut::<8>().0;
+    // SAFETY: the offsets array has four lanes.
+    let offsets = unsafe { vld1q_s32([0, 1, 2, 3].as_ptr()) };
+    let split = (local_x0 + 4).min(local_x1);
+    for (start, end) in [(local_x0, split), (split, local_x1)] {
+        if start == end {
+            break;
+        }
+        let col = start.min(4);
+        let dx = dx_lanes((tx + col) as i32, sample.position.x);
+        let dx_squared = vmulq_f32(dx, dx);
+        let columns = vaddq_s32(vdupq_n_s32(col as i32), offsets);
+        let active = vandq_u32(
+            vcgeq_s32(columns, vdupq_n_s32(start as i32)),
+            vcltq_s32(columns, vdupq_n_s32(end as i32)),
+        );
+        let clipped = col < start || col + 4 > end;
+        for (((rx, ry), rb), y) in rx[local_y.clone()]
+            .iter_mut()
+            .zip(&mut ry[local_y.clone()])
+            .zip(&mut rb[local_y.clone()])
+            .zip(y0..)
+        {
+            let dy = y as f32 - sample.position.y;
+            let li = blob_weights_from_squares::<false>(dx_squared, dy * dy, sample.inv_sigma, amp);
+            for (row, color) in [rx, ry, rb].into_iter().zip(sample.color) {
+                let block = row[col..].first_chunk_mut::<4>().unwrap();
+                // SAFETY: each block holds four readable and writable pixels.
+                unsafe {
+                    let ptr = block.as_mut_ptr();
+                    let original = vld1q_f32(ptr);
+                    let drawn = vaddq_f32(original, vmulq_n_f32(li, color));
+                    let out = if clipped {
+                        vbslq_f32(active, drawn, original)
+                    } else {
+                        drawn
+                    };
+                    vst1q_f32(ptr, out);
+                }
+            }
+        }
     }
 }

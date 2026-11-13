@@ -30,10 +30,12 @@
 //! Predictor and weighted-predictor preset cost estimation.
 
 use super::super::entropy::{EntropyOfHistFn, selected_entropy_of_hist_fn};
+#[cfg(test)]
+use super::predictor_neighbors;
 use super::row_kernels::{self, Rows, Sample};
 use super::{
     PREDICTOR_GRADIENT, PREDICTOR_LEFT, PREDICTOR_SELECT, PREDICTOR_TOP, PREDICTOR_ZERO,
-    SLOW_PREDICTORS, fixed_predictor, predictor_neighbors,
+    SLOW_PREDICTORS, fixed_predictor, visit_predictor_row,
 };
 use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
@@ -53,14 +55,20 @@ fn wp_sample_coords(len: usize) -> impl Iterator<Item = usize> {
     (0..crop).chain(tail)
 }
 
-pub(super) fn wp_sample_cost(
-    get: impl Fn(usize, usize) -> i32,
+pub(super) fn wp_sample_cost<'a, T: Copy + 'a>(
+    get_row: impl Fn(usize) -> &'a [T],
     width: usize,
     height: usize,
     params: WpParams,
-) -> (u64, usize) {
+) -> (u64, usize)
+where
+    i64: From<T>,
+{
     let cw = width.min(WP_SAMPLE_CROP);
     let ch = height.min(WP_SAMPLE_CROP);
+    if cw == 0 || ch == 0 {
+        return (0, 0);
+    }
     let xs = if width > cw { [0, width - cw] } else { [0, 0] };
     let ys = if height > ch {
         [0, height - ch]
@@ -70,38 +78,59 @@ pub(super) fn wp_sample_cost(
     let nx = 1 + usize::from(xs[1] != xs[0]);
     let ny = 1 + usize::from(ys[1] != ys[0]);
     let mut cost = 0u64;
-    let mut count = 0usize;
     let mut wp = WpState::with_params(cw, params);
     for &y0 in &ys[..ny] {
         for &x0 in &xs[..nx] {
-            let local_get = |x: usize, y: usize| get(x0 + x, y0 + y);
             wp.reset(cw, params);
+            let mut north = &get_row(y0)[x0..x0 + cw];
+            let mut north_north = north;
             for y in 0..ch {
-                for x in 0..cw {
-                    let neighbors = predictor_neighbors(&local_get, x, y, cw);
-                    let value = local_get(x, y);
-                    let prediction = wp.predict(
+                let current = &get_row(y0 + y)[x0..x0 + cw];
+                let row = wp.row_offsets(y);
+                visit_predictor_row(current, north, north_north, y == 0, |x, value, n| {
+                    let prediction = wp.predict_and_update(
+                        value,
                         x,
-                        y,
-                        neighbors.top,
-                        neighbors.left,
-                        neighbors.top_right,
-                        neighbors.top_left,
-                        neighbors.top_top,
+                        row,
+                        WpNeighbors {
+                            north: n.top,
+                            west: n.left,
+                            north_east: n.top_right,
+                            north_west: n.top_left,
+                            north_north: n.top_top,
+                        },
                     );
-                    let packed = pack_signed(value.wrapping_sub(prediction as i32));
-                    let (_, extra_bits, _) = crate::entropy::uint_encode(packed);
-                    let magnitude_bits = packed
-                        .checked_add(1)
-                        .map_or(32, |value| 32 - value.leading_zeros());
-                    cost += extra_bits as u64 + u64::from(magnitude_bits);
-                    count += 1;
-                    wp.update(value as i64, x, y);
-                }
+                    cost += wp_residual_cost((value - prediction) as i32);
+                });
+                north_north = north;
+                north = current;
             }
         }
     }
-    (cost, count)
+    (cost, nx * ny * cw * ch)
+}
+
+#[inline]
+fn wp_residual_cost(residual: i32) -> u64 {
+    let packed = pack_signed(residual);
+    let (_, extra_bits, _) = crate::entropy::uint_encode(packed);
+    let magnitude_bits = 32 - packed.saturating_add(1).leading_zeros();
+    u64::from(extra_bits + magnitude_bits)
+}
+
+pub(super) fn wp_constant_sample_cost(value: i32, width: usize, height: usize) -> (u64, usize) {
+    if width == 0 || height == 0 {
+        return (0, 0);
+    }
+    debug_assert!(value >= 0);
+    let crop_count =
+        (1 + usize::from(width > WP_SAMPLE_CROP)) * (1 + usize::from(height > WP_SAMPLE_CROP));
+    let samples = wp_sample_coords(width).count() * wp_sample_coords(height).count();
+    // Each crop starts from zero. For a nonnegative constant, the first
+    // sample leaves a nonpositive WP error. Every later prediction clamps to
+    // its equal neighbors, with zero residual and zero WP error.
+    let cost = samples as u64 + crop_count as u64 * (wp_residual_cost(value) - 1);
+    (cost, samples)
 }
 
 /// `ycocg` holds YCoCg planes (or one gray plane) and the color channels are
@@ -110,6 +139,7 @@ pub(in crate::lossless) fn choose_wp_params(
     ycocg: &Image3Si,
     rct: u32,
     alpha: Option<&AlphaPlane>,
+    alpha_constant: Option<i32>,
     num_color: usize,
     header_count: usize,
     pool: &ThreadPool,
@@ -119,6 +149,9 @@ pub(in crate::lossless) fn choose_wp_params(
     let height = ycocg.ysize();
     let nb_chans = num_color + usize::from(alpha.is_some());
     let total_values = width.saturating_mul(height).saturating_mul(nb_chans);
+    let alpha_constant_cost = alpha_constant
+        .filter(|&value| value >= 0)
+        .map(|value| wp_constant_sample_cost(value, width, height));
     let packed_width = wp_sample_coords(width).count();
     let packed_height = wp_sample_coords(height).count();
     let corners = (num_color == 3 && rct != 6).then(|| {
@@ -160,7 +193,7 @@ pub(in crate::lossless) fn choose_wp_params(
                 Some(planes) => {
                     let plane = &planes[channel];
                     wp_sample_cost(
-                        |x, y| plane[y * packed_width + x],
+                        |y| &plane[y * packed_width..][..packed_width],
                         packed_width,
                         packed_height,
                         params,
@@ -168,15 +201,24 @@ pub(in crate::lossless) fn choose_wp_params(
                 }
                 None => {
                     let plane = ycocg.plane_data(channel);
-                    wp_sample_cost(|x, y| plane[y * width + x], width, height, params)
+                    wp_sample_cost(|y| &plane[y * width..][..width], width, height, params)
                 }
             };
             sample_cost += cost;
             samples += count;
         }
         if let Some(alpha) = alpha {
-            let (cost, count) =
-                wp_sample_cost(|x, y| alpha.get_i32(y * width + x), width, height, params);
+            let (cost, count) = alpha_constant_cost.unwrap_or_else(|| match alpha {
+                AlphaPlane::U8(data) => {
+                    wp_sample_cost(|y| &data[y * width..][..width], width, height, params)
+                }
+                AlphaPlane::U16 { data, .. } => {
+                    wp_sample_cost(|y| &data[y * width..][..width], width, height, params)
+                }
+                AlphaPlane::F32(data) => {
+                    wp_sample_cost(|y| &data[y * width..][..width], width, height, params)
+                }
+            });
             sample_cost += cost;
             samples += count;
         }

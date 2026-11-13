@@ -27,7 +27,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 //! Single-channel filtering plans adapted from pic-scale's FilterBounds and
-//! floating_point_vertical scalar accumulators. Horizontal convolution keeps
+//! floating_point_vertical accumulators. Horizontal convolution keeps
 //! the fixed-kernel tap-major path, which benchmarks faster at 1:1.
 //!
 //! The detector supplies signed Gaussian derivative kernels. Unlike resize
@@ -35,11 +35,13 @@
 //! Replicated border taps stay separate to retain the original summation order.
 #![forbid(unsafe_code)]
 
+use super::SplinesContext;
 use crate::coder_scratch::CoderScratch;
 use crate::encoding_context::EncodingContext;
+use crate::simd::scaled_add::{AddScaledFn, add_scaled_scalar};
 
 #[derive(Clone, Copy)]
-struct FilterBounds {
+pub(crate) struct FilterBounds {
     start: usize,
     size: usize,
     /// Number of taps repeating the first sample before the contiguous span.
@@ -48,10 +50,12 @@ struct FilterBounds {
 
 impl FilterBounds {
     #[inline]
-    fn index(self, tap: usize) -> usize {
+    pub(crate) fn index(self, tap: usize) -> usize {
         self.start + tap.saturating_sub(self.left).min(self.size - 1)
     }
 }
+
+pub(super) type FilterVerticalRowFn = fn(&[f32], usize, FilterBounds, &[f32], &mut [f32]);
 
 /// One fixed kernel and precomputed source bounds, reusable across planes.
 /// Interior positions share the kernel instead of storing a copy per pixel.
@@ -99,7 +103,7 @@ impl FilterPlan {
             ))
     }
 
-    fn horizontal_row(&self, src: &[f32], dst: &mut [f32]) {
+    fn horizontal_row(&self, add_scaled: AddScaledFn, src: &[f32], dst: &mut [f32]) {
         let w = self.bounds.len();
         let radius = self.kernel.len() / 2;
         if w > 2 * radius {
@@ -109,9 +113,7 @@ impl FilterPlan {
             // pic-scale's four-row dot products. Both source and destination
             // walk contiguous slices with no indexing inside the tap loop.
             for (&weight, pixels) in self.kernel.iter().zip(src.windows(inner.len())) {
-                for (out, &pixel) in inner.iter_mut().zip(pixels) {
-                    *out += weight * pixel;
-                }
+                add_scaled(inner, pixels, weight);
             }
         }
         let edge = |out: &mut f32, &bounds: &FilterBounds| {
@@ -153,57 +155,28 @@ impl FilterPlan {
         }
         let bands = (ctx.thread_pool.num_threads() * 4).min(h);
         let rows_per = h.div_ceil(bands);
+        let add_scaled = ctx.spline_kernels.add_scaled_f32;
         let mut parts: Vec<_> = dst.chunks_mut(rows_per * w).collect();
         ctx.thread_pool
             .steal_for_each_mut(scratch, &mut parts, |b, rows, _| {
                 let src = &src[b * rows_per * w..b * rows_per * w + rows.len()];
                 for (src, dst) in src.chunks_exact(w).zip(rows.chunks_exact_mut(w)) {
-                    self.horizontal_row(src, dst);
+                    self.horizontal_row(add_scaled, src, dst);
                 }
             });
     }
 
-    /// Pic-scale's scalar column accumulator groups: 16, then 4, then 1.
-    /// Each output is stored once after visiting all taps; no explicit SIMD.
-    #[inline]
-    fn vertical_block<const N: usize>(
+    pub(crate) fn vertical_row(
         &self,
+        kernels: &SplinesContext,
         src: &[f32],
         w: usize,
         y: usize,
-        x: usize,
         dst: &mut [f32],
     ) {
-        let bounds = self.bounds[y];
-        let mut sums = [0.0f32; N];
-        for (j, &weight) in self.kernel.iter().enumerate() {
-            let start = bounds.index(j) * w + x;
-            let pixels = &src[start..start + N];
-            for (sum, &pixel) in sums.iter_mut().zip(pixels) {
-                *sum += weight * pixel;
-            }
-        }
-        dst.copy_from_slice(&sums);
-    }
-
-    pub(crate) fn vertical_row(&self, src: &[f32], w: usize, y: usize, dst: &mut [f32]) {
         debug_assert_eq!(src.len(), w * self.bounds.len());
         debug_assert_eq!(dst.len(), w);
-        let mut x = 0;
-        let (chunks, remainder) = dst.as_chunks_mut::<16>();
-        for chunk in chunks {
-            self.vertical_block::<16>(src, w, y, x, chunk);
-            x += 16;
-        }
-        let (chunks, remainder) = remainder.as_chunks_mut::<4>();
-        for chunk in chunks {
-            self.vertical_block::<4>(src, w, y, x, chunk);
-            x += 4;
-        }
-        for pixel in remainder {
-            self.vertical_block::<1>(src, w, y, x, std::slice::from_mut(pixel));
-            x += 1;
-        }
+        (kernels.filter_vertical_row)(src, w, self.bounds[y], &self.kernel, dst);
     }
 
     pub(crate) fn vertical(
@@ -226,9 +199,61 @@ impl FilterPlan {
         ctx.thread_pool
             .steal_for_each_mut(scratch, &mut parts, |b, rows, _| {
                 for (y, row) in rows.chunks_exact_mut(w).enumerate() {
-                    self.vertical_row(src, w, b * rows_per + y, row);
+                    self.vertical_row(ctx.spline_kernels, src, w, b * rows_per + y, row);
                 }
             });
+    }
+}
+
+/// Pic-scale's scalar column accumulator groups: 16, then 4, then 1.
+#[inline]
+fn vertical_block<const N: usize>(
+    src: &[f32],
+    w: usize,
+    bounds: FilterBounds,
+    kernel: &[f32],
+    x: usize,
+    dst: &mut [f32; N],
+) {
+    let mut sums = [0.0; N];
+    for (j, &weight) in kernel.iter().enumerate() {
+        let start = bounds.index(j) * w + x;
+        add_scaled_scalar(&mut sums, &src[start..start + N], weight);
+    }
+    *dst = sums;
+}
+
+pub(super) fn vertical_row_scalar(
+    src: &[f32],
+    w: usize,
+    bounds: FilterBounds,
+    kernel: &[f32],
+    dst: &mut [f32],
+) {
+    vertical_row_scalar_tail(src, w, bounds, kernel, 0, dst);
+}
+
+pub(crate) fn vertical_row_scalar_tail(
+    src: &[f32],
+    w: usize,
+    bounds: FilterBounds,
+    kernel: &[f32],
+    mut x: usize,
+    dst: &mut [f32],
+) {
+    let (chunks, remainder) = dst.as_chunks_mut::<16>();
+    for chunk in chunks {
+        vertical_block(src, w, bounds, kernel, x, chunk);
+        x += 16;
+    }
+    let (chunks, remainder) = remainder.as_chunks_mut::<4>();
+    for chunk in chunks {
+        vertical_block(src, w, bounds, kernel, x, chunk);
+        x += 4;
+    }
+    for pixel in remainder {
+        vertical_block(src, w, bounds, kernel, x, std::array::from_mut(pixel));
+        x += 1;
     }
 }
 

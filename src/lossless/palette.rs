@@ -74,7 +74,7 @@ pub(super) use global::{
 pub(super) use local::local_palette_coverage_is_sufficient;
 pub(super) use local::{
     LOCAL_PALETTE_MAX_COLORS, LocalPaletteGroup, build_local_palette_group_limited,
-    order_local_palette, try_encode_local_palette_multi_group,
+    ordered_local_palette, try_encode_local_palette_multi_group,
 };
 
 use super::GroupLayout;

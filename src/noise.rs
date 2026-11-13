@@ -780,7 +780,7 @@ pub(crate) fn texture_score_from_simd_sads(patch: &[f32; 64], mut sads: [f32; 20
 }
 
 /// Mean |3x3 Laplacian| of the decoded Y plane that one unit of LUT strength
-/// produces, calibrated end to end on flat grays and colours with known noise
+/// produces, calibrated end to end on flat grays and colors with known noise
 /// (gain 0.98-1.07 at sigma 1.5-6, gray 16-240). Dividing a source patch's Y
 /// Laplacian level by it gives the strength that reproduces that level. The
 /// level is measured on Y alone: the decoder's grain is luma-dominant, while

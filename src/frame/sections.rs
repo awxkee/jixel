@@ -31,6 +31,7 @@
 
 use super::{ImageDim, K_DC_GROUP_DIM, K_GROUP_DIM};
 use crate::bit_writer::BitWriter;
+use crate::util::fast_hypot_f64;
 
 /// Section sizes in codestream order, after the optional permutation
 /// (`permutation[i]` = codestream slot of canonical section `i`).
@@ -176,12 +177,13 @@ fn group_order_key(
 ) -> (i64, f64, f64) {
     let (w, h) = (dim.xsize as f64, dim.ysize as f64);
     let (dx, dy) = (center.0 - w / 2.0, center.1 - h / 2.0);
-    let radius = dx.hypot(dy);
+    // Both the dimensions and the group coordinates come from usize.
+    let radius = fast_hypot_f64(dx, dy);
     let angle = dx.atan2(-dy).rem_euclid(std::f64::consts::TAU);
     let g = group_dim as f64;
     match group_order {
         crate::GroupOrder::Diagonals => {
-            let diagonal = w.hypot(h);
+            let diagonal = fast_hypot_f64(w, h);
             let main = (w * center.1 - h * center.0).abs() / diagonal;
             let anti = (w * (h - center.1) - h * center.0).abs() / diagonal;
             ((main.min(anti) / (0.5 * g)).floor() as i64, radius, angle)

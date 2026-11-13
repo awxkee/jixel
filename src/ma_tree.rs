@@ -240,16 +240,44 @@ impl MaSamples {
         self
     }
 
+    // `i32::from` widens the i16 `Narrow` rows; it is a no-op on `Wide` rows.
+    #[allow(clippy::useless_conversion)]
     fn partition(&mut self, start: usize, end: usize, prop: u8, threshold: i32) -> usize {
         with_ma_properties!(&mut self.props, |rows| {
-            partition_rows(
+            let tokens = &mut self.tok[start..end];
+            let values = val_range(&mut self.val, start, end);
+            partition_by(
                 &mut rows[start..end],
-                &mut self.tok[start..end],
-                val_range(&mut self.val, start, end),
-                prop,
-                threshold,
+                |row| i32::from(row[prop as usize]) > threshold,
+                |a, b| {
+                    tokens.swap(a, b);
+                    if !values.is_empty() {
+                        values.swap(a, b);
+                    }
+                },
             )
         })
+    }
+
+    /// Compute the partition order without copying or moving any sample rows.
+    // `i32::from` widens the i16 `Narrow` rows; it is a no-op on `Wide` rows.
+    #[allow(clippy::useless_conversion)]
+    fn partition_indices(
+        &self,
+        start: usize,
+        end: usize,
+        prop: u8,
+        threshold: i32,
+    ) -> (Vec<u32>, usize) {
+        let mut indices: Vec<_> = (start as u32..end as u32).collect();
+        let split = with_ma_properties!(&self.props, |rows| {
+            partition_by(
+                &mut indices,
+                |&i| i32::from(rows[i as usize][prop as usize]) > threshold,
+                |_, _| {},
+            )
+        });
+        (indices, split)
     }
 
     /// Deterministic evenly spaced selection for the coarse learning stage.
@@ -354,6 +382,8 @@ pub(crate) struct MaPropertyScratch {
     node_nbits: Vec<u64>,
     /// Costs already computed when choosing the node's best predictor.
     node_costs: [f32; NUM_MA_PREDS],
+    /// Per channel and predictor: the whole sample set's flat histograms.
+    flat_hist: Vec<u32>,
 }
 
 impl Default for MaPropertyScratch {
@@ -370,6 +400,7 @@ impl Default for MaPropertyScratch {
             node_hist: Vec::new(),
             node_nbits: vec![0; NUM_MA_PREDS],
             node_costs: [f32::INFINITY; NUM_MA_PREDS],
+            flat_hist: Vec::new(),
         }
     }
 }
@@ -882,14 +913,29 @@ fn node_cost_all<'a>(
     } = scratch;
     let hist = &mut node_hist[..NUM_MA_PREDS * alpha];
     hist.fill(0);
-    node_nbits.fill(0);
-    node_costs.fill(f32::INFINITY);
     let total = tokens.len() as u32;
     for toks in tokens {
-        for (pred_hist, &token) in hist.chunks_exact_mut(alpha).zip(toks) {
-            pred_hist[token as usize] += 1;
-        }
+        count_predictor_tokens(hist, alpha, toks);
     }
+    predictor_costs(hist, total, params, node_nbits, node_costs)
+}
+
+#[inline]
+fn count_predictor_tokens(hist: &mut [u32], alphabet: usize, tokens: &[u8; NUM_MA_PREDS]) {
+    for (pred_hist, &token) in hist.chunks_exact_mut(alphabet).zip(tokens) {
+        pred_hist[token as usize] += 1;
+    }
+}
+
+fn predictor_costs(
+    hist: &[u32],
+    total: u32,
+    params: &MaLearnParams,
+    node_nbits: &mut [u64],
+    node_costs: &mut [f32; NUM_MA_PREDS],
+) -> (f32, usize) {
+    let alpha = params.alphabet;
+    node_costs.fill(f32::INFINITY);
     for (nbits, pred_hist) in node_nbits.iter_mut().zip(hist.chunks_exact(alpha)) {
         *nbits = raw_bits_from_hist(pred_hist);
     }
@@ -929,6 +975,7 @@ impl Learner<'_> {
         end: usize,
         depth: u16,
         zero_offset: i32,
+        score_split: bool,
         pool: &ThreadPool,
         scratch: &mut CoderScratch,
     ) -> Pending {
@@ -940,6 +987,7 @@ impl Learner<'_> {
             &self.s.tok[start..end],
             depth,
             zero_offset,
+            score_split,
             pool,
             scratch,
         )
@@ -971,6 +1019,7 @@ impl Learner<'_> {
         tokens: &[[u8; NUM_MA_PREDS]],
         depth: u16,
         zero_offset: i32,
+        score_split: bool,
         pool: &ThreadPool,
         scratch: &mut CoderScratch,
     ) -> Pending {
@@ -983,6 +1032,7 @@ impl Learner<'_> {
                 tokens,
                 depth,
                 zero_offset,
+                score_split,
                 pool,
                 scratch,
             ),
@@ -994,6 +1044,7 @@ impl Learner<'_> {
                 tokens,
                 depth,
                 zero_offset,
+                score_split,
                 pool,
                 scratch,
             ),
@@ -1010,6 +1061,7 @@ impl Learner<'_> {
         tokens: &[[u8; NUM_MA_PREDS]],
         depth: u16,
         zero_offset: i32,
+        score_split: bool,
         pool: &ThreadPool,
         scratch: &mut CoderScratch,
     ) -> Pending {
@@ -1022,7 +1074,8 @@ impl Learner<'_> {
         // already (near-)deterministic cannot be worth splitting, so its
         // properties are not scored at all. Exact, and the bulk of the work
         // on flat graphics and text once the tree has isolated their zeros.
-        if properties.len() >= self.p.min_node
+        if score_split
+            && properties.len() >= self.p.min_node
             && (depth as usize) < MAX_DEPTH
             && base_bits > self.p.split_cost_bits
         {
@@ -1062,7 +1115,26 @@ impl Learner<'_> {
             plans.clear();
             luts.clear();
             let mut hist_len = 0usize;
+            let mut planned = 0u32;
             for &prop in props {
+                // An absolute-value property and its signed counterpart can
+                // be identical throughout this node. Their quantiles, bins,
+                // and costs then match, and the earlier property wins ties.
+                let absolute = match prop {
+                    6 | 7 => Some(prop - 2),
+                    17 | 19 | 21 | 23 => Some(prop - 1),
+                    _ => None,
+                };
+                if let Some(absolute) = absolute
+                    && planned & (1 << absolute) != 0
+                    && properties.iter().all(|row| {
+                        let a: i32 = row[absolute as usize].into();
+                        let b: i32 = row[prop as usize].into();
+                        a == b
+                    })
+                {
+                    continue;
+                }
                 if let Some(plan) = plan_split(
                     properties,
                     prop as usize,
@@ -1074,6 +1146,7 @@ impl Learner<'_> {
                 ) {
                     hist_len += plan.hist_len();
                     plans.push(plan);
+                    planned |= 1 << prop;
                 }
             }
 
@@ -1280,19 +1353,29 @@ fn new_learner(samples: &mut MaSamples, params: MaLearnParams, nodes: Vec<MaNode
 
 fn flat_cost(learner: &Learner<'_>, scratch: &mut CoderScratch) -> f64 {
     let samples = &*learner.s;
-    let mut flat_bits = 0.0f64;
-    let per_channel = samples.len().div_ceil(4);
-    let mut chan_idx: [Vec<u32>; 4] = std::array::from_fn(|_| Vec::with_capacity(per_channel));
+    let alphabet = learner.p.alphabet;
+    let channel_stride = NUM_MA_PREDS * alphabet;
+    let MaPropertyScratch {
+        flat_hist,
+        node_nbits,
+        node_costs,
+        ..
+    } = &mut scratch.ma_property;
+    flat_hist.clear();
+    flat_hist.resize(4 * channel_stride, 0);
+    let mut counts = [0u32; 4];
     with_ma_properties!(&samples.props, |rows| {
-        for (sample, props) in rows.iter().enumerate() {
+        for (props, tokens) in rows.iter().zip(&samples.tok) {
             let c = props[0].clamp(0, 3) as usize;
-            chan_idx[c].push(sample as u32);
+            counts[c] += 1;
+            let hist = &mut flat_hist[c * channel_stride..][..channel_stride];
+            count_predictor_tokens(hist, alphabet, tokens);
         }
     });
-    for channel in &chan_idx {
-        if !channel.is_empty() {
-            let tokens = channel.iter().map(|&i| &samples.tok[i as usize]);
-            let (bits, _) = node_cost_all(tokens, &learner.p, &mut scratch.ma_property);
+    let mut flat_bits = 0.0;
+    for (hist, count) in flat_hist.chunks_exact(channel_stride).zip(counts) {
+        if count != 0 {
+            let (bits, _) = predictor_costs(hist, count, &learner.p, node_nbits, node_costs);
             flat_bits += bits as f64;
         }
     }
@@ -1323,32 +1406,27 @@ fn speculative_splits(pool: &ThreadPool) -> usize {
 /// Upper bound of the speculation window (nodes scored per round).
 const SPECULATE_MAX_WINDOW: usize = 8;
 
-/// Rows of a node scored ahead of its turn are partitioned on a copy, so the
-/// learner's own row order (which leaf-offset sampling later reads) changes
-/// only when a split is committed; the copy bounds the speculated node size.
+/// Bound the size of the child copies scored ahead of their turn. The
+/// learner's own row order changes only when a split is committed.
 const SPECULATE_MAX_ROWS: usize = 1 << 16;
 
-/// The learner's two-ended partition: `gt` rows move to the front in their
-/// original relative order, the rest to the back. Returns the first `le` row.
-fn partition_rows<T: MaProperty>(
-    props: &mut [[T; NUM_MA_PROPS]],
-    tok: &mut [[u8; NUM_MA_PREDS]],
-    val: &mut [i32],
-    prop: u8,
-    threshold: i32,
+/// The learner's two-ended partition. Returns the first `le` row. Use the
+/// same swap order for rows and indices so every quantile probe sees the
+/// same sequence whether it is scored before or after committing a split.
+fn partition_by<T>(
+    rows: &mut [T],
+    is_gt: impl Fn(&T) -> bool,
+    mut swap_parallel_rows: impl FnMut(usize, usize),
 ) -> usize {
     let mut lo = 0;
-    let mut hi = props.len();
+    let mut hi = rows.len();
     while lo < hi {
-        if props[lo][prop as usize].into() > threshold {
+        if is_gt(&rows[lo]) {
             lo += 1;
         } else {
             hi -= 1;
-            props.swap(lo, hi);
-            tok.swap(lo, hi);
-            if !val.is_empty() {
-                val.swap(lo, hi);
-            }
+            rows.swap(lo, hi);
+            swap_parallel_rows(lo, hi);
         }
     }
     lo
@@ -1408,6 +1486,7 @@ fn grow_tree(
     let modal = learner.p.modal_offsets && !learner.s.val.is_empty();
     while learner.leaves < learner.p.max_leaves as u32 {
         let Some(p) = heap.pop() else { break };
+        let remaining = (learner.p.max_leaves as u32 - learner.leaves) as usize;
         let (prop, threshold) = p.split.expect("only splittable nodes are queued");
         if !ahead.contains_key(&p.node_id) {
             // The committed node: use the original two-ended partition order,
@@ -1423,10 +1502,11 @@ fn grow_tree(
             // Speculated nodes: the next best pending splits by gain (ties
             // may pick either, which only decides what is computed early,
             // never what is committed). Their rows are untouched until they
-            // commit, so a copy partitioned the same way holds exactly the
-            // rows the children will then own.
+            // commit, so partition their indices to find the rows each child
+            // will own in the same order.
             let mut speculated: Vec<(u32, usize, usize, u8, i32, u16)> = Vec::new();
-            if window > 1 {
+            let speculate = window.min(remaining) - 1;
+            if speculate > 0 {
                 let mut next: Vec<&Pending> = heap
                     .iter()
                     .filter(|q| {
@@ -1434,16 +1514,14 @@ fn grow_tree(
                     })
                     .collect();
                 next.sort_by(|a, b| b.gain.total_cmp(&a.gain));
-                for q in next.into_iter().take(window - 1) {
+                for q in next.into_iter().take(speculate) {
                     let (prop, threshold) = q.split.expect("only splittable nodes are queued");
                     speculated.push((q.node_id, q.start, q.end, prop, threshold, q.depth + 1));
                 }
             }
-            // Two tasks per node, `gt` then `le`. The committed node's score
-            // its partitioned rows in place; a speculated node's each copy
-            // and partition the node's rows themselves (the copy is private
-            // to the task, and both tasks of a node partition it alike), so
-            // the copies are made off the committing thread.
+            // Two tasks per node, `gt` then `le`. A committed child scores
+            // its rows in place; a speculated child gathers only its own rows
+            // after partitioning the indices.
             let committed_tasks = if committed_live { 2 } else { 0 };
             let learner_ref = &learner;
             let speculated_ref = &speculated;
@@ -1460,6 +1538,8 @@ fn grow_tree(
                         end,
                         p.depth + 1,
                         offset,
+                        // On the last split, the children only need their leaf scores.
+                        remaining > 1,
                         pool,
                         worker_scratch,
                     );
@@ -1467,29 +1547,22 @@ fn grow_tree(
                 }
                 let j = (k - committed_tasks) / 2;
                 let (_, start, end, prop, threshold, depth) = speculated_ref[j];
-                let mut copy = MaSamples {
-                    props: learner_ref.s.props.copy_range(start..end),
-                    tok: learner_ref.s.tok[start..end].to_vec(),
-                    val: if modal {
-                        learner_ref.s.val[start..end].to_vec()
-                    } else {
-                        Vec::new()
-                    },
-                };
-                let split_at = copy.partition(0, copy.len(), prop, threshold);
-                if split_at == 0 || split_at == copy.len() {
+                let (indices, split_at) =
+                    learner_ref.s.partition_indices(start, end, prop, threshold);
+                if split_at == 0 || split_at == indices.len() {
                     // Quantile candidate straddled no actual sample boundary.
                     return None;
                 }
                 let rows = if (k - committed_tasks).is_multiple_of(2) {
                     0..split_at
                 } else {
-                    split_at..copy.len()
+                    split_at..indices.len()
                 };
+                let mut copy = learner_ref.s.select(&indices[rows.clone()]);
                 let offset = if modal {
                     rebase_zero(
-                        &mut copy.tok[rows.clone()],
-                        &copy.val[rows.clone()],
+                        &mut copy.tok,
+                        &copy.val,
                         &mut worker_scratch.ma_property.multi_bin_count,
                     )
                 } else {
@@ -1499,10 +1572,11 @@ fn grow_tree(
                     0,
                     start + rows.start,
                     start + rows.end,
-                    copy.props.slice(rows.clone()),
-                    &copy.tok[rows],
+                    copy.props.slice(0..copy.len()),
+                    &copy.tok,
                     depth,
                     offset,
+                    true,
                     pool,
                     worker_scratch,
                 );
@@ -1696,7 +1770,16 @@ pub(crate) fn learn_ma_tree_in_place(
     let flat_bits = flat_cost(&learner, scratch);
     let mut heap = std::collections::BinaryHeap::new();
     let offset = learner.rebase(0, n, scratch);
-    let root = learner.evaluate(0, 0, n, 0, offset, pool, scratch);
+    let root = learner.evaluate(
+        0,
+        0,
+        n,
+        0,
+        offset,
+        learner.p.max_leaves as u32 > 1,
+        pool,
+        scratch,
+    );
     learner.nodes[0] = MaNode::Leaf {
         pred: root.pred,
         offset: root.offset,
@@ -1782,6 +1865,7 @@ pub(crate) fn deepen_ma_tree(
                 offsets[node + 1],
                 depths[node],
                 modal_offsets[k],
+                learner_ref.leaves < learner_ref.p.max_leaves as u32,
                 pool,
                 worker_scratch,
             )
@@ -1856,6 +1940,7 @@ mod tests {
                 tok: samples.tok.clone(),
                 val: samples.val.clone(),
             };
+            let mut serial: Option<(LearnedTree, MaSamples)> = None;
             for threads in [1, 4] {
                 let pool = ThreadPool::new(threads);
                 if threads == 4 {
@@ -1903,6 +1988,14 @@ mod tests {
                 );
                 assert_eq!(narrow_rows.tok, wide_rows.tok);
                 assert_eq!(narrow_rows.val, wide_rows.val);
+                if let Some((tree, rows)) = &serial {
+                    assert_tree(&narrow_tree, tree);
+                    assert_eq!(narrow_rows.props, rows.props);
+                    assert_eq!(narrow_rows.tok, rows.tok);
+                    assert_eq!(narrow_rows.val, rows.val);
+                } else {
+                    serial = Some((narrow_tree, narrow_rows));
+                }
             }
             // A genuinely wide set must still learn without clamping values.
             wide.props.map_rows(|row| row[4] *= 100_000);
@@ -2170,6 +2263,7 @@ mod tests {
         let mut push = |prop4: i32, good_pred: usize| {
             let mut props = [0i32; NUM_MA_PROPS];
             props[4] = prop4;
+            props[6] = prop4;
             let mut tok = [0u8; NUM_MA_PREDS];
             for p in 0..NUM_MA_PREDS {
                 // The good predictor has residual 0; all others residual 200.
@@ -2225,6 +2319,7 @@ mod tests {
         assert_eq!(serial.est_bits, tree.est_bits);
         assert_eq!(serial.flat_bits, tree.flat_bits);
         assert!(tree.est_bits < tree.flat_bits);
+        assert!(matches!(tree.nodes[0], MaNode::Split { prop: 4, .. }));
         for i in 0..s.len() {
             let (_, pred) = tree.lookup(&s.props.get(i));
             let expected = if s.props.get(i)[4] < 32 { 1 } else { 5 };

@@ -29,6 +29,7 @@
 
 //! Learned-tree frame and section encoding.
 
+use super::encoder::TreeSearch;
 use super::frame::keep_smaller_writer;
 use super::groups::group_lz_threads;
 use super::header::{write_frame_header_modular_kind, write_patch_dictionary, write_toc_entry};
@@ -40,7 +41,7 @@ use super::ma_local::{LOCAL_TREE_MAX_BITS_PER_VALUE, write_local_tree_sections};
 use super::ma_lookup::MaLookup;
 use super::ma_sampling::tokenize_channel_ma;
 use super::ma_source::{
-    LearnedCandidate, MaChannel, MaPlacement, MaSource, ac_stream_id, with_ma_pixels,
+    LearnedCandidate, MaChannel, MaPlacement, MaSource, MaTransform, ac_stream_id, with_ma_pixels,
 };
 use super::ma_streams::{TreeStreams, VARIANT_WRITE_TOLERANCE, choose_tree_streams};
 use super::palette::write_palette_transform;
@@ -84,9 +85,11 @@ pub(super) fn write_learned_tree_frame(
     wp_params: WpParams,
     use_wp: bool,
     cand: &LearnedCandidate,
-    local_trees: bool,
+    tree_search: TreeSearch,
     writer: &mut BitWriter,
 ) -> f64 {
+    let prune_trailing_lz = matches!(tree_search, TreeSearch::Vector)
+        && matches!(source.transform, MaTransform::Palette { .. });
     let gdim = layout.dim();
     let xsize_groups = xsize.div_ceil(gdim);
     let ysize_groups = ysize.div_ceil(gdim);
@@ -158,6 +161,7 @@ pub(super) fn write_learned_tree_frame(
                 num_ctx as usize + 1,
                 min_symbol,
                 source.deep_lz_max_ratio(),
+                prune_trailing_lz,
                 pool,
                 scratch,
             );
@@ -311,6 +315,7 @@ pub(super) fn write_learned_tree_frame(
             num_ctx as usize + 1,
             min_symbol,
             source.deep_lz_max_ratio(),
+            prune_trailing_lz,
             pool,
             scratch,
         );
@@ -366,7 +371,7 @@ pub(super) fn write_learned_tree_frame(
 
     // Local per-group trees (libjxl's streaming layout) compete on size,
     // whole frame or group by group.
-    let local_gate = local_trees
+    let local_gate = matches!(tree_search, TreeSearch::Full)
         && cand.est_real <= LOCAL_TREE_MAX_BITS_PER_VALUE * source.total_values() as f64;
     if !has_global_stream
         && local_gate

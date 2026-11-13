@@ -242,3 +242,65 @@ pub(crate) mod f32 {
         _mm256_cvttps_epi32(v)
     }
 }
+
+macro_rules! add_scaled {
+    ($name:ident, $features:literal, $update8:expr, $update4:expr, $update1:expr) => {
+        #[target_feature(enable = $features)]
+        pub(crate) fn $name(out: &mut [f32], src: &[f32], factor: f32) {
+            use std::arch::x86_64::*;
+
+            let src = &src[..out.len()];
+            let scale = _mm256_set1_ps(factor);
+            let scale4 = _mm256_castps256_ps128(scale);
+            let update8 = |dst: &mut [core::primitive::f32; 8], src: &[core::primitive::f32; 8]| {
+                let d = dst.as_mut_ptr();
+                // SAFETY: both arrays contain eight elements.
+                unsafe {
+                    let x = _mm256_loadu_ps(src.as_ptr());
+                    _mm256_storeu_ps(d, $update8(scale, x, _mm256_loadu_ps(d)));
+                }
+            };
+            let (out_blocks, out) = out.as_chunks_mut::<8>();
+            let (src_blocks, src) = src.as_chunks::<8>();
+            let (out_pairs, out_blocks) = out_blocks.as_chunks_mut::<2>();
+            let (src_pairs, src_blocks) = src_blocks.as_chunks::<2>();
+            for ([dst0, dst1], [src0, src1]) in out_pairs.iter_mut().zip(src_pairs) {
+                update8(dst0, src0);
+                update8(dst1, src1);
+            }
+            for (dst, src) in out_blocks.iter_mut().zip(src_blocks) {
+                update8(dst, src);
+            }
+            let (out_blocks, out) = out.as_chunks_mut::<4>();
+            let (src_blocks, src) = src.as_chunks::<4>();
+            for (dst, src) in out_blocks.iter_mut().zip(src_blocks) {
+                let d = dst.as_mut_ptr();
+                // SAFETY: both arrays contain four elements.
+                unsafe {
+                    let x = _mm_loadu_ps(src.as_ptr());
+                    _mm_storeu_ps(d, $update4(scale4, x, _mm_loadu_ps(d)));
+                }
+            }
+            for (dst, &input) in out.iter_mut().zip(src) {
+                *dst = $update1(factor, input, *dst);
+            }
+        }
+    };
+}
+
+add_scaled!(
+    add_scaled_avx2,
+    "avx2",
+    |scale, src, dst| _mm256_add_ps(dst, _mm256_mul_ps(scale, src)),
+    |scale, src, dst| _mm_add_ps(dst, _mm_mul_ps(scale, src)),
+    |scale, src, dst| dst + scale * src
+);
+
+#[cfg(feature = "splines")]
+add_scaled!(
+    add_scaled_fma_avx2,
+    "avx2,fma",
+    _mm256_fmadd_ps,
+    _mm_fmadd_ps,
+    core::primitive::f32::mul_add
+);

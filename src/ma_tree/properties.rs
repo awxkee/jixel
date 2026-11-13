@@ -187,13 +187,6 @@ impl MaProperties {
         }
     }
 
-    pub(crate) fn copy_range(&self, range: Range<usize>) -> Self {
-        match self {
-            Self::Narrow(rows) => Self::Narrow(rows[range].to_vec()),
-            Self::Wide(rows) => Self::Wide(rows[range].to_vec()),
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn swap(&mut self, a: usize, b: usize) {
         match self {

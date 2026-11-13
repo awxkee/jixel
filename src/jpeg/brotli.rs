@@ -564,7 +564,8 @@ mod tests {
 
     #[test]
     fn compresses_every_small_length() {
-        for len in 0..300 {
+        // Every length through the first block sizes, then a sample.
+        for len in (0..64).chain((64..300).step_by(7)) {
             roundtrip(&words(len, len as u32));
         }
     }

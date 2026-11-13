@@ -30,7 +30,7 @@
 //! Modular XYB atlases and layered lossless frames.
 
 use super::LosslessSettings;
-use super::encoder::encode_frame_lossless_core;
+use super::encoder::{TreeSearch, encode_frame_lossless_core, encode_frame_lossless_core_impl};
 use super::header::{write_frame_header_modular_xyb_reference, write_toc_entry};
 use super::lz77::{
     LZ77_MIN_SYMBOL, build_lz_pixel_code, lz77_compress_for_speed, write_local_tree_lz77,
@@ -385,12 +385,18 @@ pub(crate) fn encode_frame_lossless_layer(
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) {
-    encode_frame_lossless_core(
+    let tree_search = if speed >= crate::Speed::Slow {
+        TreeSearch::Full
+    } else {
+        TreeSearch::Vector
+    };
+    encode_frame_lossless_core_impl(
         linear,
         Some(alpha),
         LosslessSettings::rgb8(speed, decoding_speed),
         kind,
         true,
+        tree_search,
         pool,
         scratch,
         writer,

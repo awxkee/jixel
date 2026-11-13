@@ -58,8 +58,8 @@ pub(crate) use afv::{afv0_sse41, afv1_sse41, afv2_sse41, afv3_sse41};
 pub(crate) use cfl::{cfl_rd_cost_sse41, cfl_rd_costs_sse41, cfl_rdo_refill_sse41};
 pub(crate) use color::color_matrix_shaper_sse41;
 pub(crate) use dc_ops::{
-    add_scaled_sse41, adjust_b_dc_sse41, compensate_b_dc_sse41, dc_distortion_row_sse41,
-    dc_error_row_sse41, reconstruct_dc_sse41,
+    adjust_b_dc_sse41, compensate_b_dc_sse41, dc_distortion_row_sse41, dc_error_row_sse41,
+    reconstruct_dc_sse41,
 };
 
 pub(crate) use divide::rounded_quotients_sse41;
@@ -90,7 +90,7 @@ pub(crate) use xyb::xyb_lattice_sse41;
 pub(crate) use xyb::{to_linear_rows_sse41, to_xyb_sse41_band};
 
 #[cfg(feature = "splines")]
-pub(crate) use splines::{continuous_idct_sse2, continuous_idct_sse41};
+pub(crate) use splines::{continuous_idct_sse2, continuous_idct_sse41, spline_render_tile_sse2};
 
 #[cfg(feature = "extraslow")]
-pub(crate) use coef_polish::{polish_add_scaled_sse41, polish_count_nonzero_sse41};
+pub(crate) use coef_polish::polish_count_nonzero_sse41;

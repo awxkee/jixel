@@ -45,33 +45,36 @@ mod edge_select;
 mod extend;
 mod filter;
 mod fit;
+#[cfg(target_arch = "aarch64")]
+#[path = "neon/spline_fit.rs"]
+mod fit_neon;
 mod geometry;
 mod lines;
+#[cfg(target_arch = "aarch64")]
+#[path = "neon/splines.rs"]
+mod neon;
 mod render;
 mod select;
+#[cfg(target_arch = "aarch64")]
+#[path = "neon/spline_curve.rs"]
+mod spline_curve_neon;
 mod transform;
 mod trig;
 
-#[cfg(any(
-    all(target_arch = "aarch64", feature = "neon"),
-    all(target_arch = "x86_64", feature = "avx")
-))]
+#[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", feature = "avx")))]
 pub(crate) use detect::{ALONG_PENALTY, MAX_SUBPIXEL_OFFSET, RidgeRow, ridge_row_scalar};
-pub(crate) use detect::{RidgeRowFn, select_ridge_row_fn};
+#[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", feature = "avx")))]
+pub(crate) use filter::{FilterBounds, vertical_row_scalar_tail};
 pub(crate) use fit::FitScratch;
-#[cfg(any(
-    all(target_arch = "aarch64", feature = "neon"),
-    all(target_arch = "x86_64", feature = "avx")
-))]
+#[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", feature = "avx")))]
 pub(crate) use geometry::Segments;
-pub(crate) use geometry::{SegmentDistanceFn, select_segment_distance_fn};
 #[cfg(any(
-    all(target_arch = "aarch64", feature = "neon"),
-    all(target_arch = "x86_64", feature = "avx")
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", feature = "avx"),
+    all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"),
+    all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
 ))]
 pub(crate) use render::Sample;
-pub(crate) use render::{RenderRowFn, select_render_row_fn};
-pub(crate) use transform::{ContinuousIdctFn, select_continuous_idct_fn};
 
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
@@ -81,11 +84,213 @@ use crate::entropy::{
 };
 use crate::image::Image3F;
 use crate::path_order;
+use crate::simd::scaled_add::{AddScaledFn, selected_add_scaled_fn};
+use crate::util::fast_hypot;
+use std::sync::OnceLock;
+
+pub(crate) type FitMatrix = [[f64; fit::MAX_COEFFS]; fit::MAX_COEFFS];
+pub(crate) type FitTargets = [[f64; fit::MAX_COEFFS]; 3];
+type FitAccumulateFn = fn(&mut FitMatrix, &mut FitTargets, &mut [f64; 3], &[f64], [f32; 3]);
+type FitScoreFn = fn(&FitMatrix, &[f64], &[f64]) -> (f64, f64);
+
+/// Spline kernels selected once for the process and shared by every encoder.
+pub(crate) struct SplinesContext {
+    ridge_row: detect::RidgeRowFn,
+    segment_distance: geometry::SegmentDistanceFn,
+    render_row: render::RenderRowFn,
+    render_tile: render::RenderTileFn,
+    continuous_idct: transform::ContinuousIdctFn,
+    dot_contrast: dots::DotContrastFn,
+    /// Fitting and dot templates use a fused erf polynomial on SIMD targets.
+    blob_weight_row: fn(BlobWeightRow, i32, &mut [f32]),
+    add_scaled_f32: AddScaledFn,
+    add_scaled_fma_f32: AddScaledFn,
+    filter_vertical_row: filter::FilterVerticalRowFn,
+    fit_add_scaled: fn(&mut [f64], &[f64], f64),
+    fit_accumulate: FitAccumulateFn,
+    fit_sub_dot: fn(f64, &[f64], &[f64]) -> f64,
+    fit_score: FitScoreFn,
+    #[cfg(any(not(target_arch = "aarch64"), test))]
+    cos: fn(f32) -> f32,
+    sin_cos: fn(f32) -> (f32, f32),
+    atan2: fn(f32, f32) -> f32,
+}
+
+impl SplinesContext {
+    pub(crate) fn get() -> &'static Self {
+        static KERNELS: OnceLock<SplinesContext> = OnceLock::new();
+        KERNELS.get_or_init(Self::resolve)
+    }
+
+    fn resolve() -> Self {
+        let add_scaled_f32 = selected_add_scaled_fn();
+        let kernels = Self {
+            ridge_row: detect::ridge_row_scalar,
+            segment_distance: geometry::segment_distance_scalar,
+            render_row: render::Sample::scalar_row,
+            render_tile: render::Sample::scalar_tile,
+            continuous_idct: transform::continuous_idct_scalar,
+            dot_contrast: dots::dot_contrast_scalar,
+            blob_weight_row: BlobWeightRow::fill_scalar,
+            add_scaled_f32,
+            add_scaled_fma_f32: add_scaled_f32,
+            filter_vertical_row: filter::vertical_row_scalar,
+            fit_add_scaled: fit::add_scaled_scalar,
+            fit_accumulate: fit::accumulate_fit_scalar,
+            fit_sub_dot: fit::sub_dot_scalar,
+            fit_score: fit::fit_score_scalar,
+            #[cfg(any(not(target_arch = "aarch64"), test))]
+            cos: trig::cos_scalar,
+            sin_cos: trig::sin_cos_scalar,
+            atan2: trig::atan2_scalar,
+        };
+
+        #[cfg(target_arch = "aarch64")]
+        let kernels = Self {
+            // SAFETY: NEON is part of the supported AArch64 target baseline.
+            ridge_row: |s, derivatives, out| unsafe {
+                neon::spline_ridge_row_neon(s, derivatives, out)
+            },
+            segment_distance: |p, blocks| unsafe { neon::spline_distance_neon(p, blocks) },
+            render_row: |sample, dy, x, rows, amp| unsafe {
+                neon::spline_render_row_neon(sample, dy, x, rows, amp)
+            },
+            #[cfg(feature = "neon")]
+            render_tile: |sample, tx, ty, bounds, pixels, sign| unsafe {
+                neon::spline_render_tile_neon(sample, tx, ty, bounds, pixels, sign)
+            },
+            continuous_idct: |dct, t| unsafe { neon::continuous_idct_neon(dct, t) },
+            dot_contrast: |src, stride, dst, side, bg, slope| unsafe {
+                neon::dot_contrast_neon(src, stride, dst, side, bg, slope)
+            },
+            blob_weight_row: |row, x, out| unsafe { neon::blob_weight_row_neon(row, x, out) },
+            add_scaled_fma_f32: |dst, src, scale| unsafe {
+                crate::simd::neon_add_scaled::add_scaled_fma_neon(dst, src, scale)
+            },
+            filter_vertical_row: |src, w, bounds, taps, dst| unsafe {
+                neon::vertical_row_neon(src, w, bounds, taps, dst)
+            },
+            fit_add_scaled: |dst, src, scale| unsafe { fit_neon::add_scaled_neon(dst, src, scale) },
+            fit_accumulate: |ata, atb, btb, row, target| unsafe {
+                fit_neon::accumulate_fit_neon(ata, atb, btb, row, target)
+            },
+            fit_sub_dot: |acc, left, right| unsafe { fit_neon::sub_dot_neon(acc, left, right) },
+            fit_score: |ata, rhs, sol| unsafe { fit_neon::fit_score_neon(ata, rhs, sol) },
+            ..kernels
+        };
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let avx_fma = std::arch::is_x86_feature_detected!("avx")
+            && std::arch::is_x86_feature_detected!("fma");
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let kernels = if avx_fma {
+            // SAFETY: these callbacks require AVX and FMA.
+            Self {
+                cos: |x| unsafe { trig::cos_fma(x) },
+                sin_cos: |x| unsafe { trig::sin_cos_fma(x) },
+                atan2: |y, x| unsafe { trig::atan2_fma(y, x) },
+                ..kernels
+            }
+        } else {
+            kernels
+        };
+
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+        let kernels = if std::arch::is_x86_feature_detected!("sse2") {
+            Self {
+                // SAFETY: SSE2 support was checked above.
+                render_tile: |sample, tx, ty, bounds, pixels, sign| unsafe {
+                    crate::sse::spline_render_tile_sse2(sample, tx, ty, bounds, pixels, sign)
+                },
+                ..kernels
+            }
+        } else {
+            kernels
+        };
+
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        let kernels = if avx2 {
+            Self {
+                // SAFETY: these kernels only require AVX2.
+                render_row: |sample, dy, x, rows, amp| unsafe {
+                    crate::avx::spline_render_row_avx2(sample, dy, x, rows, amp)
+                },
+                render_tile: |sample, tx, ty, bounds, pixels, sign| unsafe {
+                    crate::avx::spline_render_tile_avx2(sample, tx, ty, bounds, pixels, sign)
+                },
+                filter_vertical_row: |src, w, bounds, taps, dst| unsafe {
+                    crate::avx::vertical_row_avx2(src, w, bounds, taps, dst)
+                },
+                dot_contrast: |src, stride, dst, side, bg, slope| unsafe {
+                    crate::avx::dot_contrast_avx2(src, stride, dst, side, bg, slope)
+                },
+                ..kernels
+            }
+        } else {
+            kernels
+        };
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if avx_fma && avx2 {
+            use crate::avx;
+            // SAFETY: these callbacks require AVX2 and FMA.
+            return Self {
+                ridge_row: |s, derivatives, out| unsafe {
+                    avx::spline_ridge_row_avx2(s, derivatives, out)
+                },
+                segment_distance: |p, blocks| unsafe { avx::spline_distance_avx2(p, blocks) },
+                continuous_idct: |dct, t| unsafe { avx::continuous_idct_avx2(dct, t) },
+                blob_weight_row: |row, x, out| unsafe { avx::blob_weight_row_avx2(row, x, out) },
+                add_scaled_fma_f32: |dst, src, scale| unsafe {
+                    crate::simd::avx::add_scaled_fma_avx2(dst, src, scale)
+                },
+                fit_add_scaled: |dst, src, scale| unsafe {
+                    avx::add_scaled_f64_avx2(dst, src, scale)
+                },
+                fit_accumulate: |ata, atb, btb, row, target| unsafe {
+                    avx::accumulate_fit_avx2(ata, atb, btb, row, target)
+                },
+                fit_sub_dot: |acc, left, right| unsafe { avx::sub_dot_avx2(acc, left, right) },
+                fit_score: |ata, rhs, sol| unsafe { avx::fit_score_avx2(ata, rhs, sol) },
+                ..kernels
+            };
+        }
+
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+        {
+            if std::arch::is_x86_feature_detected!("sse4.1") {
+                return Self {
+                    continuous_idct: |dct, t| unsafe { crate::sse::continuous_idct_sse41(dct, t) },
+                    ..kernels
+                };
+            }
+            if std::arch::is_x86_feature_detected!("sse2") {
+                return Self {
+                    continuous_idct: |dct, t| unsafe { crate::sse::continuous_idct_sse2(dct, t) },
+                    ..kernels
+                };
+            }
+        }
+
+        #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+        let kernels = Self {
+            continuous_idct: crate::wasm::continuous_idct_wasm,
+            render_tile: crate::wasm::spline_render_tile_wasm,
+            ..kernels
+        };
+        kernels
+    }
+}
 
 /// X, Y, B, sigma.
 static CHANNEL_WEIGHT: [f32; 4] = [0.0042, 0.075, 0.07, 0.3333];
 const Y_TO_X: f32 = 0.0;
 const Y_TO_B: f32 = 1.0;
+
+/// Natural log of the Gaussian render cutoff `10^-5`.
+/// `ln((1/10)^5) = 5 * ln(1/10) = -5 * ln(10)`.
+const LN_RENDER_CUTOFF: f32 = -5.0 * std::f32::consts::LN_10;
 
 /// Frame-global `quantization_adjustment`: the sigma lattice step is
 /// `0.3333 / (1 + adjust / 8)`.
@@ -104,7 +309,7 @@ const MAX_DISTANCE: f32 = 16.0;
 const PALETTE_LIKE_COLORS: usize = 32;
 
 /// A spline control point or sampled position.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Point<T> {
     pub(crate) x: T,
     pub(crate) y: T,
@@ -150,11 +355,6 @@ fn round_isize(value: f32) -> isize {
     biased_for_rounding(value) as isize
 }
 
-#[inline]
-fn fast_hypot(x: f32, y: f32) -> f32 {
-    (x * x + y * y).sqrt()
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct QuantizedSpline {
     pub(crate) points: Vec<Point<i32>>,
@@ -191,12 +391,46 @@ pub(crate) fn fast_erf(x: f32) -> f32 {
     if x <= 0.0 { -r } else { r }
 }
 
+pub(crate) const SPAN_STEPS: [f32; 16] = [
+    0.0, 0.0625, 0.125, 0.1875, 0.25, 0.3125, 0.375, 0.4375, 0.5, 0.5625, 0.625, 0.6875, 0.75,
+    0.8125, 0.875, 0.9375,
+];
+
 pub(crate) fn catmull_rom(control: &[Point<f32>]) -> Vec<Point<f32>> {
     catmull_rom_spans(control, 0..control.len() - 1)
 }
 
 /// Samples only these spans, retaining the surrounding controls for their tangents.
 fn catmull_rom_spans(control: &[Point<f32>], spans: std::ops::Range<usize>) -> Vec<Point<f32>> {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return catmull_rom_spans_with(
+            // SAFETY: AVX2 support was checked above.
+            |q, d, t, out| unsafe { crate::avx::sample_span_avx2(q, d, t, out) },
+            control,
+            spans,
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    let sample_span = |q: &[Point<f32>; 4], d, t, out: &mut Vec<Point<f32>>| {
+        // SAFETY: NEON is part of the supported AArch64 target baseline.
+        unsafe { spline_curve_neon::sample_span_neon(q, d, t, out) }
+    };
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    let sample_span = crate::wasm::sample_span_wasm;
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    )))]
+    let sample_span = sample_span_scalar;
+    catmull_rom_spans_with(sample_span, control, spans)
+}
+
+fn catmull_rom_spans_with(
+    sample_span: impl Fn(&[Point<f32>; 4], [f32; 3], [f32; 4], &mut Vec<Point<f32>>),
+    control: &[Point<f32>],
+    spans: std::ops::Range<usize>,
+) -> Vec<Point<f32>> {
     if control.len() == 1 {
         return vec![control[0]];
     }
@@ -211,7 +445,7 @@ fn catmull_rom_spans(control: &[Point<f32>], spans: std::ops::Range<usize>) -> V
         control[n - 1].x + (control[n - 1].x - control[n - 2].x),
         control[n - 1].y + (control[n - 1].y - control[n - 2].y),
     ));
-    let mut out = Vec::with_capacity(spans.len() * 16 + 1);
+    let mut out = Vec::with_capacity(spans.len() * SPAN_STEPS.len() + 1);
     for q in p.array_windows::<4>().skip(spans.start).take(spans.len()) {
         out.push(q[1]);
         let mut d = [0f32; 3];
@@ -220,33 +454,42 @@ fn catmull_rom_spans(control: &[Point<f32>], spans: std::ops::Range<usize>) -> V
             d[k] = fast_hypot(q[k + 1].x - q[k].x, q[k + 1].y - q[k].y).sqrt();
             t[k + 1] = t[k] + d[k];
         }
-        for i in 1..16 {
-            let tt = d[0] + (i as f32 / 16.0) * d[1];
-            let mut a = [Point::default(); 3];
-            for k in 0..3 {
-                let f = (tt - t[k]) / d[k];
-                a[k] = Point::new(
-                    q[k].x + f * (q[k + 1].x - q[k].x),
-                    q[k].y + f * (q[k + 1].y - q[k].y),
-                );
-            }
-            let mut b = [Point::default(); 2];
-            for k in 0..2 {
-                let f = (tt - t[k]) / (d[k] + d[k + 1]);
-                b[k] = Point::new(
-                    a[k].x + f * (a[k + 1].x - a[k].x),
-                    a[k].y + f * (a[k + 1].y - a[k].y),
-                );
-            }
-            let f = (tt - t[1]) / d[1];
-            out.push(Point::new(
-                b[0].x + f * (b[1].x - b[0].x),
-                b[0].y + f * (b[1].y - b[0].y),
-            ));
-        }
+        sample_span(q, d, t, &mut out);
     }
     out.push(control[spans.end]);
     out
+}
+
+#[cfg(any(
+    test,
+    not(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    ))
+))]
+fn sample_span_scalar(q: &[Point<f32>; 4], d: [f32; 3], t: [f32; 4], out: &mut Vec<Point<f32>>) {
+    let delta: [Point<f32>; 3] =
+        std::array::from_fn(|k| Point::new(q[k + 1].x - q[k].x, q[k + 1].y - q[k].y));
+    let adjacent = [d[0] + d[1], d[1] + d[2]];
+    for &step in &SPAN_STEPS[1..] {
+        let tt = d[0] + step * d[1];
+        let f = (tt - t[1]) / d[1];
+        let a: [Point<f32>; 3] = std::array::from_fn(|k| {
+            let f = if k == 1 { f } else { (tt - t[k]) / d[k] };
+            Point::new(q[k].x + f * delta[k].x, q[k].y + f * delta[k].y)
+        });
+        let b: [Point<f32>; 2] = std::array::from_fn(|k| {
+            let f = (tt - t[k]) / adjacent[k];
+            Point::new(
+                a[k].x + f * (a[k + 1].x - a[k].x),
+                a[k].y + f * (a[k + 1].y - a[k].y),
+            )
+        });
+        out.push(Point::new(
+            b[0].x + f * (b[1].x - b[0].x),
+            b[0].y + f * (b[1].y - b[0].y),
+        ));
+    }
 }
 
 /// One arc sample: position and intensity multiplier.
@@ -313,6 +556,25 @@ pub(crate) fn blob_weight(dx: f32, dy: f32, inv_sigma: f32, amp: f32) -> f32 {
     let e = fast_erf((dist * 0.5 + 0.353_553_39) * inv_sigma)
         - fast_erf((dist * 0.5 - 0.353_553_39) * inv_sigma);
     amp * e * e
+}
+
+/// A horizontal batch with `dx = (x as f32 - center) * step`.
+#[derive(Clone, Copy)]
+pub(crate) struct BlobWeightRow {
+    pub(crate) center: f32,
+    pub(crate) step: f32,
+    pub(crate) dy: f32,
+    pub(crate) inv_sigma: f32,
+    pub(crate) amp: f32,
+}
+
+impl BlobWeightRow {
+    fn fill_scalar(self, x0: i32, weights: &mut [f32]) {
+        for (x, out) in (x0..).zip(weights) {
+            let dx = (x as f32 - self.center) * self.step;
+            *out = blob_weight(dx, self.dy, self.inv_sigma, self.amp);
+        }
+    }
 }
 
 /// Half-open pixel window `(x0, x1, y0, y1)` of an arc sample with the given reach.
@@ -401,7 +663,7 @@ fn priced_order<'a>(chain: &[&'a QuantizedSpline]) -> Vec<&'a QuantizedSpline> {
         .map(|sp| (sp.points[0].x, sp.points[0].y))
         .collect();
     let given = vec![(0..points.len()).collect()];
-    let order = path_order::order_sets(&[points], &[true], given, true);
+    let order = path_order::order_sets(&[points], &[true], given, true, None);
     order[0].iter().map(|&i| chain[i]).collect()
 }
 
@@ -571,7 +833,7 @@ pub(crate) fn find_candidates(
         let chains = lines::split_corners(detect::detect_chains(ctx, scratch, xyb));
         if !chains.is_empty() {
             let extensions = extend::find_extensions(ctx, scratch, xyb, &chains);
-            let long_lines = lines::find_long_lines(&chains);
+            let long_lines = lines::find_long_lines(ctx.spline_kernels, &chains);
             (candidates, groups) = fit::fit_candidates(
                 ctx,
                 scratch,
@@ -585,7 +847,12 @@ pub(crate) fn find_candidates(
         }
     }
     if ctx.dots {
-        candidates.extend(dots::dot_candidates(&ctx.thread_pool, scratch, xyb));
+        candidates.extend(dots::dot_candidates(
+            ctx.spline_kernels,
+            &ctx.thread_pool,
+            scratch,
+            xyb,
+        ));
     }
     (!candidates.is_empty()).then_some(SplineCandidates(candidates, groups))
 }
@@ -653,6 +920,83 @@ mod tests {
     use super::*;
 
     #[test]
+    fn f32_scaled_add_kernels_cover_unaligned_rows_and_tails() {
+        let kernels = SplinesContext::get();
+        #[cfg(not(all(target_arch = "x86_64", feature = "avx")))]
+        let fused = cfg!(target_arch = "aarch64");
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        let fused = std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma");
+        let scale = 0.91f32;
+        let src: [f32; 67] = std::array::from_fn(|i| (i as f32 - 17.0) * 0.071);
+        let dst: [f32; 66] = std::array::from_fn(|i| (i as f32 - 23.0) * 0.083);
+        for len in 0..=64 {
+            for (add, fused) in [
+                (kernels.add_scaled_f32, false),
+                (kernels.add_scaled_fma_f32, fused),
+            ] {
+                let mut actual = dst;
+                let mut expected = dst;
+                add(&mut actual[1..1 + len], &src[2..], scale);
+                for (out, &value) in expected[1..1 + len].iter_mut().zip(&src[2..]) {
+                    *out = if fused {
+                        scale.mul_add(value, *out)
+                    } else {
+                        *out + scale * value
+                    };
+                }
+                assert_eq!(
+                    actual.map(f32::to_bits),
+                    expected.map(f32::to_bits),
+                    "len={len}, fused={fused}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blob_weight_rows_preserve_coordinates_and_tail_values() {
+        let fill = SplinesContext::get().blob_weight_row;
+        for (x0, center, step) in [
+            (-11, 0.0, 1.0),
+            (0, 0.0, 1.0 / 32.0),
+            (16_777_213, 16_777_219.0, 1.0),
+            (
+                crate::encode_image::MAX_DIMENSION as i32 - 111,
+                (crate::encode_image::MAX_DIMENSION - 128) as f32,
+                1.0,
+            ),
+        ] {
+            for inv_sigma in [0.29, 1.4, 4.5] {
+                let row = BlobWeightRow {
+                    center,
+                    step,
+                    dy: -0.75,
+                    inv_sigma,
+                    amp: 0.25 / inv_sigma,
+                };
+                let mut scalar = [0.0; 32];
+                let mut full = [0.0; 32];
+                row.fill_scalar(x0, &mut scalar);
+                fill(row, x0, &mut full);
+                for (i, (&actual, expected)) in full.iter().zip(scalar).enumerate() {
+                    // Fused Horner steps can shift either erf result by a few ulps.
+                    assert!(
+                        (actual - expected).abs() <= 2e-6 * row.amp,
+                        "x0={x0}, lane={i}, inv_sigma={inv_sigma}: {actual} vs {expected}"
+                    );
+                }
+                for len in 0..full.len() {
+                    let mut partial = [f32::NAN; 32];
+                    fill(row, x0, &mut partial[..len]);
+                    assert_eq!(partial[..len], full[..len], "x0={x0}, len={len}");
+                    assert!(partial[len..].iter().all(|x| x.is_nan()));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn coding_order_chains_neighboring_starts() {
         let at = |x: i32, y: i32| QuantizedSpline {
             points: vec![Point::new(x, y), Point::new(x + 30, y)],
@@ -690,6 +1034,51 @@ mod tests {
     }
 
     #[test]
+    fn selected_catmull_rom_matches_scalar_points_and_arc() {
+        for control in [
+            [
+                Point::new(2.0, 7.0),
+                Point::new(11.0, 19.0),
+                Point::new(25.0, 4.0),
+                Point::new(33.0, 18.0),
+            ],
+            [
+                Point::new(16_777_216.0, 16_777_216.0),
+                Point::new(16_777_228.0, 16_777_226.0),
+                Point::new(16_777_232.0, 16_777_218.0),
+                Point::new(16_777_246.0, 16_777_220.0),
+            ],
+            [
+                Point::new(2.0, 7.0),
+                Point::new(11.0, 19.0),
+                Point::new(11.0, 19.0),
+                Point::new(33.0, 18.0),
+            ],
+        ] {
+            let selected = catmull_rom(&control);
+            let scalar = catmull_rom_spans_with(sample_span_scalar, &control, 0..3);
+            let same = |a: f32, b: f32| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+            let same_point = |a: Point<f32>, b: Point<f32>| same(a.x, b.x) && same(a.y, b.y);
+            assert_eq!(selected.len(), scalar.len());
+            assert!(
+                selected
+                    .iter()
+                    .zip(&scalar)
+                    .all(|(&a, &b)| same_point(a, b))
+            );
+            // The arc walker requires positions where adding a one-pixel step can progress.
+            if control[0].x < 1e6 {
+                let selected = equally_spaced(&selected);
+                let scalar = equally_spaced(&scalar);
+                assert_eq!(selected.len(), scalar.len());
+                assert!(selected.iter().zip(&scalar).all(|(a, b)| {
+                    same_point(a.position, b.position) && same(a.multiplier, b.multiplier)
+                }));
+            }
+        }
+    }
+
+    #[test]
     fn local_catmull_rom_spans_match_the_full_curve() {
         let control = [
             Point::new(2.0, 7.0),
@@ -704,7 +1093,7 @@ mod tests {
             for end in start..control.len() {
                 assert_eq!(
                     catmull_rom_spans(&control, start..end),
-                    full[start * 16..=end * 16],
+                    full[start * SPAN_STEPS.len()..=end * SPAN_STEPS.len()],
                     "spans {start}..{end}",
                 );
             }

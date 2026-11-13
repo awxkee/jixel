@@ -35,8 +35,10 @@
 //! the gaps and change sign along the way.
 
 use super::detect::{Chain, MIN_CHAIN_LEN};
-use super::{Point, fast_hypot, sample_curve};
+use super::{Point, SplinesContext, sample_curve};
+use crate::util::fast_hypot;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 const MIN_FRAGMENT: usize = 20;
 /// RMS distance of a fragment's points from its own line.
@@ -58,7 +60,10 @@ struct Line {
 
 impl Line {
     /// Least-squares line through `points`: centroid and principal direction.
-    fn through<'a>(points: impl Iterator<Item = &'a Point<f32>> + Clone) -> Self {
+    fn through<'a>(
+        kernels: &SplinesContext,
+        points: impl Iterator<Item = &'a Point<f32>> + Clone,
+    ) -> Self {
         let n = points.clone().count().max(1) as f32;
         let (mut cx, mut cy) = (0f32, 0f32);
         for p in points.clone() {
@@ -73,8 +78,8 @@ impl Line {
             sxy += dx * dy;
             syy += dy * dy;
         }
-        let angle = 0.5 * super::trig::f_atan2f(2.0 * sxy, sxx - syy);
-        let (sin, cos) = super::trig::f_sincosf(angle);
+        let angle = 0.5 * (kernels.atan2)(2.0 * sxy, sxx - syy);
+        let (sin, cos) = (kernels.sin_cos)(angle);
         Line {
             center: Point::new(cx, cy),
             dir: Point::new(cos, sin),
@@ -97,11 +102,11 @@ struct Fragment {
     line: Line,
 }
 
-fn straight_fragment(index: usize, chain: &Chain) -> Option<Fragment> {
+fn straight_fragment(kernels: &SplinesContext, index: usize, chain: &Chain) -> Option<Fragment> {
     if chain.points.len() < MIN_FRAGMENT {
         return None;
     }
-    let line = Line::through(chain.points.iter());
+    let line = Line::through(kernels, chain.points.iter());
     let sum: f32 = chain.points.iter().map(|&p| line.across(p).powi(2)).sum();
     ((sum / chain.points.len() as f32).sqrt() <= MAX_FRAGMENT_RMS)
         .then_some(Fragment { index, line })
@@ -124,8 +129,11 @@ fn placement(line: &Line, chain: &Chain) -> (f32, f32, f32) {
 }
 
 /// Members ordered along the line, oriented the same way, gaps bridged at 1 px.
-fn join(chains: &[Chain], members: &[usize]) -> Chain {
-    let line = Line::through(members.iter().flat_map(|&m| chains[m].points.iter()));
+fn join(kernels: &SplinesContext, chains: &[Chain], members: &[usize]) -> Chain {
+    let line = Line::through(
+        kernels,
+        members.iter().flat_map(|&m| chains[m].points.iter()),
+    );
     let mut order = members.to_vec();
     order.sort_by(|&a, &b| {
         let mid = |m: usize| line.along(chains[m].points[chains[m].points.len() / 2]);
@@ -312,11 +320,11 @@ pub(super) struct LongLines {
 
 /// Long straight lines among `chains`: groups of collinear fragments, plus long
 /// straight chains that found no partner.
-pub(super) fn find_long_lines(chains: &[Chain]) -> LongLines {
+pub(super) fn find_long_lines(kernels: &SplinesContext, chains: &[Chain]) -> LongLines {
     let mut fragments: Vec<Fragment> = chains
         .iter()
         .enumerate()
-        .filter_map(|(i, c)| straight_fragment(i, c))
+        .filter_map(|(i, c)| straight_fragment(kernels, i, c))
         .collect();
     fragments.sort_by_key(|f| std::cmp::Reverse(chains[f.index].points.len()));
     let index = EndpointIndex::new(chains, &fragments);
@@ -331,7 +339,10 @@ pub(super) fn find_long_lines(chains: &[Chain]) -> LongLines {
         }
         let mut members = vec![seed_index];
         loop {
-            let line = Line::through(members.iter().flat_map(|&m| chains[m].points.iter()));
+            let line = Line::through(
+                kernels,
+                members.iter().flat_map(|&m| chains[m].points.iter()),
+            );
             let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
             for &m in &members {
                 let (a, b, _) = placement(&line, &chains[m]);
@@ -371,7 +382,7 @@ pub(super) fn find_long_lines(chains: &[Chain]) -> LongLines {
         }
         if members.len() >= 2 {
             members.iter().for_each(|&m| used[m] = true);
-            let line = join(chains, &members);
+            let line = join(kernels, chains, &members);
             let observed: usize = members.iter().map(|&m| chains[m].points.len()).sum();
             // Repeated interruptions provide evidence of a crossing line. Do
             // not promote a lone line, a pair, or a mostly invented gap ahead
@@ -490,9 +501,41 @@ const ON_LINE_CELL: f32 = 4.0;
 const MEMBER_SHARE: f32 = 0.6;
 const MEMBER_SAMPLES: usize = 24;
 
+/// Multiplicative hash of a packed cell coordinate. `near` probes nine cells
+/// per query, so SipHash dominated it; membership answers do not depend on
+/// bucket order.
+#[derive(Default)]
+struct CellHasher(u64);
+
+impl Hasher for CellHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("cells hash as one u64");
+    }
+
+    fn write_u64(&mut self, key: u64) {
+        // Fold the high half into the bits hashbrown reads for its control byte.
+        let h = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 29);
+    }
+}
+
+type CellMap = HashMap<u64, Vec<usize>, BuildHasherDefault<CellHasher>>;
+
+#[inline]
+fn cell_key(cx: i32, cy: i32) -> u64 {
+    ((cy as u32 as u64) << 32) | cx as u32 as u64
+}
+
 /// Points with unit tangents, bucketed for "lies on this line" queries.
 pub(super) struct LineIndex {
-    cells: HashMap<(i32, i32), Vec<usize>>,
+    cells: CellMap,
+    /// Cell range holding points, for rejecting far queries without probes.
+    lo: (i32, i32),
+    hi: (i32, i32),
     points: Vec<Point<f32>>,
     tangents: Vec<Point<f32>>,
 }
@@ -519,15 +562,18 @@ pub(super) fn curve_samples(points: &[Point<i32>]) -> (Vec<Point<f32>>, Vec<Poin
 
 impl LineIndex {
     pub(super) fn new(points: &[Point<f32>], tangents: &[Point<f32>]) -> Self {
-        let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        let mut cells = CellMap::default();
+        let (mut lo, mut hi) = ((i32::MAX, i32::MAX), (i32::MIN, i32::MIN));
         for (i, p) in points.iter().enumerate() {
-            cells
-                .entry(((p.x / ON_LINE_CELL) as i32, (p.y / ON_LINE_CELL) as i32))
-                .or_default()
-                .push(i);
+            let (cx, cy) = ((p.x / ON_LINE_CELL) as i32, (p.y / ON_LINE_CELL) as i32);
+            lo = (lo.0.min(cx), lo.1.min(cy));
+            hi = (hi.0.max(cx), hi.1.max(cy));
+            cells.entry(cell_key(cx, cy)).or_default().push(i);
         }
         Self {
             cells,
+            lo,
+            hi,
             points: points.to_vec(),
             tangents: tangents.to_vec(),
         }
@@ -543,9 +589,12 @@ impl LineIndex {
 
     pub(super) fn near(&self, q: Point<f32>, t: Point<f32>) -> bool {
         let (cx, cy) = ((q.x / ON_LINE_CELL) as i32, (q.y / ON_LINE_CELL) as i32);
+        if cx < self.lo.0 - 1 || cx > self.hi.0 + 1 || cy < self.lo.1 - 1 || cy > self.hi.1 + 1 {
+            return false;
+        }
         for dy in -1..=1 {
             for dx in -1..=1 {
-                let Some(list) = self.cells.get(&(cx + dx, cy + dy)) else {
+                let Some(list) = self.cells.get(&cell_key(cx + dx, cy + dy)) else {
                     continue;
                 };
                 for &i in list {
@@ -574,13 +623,28 @@ impl LineIndex {
 
     /// Whether a curve with these samples belongs to this line.
     pub(super) fn holds(&self, positions: &[Point<f32>], tangents: &[Point<f32>]) -> bool {
-        let near = self.count_near(positions, tangents);
-        near as f32 >= MEMBER_SHARE * positions.len() as f32 || near >= MEMBER_SAMPLES
+        let needed = ((MEMBER_SHARE * positions.len() as f32).ceil() as usize).min(MEMBER_SAMPLES);
+        self.has_near(positions, tangents, needed)
     }
 
     /// Whether a curve this long overlaps this line enough to share it.
     pub(super) fn overlaps(&self, positions: &[Point<f32>], tangents: &[Point<f32>]) -> bool {
-        self.count_near(positions, tangents) >= MEMBER_SAMPLES
+        self.has_near(positions, tangents, MEMBER_SAMPLES)
+    }
+
+    fn has_near(&self, positions: &[Point<f32>], tangents: &[Point<f32>], needed: usize) -> bool {
+        if needed == 0 {
+            return true;
+        }
+        if positions.len().min(tangents.len()) < needed {
+            return false;
+        }
+        positions
+            .iter()
+            .zip(tangents)
+            .filter(|&(&q, &t)| self.near(q, t))
+            .nth(needed - 1)
+            .is_some()
     }
 }
 
@@ -588,11 +652,11 @@ impl LineIndex {
 mod tests {
     use super::*;
 
-    fn find_long_lines_reference(chains: &[Chain]) -> Vec<Chain> {
+    fn find_long_lines_reference(kernels: &SplinesContext, chains: &[Chain]) -> Vec<Chain> {
         let mut fragments: Vec<Fragment> = chains
             .iter()
             .enumerate()
-            .filter_map(|(i, c)| straight_fragment(i, c))
+            .filter_map(|(i, c)| straight_fragment(kernels, i, c))
             .collect();
         fragments.sort_by_key(|f| std::cmp::Reverse(chains[f.index].points.len()));
         let mut used = vec![false; chains.len()];
@@ -604,7 +668,10 @@ mod tests {
             }
             let mut members = vec![seed_index];
             loop {
-                let line = Line::through(members.iter().flat_map(|&m| chains[m].points.iter()));
+                let line = Line::through(
+                    kernels,
+                    members.iter().flat_map(|&m| chains[m].points.iter()),
+                );
                 let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
                 for &m in &members {
                     let (a, b, _) = placement(&line, &chains[m]);
@@ -636,7 +703,7 @@ mod tests {
             }
             if members.len() >= 2 {
                 members.iter().for_each(|&m| used[m] = true);
-                lines.push(join(chains, &members));
+                lines.push(join(kernels, chains, &members));
             } else if chains[seed_index].points.len() >= MIN_SINGLE {
                 used[seed_index] = true;
                 lines.push(Chain {
@@ -676,6 +743,7 @@ mod tests {
 
     #[test]
     fn indexed_joining_preserves_original_groups_order_and_geometry() {
+        let kernels = SplinesContext::get();
         for shift in [0.0, 16_777_216.0] {
             let mut chains = Vec::new();
             for row in 0..40 {
@@ -706,8 +774,8 @@ mod tests {
                 segment(60.0, 90.0, -51.0, 0.0),
             ]);
             assert_same_lines(
-                &find_long_lines(&chains).chains,
-                &find_long_lines_reference(&chains),
+                &find_long_lines(kernels, &chains).chains,
+                &find_long_lines_reference(kernels, &chains),
             );
         }
     }
@@ -795,7 +863,7 @@ mod tests {
             segment(200.0, 150.0, 20.0, 0.1),
             segment(80.0, 110.0, 20.0, 0.1),
         ];
-        let lines = find_long_lines(&chains);
+        let lines = find_long_lines(SplinesContext::get(), &chains);
         assert_eq!(lines.chains.len(), 1);
         assert_eq!(lines.joined, [0]);
         let points = &lines.chains[0].points;
@@ -860,8 +928,22 @@ mod tests {
         let index = LineIndex::new(&line, &unit_tangents(&line));
         let run = |points: Vec<Point<f32>>| {
             let tangents = unit_tangents(&points);
-            index.holds(&points, &tangents)
+            let count = index.count_near(&points, &tangents);
+            assert_eq!(index.overlaps(&points, &tangents), count >= MEMBER_SAMPLES);
+            let holds = index.holds(&points, &tangents);
+            assert_eq!(
+                holds,
+                count as f32 >= MEMBER_SHARE * points.len() as f32 || count >= MEMBER_SAMPLES
+            );
+            holds
         };
+        for len in [0, 1, 23, 24, 39, 40, 41, 120] {
+            for inside in 0..=len {
+                run((0..len)
+                    .map(|i| Point::new(i as f32, if i < inside { 50.0 } else { 60.0 }))
+                    .collect());
+            }
+        }
         assert!(run((40..=80).map(|x| Point::new(x as f32, 51.0)).collect()));
         assert!(!run((40..=80)
             .map(|y| Point::new(100.0, y as f32))
@@ -882,15 +964,22 @@ mod tests {
             segment(80.0, 130.0, 24.0, 0.0),
             segment(80.0, 130.0, 0.0, 0.3),
         ];
-        assert!(find_long_lines(&chains).chains.is_empty());
+        assert!(
+            find_long_lines(SplinesContext::get(), &chains)
+                .chains
+                .is_empty()
+        );
     }
 
     #[test]
     fn a_long_straight_chain_is_a_line_on_its_own_and_a_short_one_is_not() {
-        let lines = find_long_lines(&[
-            segment(10.0, 100.0, 30.0, -0.2),
-            segment(10.0, 45.0, 90.0, 0.0),
-        ]);
+        let lines = find_long_lines(
+            SplinesContext::get(),
+            &[
+                segment(10.0, 100.0, 30.0, -0.2),
+                segment(10.0, 45.0, 90.0, 0.0),
+            ],
+        );
         assert_eq!(lines.chains.len(), 1);
         assert_eq!(lines.chains[0].points.len(), 91);
         assert!(lines.joined.is_empty());
@@ -902,11 +991,16 @@ mod tests {
             segment(10.0, 40.0, 20.0, 0.0),
             segment(260.0, 300.0, 20.0, 0.0),
         ];
-        assert!(find_long_lines(&chains).chains.is_empty());
+        assert!(
+            find_long_lines(SplinesContext::get(), &chains)
+                .chains
+                .is_empty()
+        );
     }
 
     #[test]
     fn sparse_joins_and_pairs_keep_the_faint_line_fallback() {
+        let kernels = SplinesContext::get();
         for chains in [
             vec![
                 segment(10.0, 50.0, 20.0, 0.0),
@@ -918,7 +1012,7 @@ mod tests {
                 segment(310.0, 330.0, 20.0, 0.0),
             ],
         ] {
-            let lines = find_long_lines(&chains);
+            let lines = find_long_lines(kernels, &chains);
             assert_eq!(lines.chains.len(), 1);
             assert!(lines.joined.is_empty());
         }

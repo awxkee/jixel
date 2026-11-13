@@ -47,6 +47,7 @@ use crate::inflated_cost::{
     Footprint, ReconCost, ReconDistInput, ReconQuantization, ReconScoring, ReconSource,
     ReconTransform, channel_rd,
 };
+use crate::util::fast_exp;
 
 mod matrix_overhead;
 mod rate_prices;
@@ -295,7 +296,7 @@ impl MergeTuning {
         }
         let var = site_variance(opsin, x0, y0, n).max(1e-9);
         let s = (dirty_log2f(var / SITE_BIAS_V0) / SITE_BIAS_OCTAVES).clamp(-1.0, 1.0);
-        (k * s).exp()
+        fast_exp(k * s)
     }
 
     pub(crate) fn new(distance: f32, arbiter: crate::Arbiter, speed: crate::Speed) -> Self {

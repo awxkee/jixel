@@ -30,7 +30,9 @@
 //! Tests for predictor.
 
 use super::super::lz77::RunLzWriter;
-use super::cost::{SqueezePredictorCost, choose_predictor_for_plane, wp_sample_cost};
+use super::cost::{
+    SqueezePredictorCost, choose_predictor_for_plane, wp_constant_sample_cost, wp_sample_cost,
+};
 use super::tokens::{
     channel_to_context, tokenize_channel_with_wp, tokenize_plane, tokenize_plane_rows,
     tokenize_sample_rows,
@@ -765,14 +767,65 @@ fn directional_wp_presets_are_distinct() {
     }
     let west_costs: Vec<_> = WpParams::PRESETS
         .iter()
-        .map(|&params| wp_sample_cost(|x, y| west[y * W + x], W, H, params).0)
+        .map(|&params| wp_sample_cost(|y| &west[y * W..][..W], W, H, params).0)
         .collect();
     let north_costs: Vec<_> = WpParams::PRESETS
         .iter()
-        .map(|&params| wp_sample_cost(|x, y| north[y * W + x], W, H, params).0)
+        .map(|&params| wp_sample_cost(|y| &north[y * W..][..W], W, H, params).0)
         .collect();
     assert_ne!(west_costs[2], west_costs[3]);
     assert_ne!(north_costs[2], north_costs[3]);
+}
+
+#[test]
+fn wp_sample_cost_matches_point_fetched_corners() {
+    for (width, height) in [(1, 4), (3, 129), (129, 3), (11, 13)] {
+        let plane: Vec<i32> = (0..width * height)
+            .map(|i| ((i * 977 + (i / width) * 619) % 65_536) as i32 - 32_768)
+            .collect();
+        let cw = width.min(128);
+        let ch = height.min(128);
+        for params in WpParams::PRESETS {
+            let mut expected = (0, 0);
+            for y0 in (0..=height - ch).step_by((height - ch).max(1)) {
+                for x0 in (0..=width - cw).step_by((width - cw).max(1)) {
+                    let get = |x, y| plane[(y0 + y) * width + x0 + x];
+                    let mut wp = WpState::with_params(cw, params);
+                    for y in 0..ch {
+                        for x in 0..cw {
+                            let n = predictor_neighbors(&get, x, y, cw);
+                            let value = get(x, y);
+                            let prediction =
+                                wp.predict(x, y, n.top, n.left, n.top_right, n.top_left, n.top_top);
+                            let packed = pack_signed(value.wrapping_sub(prediction as i32));
+                            let (_, extra, _) = crate::entropy::uint_encode(packed);
+                            expected.0 +=
+                                u64::from(extra + 32 - packed.saturating_add(1).leading_zeros());
+                            expected.1 += 1;
+                            wp.update(i64::from(value), x, y);
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                wp_sample_cost(|y| &plane[y * width..][..width], width, height, params),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn wp_constant_sample_cost_matches_all_presets() {
+    for (width, height) in [(1, 1), (1, 5), (9, 1), (17, 8), (129, 2), (3, 129)] {
+        for value in [0, 255, 65_535, i32::MAX] {
+            let row = vec![value; width];
+            let expected = wp_constant_sample_cost(value, width, height);
+            for params in WpParams::PRESETS {
+                assert_eq!(wp_sample_cost(|_| &row, width, height, params), expected);
+            }
+        }
+    }
 }
 
 #[test]

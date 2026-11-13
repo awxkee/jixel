@@ -95,6 +95,8 @@ pub(crate) use float::encode_frame_lossless_float;
 pub(crate) use frame::{encode_frame_lossless, encode_frame_lossless_base};
 pub(crate) use groups::write_single_channel_lz77_section;
 pub(crate) use header::write_patch_dictionary;
+#[cfg(feature = "splines")]
+pub(crate) use header::write_patch_dictionary_with_pool;
 pub(crate) use lz77::LzToken;
 pub(crate) use ma_sampling::{
     DcPlanes, dc_channels, sample_dc_planes, tokenize_dc_channel, walk_dc_planes_predictors,

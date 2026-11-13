@@ -35,6 +35,9 @@ mod polyeval;
 mod sincosf;
 mod sincosf_eval;
 
-pub(super) use atan2f::f_atan2f;
-pub(super) use cosf::f_cosf;
-pub(super) use sincosf::f_sincosf;
+pub(super) use atan2f::atan2_scalar;
+pub(super) use cosf::cos_scalar;
+pub(super) use sincosf::sin_cos_scalar;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(super) use {atan2f::atan2_fma, cosf::cos_fma, sincosf::sin_cos_fma};

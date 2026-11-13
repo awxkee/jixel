@@ -48,32 +48,10 @@ fn fast_cos(x: f32) -> f32 {
     if above { -s2 } else { s2 }
 }
 
-/// Coefficients are interleaved by channel and already multiplied by sqrt(2).
-pub(crate) type ContinuousIdctFn = fn(&[[f32; 4]; 32], f32) -> [f32; 4];
+/// Active frequency rows are interleaved by channel and multiplied by sqrt(2).
+pub(crate) type ContinuousIdctFn = fn(&[[f32; 4]], f32) -> [f32; 4];
 
-pub(crate) fn select_continuous_idct_fn() -> ContinuousIdctFn {
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    return |dct, t| unsafe { crate::neon::continuous_idct_neon(dct, t) };
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-        return |dct, t| unsafe { crate::avx::continuous_idct_avx2(dct, t) };
-    }
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
-    {
-        if std::is_x86_feature_detected!("sse4.1") {
-            return |dct, t| unsafe { crate::sse::continuous_idct_sse41(dct, t) };
-        }
-        if std::is_x86_feature_detected!("sse2") {
-            return |dct, t| unsafe { crate::sse::continuous_idct_sse2(dct, t) };
-        }
-    }
-    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
-    return crate::wasm::continuous_idct_wasm;
-    #[allow(unreachable_code)]
-    continuous_idct_scalar
-}
-
-pub(super) fn continuous_idct_scalar(dct: &[[f32; 4]; 32], t: f32) -> [f32; 4] {
+pub(super) fn continuous_idct_scalar(dct: &[[f32; 4]], t: f32) -> [f32; 4] {
     let mut result = [0.0; 4];
     for (i, row) in dct.iter().enumerate() {
         let arg = std::f32::consts::PI / 32.0 * i as f32 * (t + 0.5);
@@ -102,10 +80,10 @@ mod tests {
                 }
             })
         });
-        let interleaved = std::array::from_fn(|i| {
+        let interleaved: [[f32; 4]; 32] = std::array::from_fn(|i| {
             std::array::from_fn(|c| std::f32::consts::SQRT_2 * channels[c][i])
         });
-        let selected = crate::encoding_context::EncodingContext::default().spline_continuous_idct;
+        let selected = crate::splines::SplinesContext::get().continuous_idct;
         let steps = if cfg!(miri) { 8 } else { 256 };
         for k in 0..=steps {
             let t = 31.0 * k as f32 / steps as f32;
@@ -133,6 +111,29 @@ mod tests {
                         expected
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn continuous_idct_omits_trailing_zeros_bitwise() {
+        let selected = crate::splines::SplinesContext::get().continuous_idct;
+        let mut dct = [[0.0, -0.0, 0.0, -0.0]; 32];
+        for active in 1..=dct.len() {
+            // Move the last nonzero term between all four channels.
+            let i = active - 1;
+            dct[i][i % 4] = if i % 2 == 0 { 0.37 } else { -0.19 };
+            for t in [0.0, 0.13, 1.0, 15.0, 27.375, 31.0] {
+                let expected = continuous_idct_scalar(&dct, t).map(f32::to_bits);
+                assert_eq!(
+                    continuous_idct_scalar(&dct[..active], t).map(f32::to_bits),
+                    expected
+                );
+                assert_eq!(
+                    selected(&dct[..active], t).map(f32::to_bits),
+                    expected,
+                    "active={active}, t={t}"
+                );
             }
         }
     }

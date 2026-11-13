@@ -442,7 +442,7 @@ fn wp_matters(stage: &CoarseLearn) -> bool {
 }
 
 /// Rank the WP presets of `source` by their first-stage learns, starting
-/// from `first` (already learned under `first_params`), the rest in order
+/// from `first` (the result already computed under `first_params`), the rest in order
 /// of how often they win; a preset trailing the best first stage seen by
 /// more than `RANK_COARSE_PRUNE` is dropped. Without `all_presets` only
 /// `first` is scored. Returns (best bits, best coarse bits, preset) and, with
@@ -478,11 +478,12 @@ pub(super) fn rank_presets(
     }
     let mut first = first;
     for preset in order {
-        let stage = match first.take() {
-            Some(stage) => Some(stage),
-            None => rank_coarse(
+        let stage = if preset == first_params {
+            first.take()
+        } else {
+            rank_coarse(
                 source, xsize, ysize, min_symbol, preset, use_wp, layout, sampling, pool, scratch,
-            ),
+            )
         };
         let Some(stage) = stage else {
             continue;

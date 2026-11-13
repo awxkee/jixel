@@ -43,7 +43,7 @@
 //! surviving source is learned in full and written, cheapest first; a source
 //! whose estimate trails the best so far is not written.
 
-use super::{ColorTransform, CoreFrame, SmallestFrame, learned_tree_is_decisive};
+use super::{ColorTransform, CoreFrame, SmallestFrame, TreeSearch, learned_tree_is_decisive};
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::lossless::GroupLayout;
@@ -69,6 +69,10 @@ use crate::weighted_predictor::WpParams;
 /// A learned tree estimated to save at least this fraction over the flat
 /// coder also skips the v1 context-tree and flat frame candidates.
 const MA_ALTERNATIVES_MIN_SAVINGS: f64 = 0.05;
+
+/// A vector frame's global palette must lead by at least 25% at the shared
+/// first-stage budget before the full RGB tree is skipped.
+const VECTOR_PALETTE_MAX_SHARE: f64 = 0.75;
 
 /// What the tournament leaves to the later steps.
 pub(super) struct TreeOutcome {
@@ -104,7 +108,7 @@ pub(super) fn learn_tree_candidates(
     }
     let effort = frame.effort;
 
-    // 5a: the global palette (<= 1024 colors), when the frame has one.
+    // 5a: the global palette, when the frame has one.
     let palette = if effort.tree_global_palette {
         build_global_palette(
             frame.ycocg,
@@ -123,6 +127,10 @@ pub(super) fn learn_tree_candidates(
     let mut sources = SourcePlan::new(frame, wp_params, palette.is_some());
     if effort.tree_rank && matches!(frame.settings.decoding_speed, crate::DecodingSpeed::Slow) {
         sources.rank(frame, color, palette.as_ref(), &layouts, pool, scratch);
+    } else if matches!(frame.tree_search, TreeSearch::Vector)
+        && let Some(palette) = &palette
+    {
+        sources.rank_vector(frame, color, palette, layouts.rank_layout(), pool, scratch);
     }
     sources.keep_reusable_stages(&layouts);
 
@@ -260,6 +268,64 @@ impl SourcePlan {
         }
     }
 
+    /// Vector frames use the same preset and RCT for the ranking and final
+    /// learn. Skip a clearly trailing RGB tree and deepen the palette's
+    /// first stage directly, with both complete encodes still racing close
+    /// scores. The ranking's reduced leaf budget differs on small probes.
+    fn rank_vector(
+        &mut self,
+        frame: &CoreFrame<'_>,
+        color: &mut ColorTransform<'_>,
+        palette: &GlobalPalette,
+        layout: GroupLayout,
+        pool: &ThreadPool,
+        scratch: &mut CoderScratch,
+    ) {
+        let sample = |source: &MaSource<'_>, scratch: &mut CoderScratch| {
+            rank_coarse(
+                source,
+                frame.xsize,
+                frame.ysize,
+                frame.min_symbol,
+                self.wp_params,
+                frame.use_wp,
+                layout,
+                self.rank_sampling,
+                pool,
+                scratch,
+            )
+        };
+        let palette = palette.source(frame.xsize, frame.ysize);
+        if palette.total_values() <= MA_COARSE_TARGET_SAMPLES {
+            return;
+        }
+        let Some(palette_stage) = sample(&palette, scratch)
+            .filter(|stage| stage.samples.len() > MA_COARSE_TARGET_SAMPLES)
+        else {
+            return;
+        };
+        let rct_type = color.rct_type;
+        let planes = color.planes(pool, scratch);
+        let rgb = rgb_ma_source(
+            planes,
+            frame.alpha,
+            frame.xsize,
+            rct_type,
+            frame.alpha_constant,
+            frame.num_color,
+        );
+        if let Some(rgb_stage) = sample(&rgb, scratch) {
+            if palette_stage.candidate.est_real
+                <= VECTOR_PALETTE_MAX_SHARE * rgb_stage.candidate.est_real
+            {
+                self.rgb = false;
+            } else if rgb_stage.samples.len() > MA_COARSE_TARGET_SAMPLES {
+                self.rgb_stage = Some(rgb_stage);
+            }
+        }
+        self.palette_stage = Some(palette_stage);
+    }
+
     /// Ranks the sources by one coarse learn each under the current preset,
     /// then ranks the WP presets of each surviving source and tries the color
     /// transform's runner-up.
@@ -364,7 +430,11 @@ impl SourcePlan {
                     ysize,
                     frame.min_symbol,
                     frame.use_wp,
-                    rgb_stage.take(),
+                    if palette_only {
+                        coarse(&source, self.wp_params, scratch)
+                    } else {
+                        rgb_stage.take()
+                    },
                     self.wp_params,
                     &header_bits,
                     rank_presets_deep,
@@ -383,9 +453,15 @@ impl SourcePlan {
             if let Some((runner_up, cost)) = color.runner_up()
                 && cost <= color.ranked[0].1 * RCT_RANK_MARGIN
             {
-                // One RGB sample set alive at a time: a losing runner-up
-                // leaves the final learn to sample afresh.
-                rgb_stage = None;
+                // The runner-up samples the same number of rows. Keep the
+                // first stage when both sets fit the ranking sample budget
+                // and the final learn can reuse it if the runner-up loses.
+                rgb_stage = rgb_stage.filter(|stage| {
+                    let rows = stage.samples.len();
+                    self.final_sampling == self.rank_sampling
+                        && rows > MA_COARSE_TARGET_SAMPLES
+                        && rows <= self.rank_sampling.0 / 2
+                });
                 let planes = (runner_up != 6)
                     .then(|| rct_planes(color.ycocg, xsize, ysize, runner_up, pool, scratch));
                 let source = rgb_ma_source(
@@ -544,7 +620,7 @@ impl Tournament {
             sources.wp_params,
             frame.use_wp,
             &cand,
-            frame.local_trees,
+            frame.tree_search,
             &mut candidate,
         );
         self.decisive = learned_tree_is_decisive(estimated_savings);
@@ -609,7 +685,7 @@ impl Tournament {
                 sources.palette_wp,
                 frame.use_wp,
                 &cand,
-                frame.local_trees,
+                frame.tree_search,
                 &mut candidate,
             );
             if learned_tree_is_decisive(estimated_savings) {
@@ -674,18 +750,27 @@ impl Tournament {
         // picked the chain on screenshots at +2.7..+3.5 % of the frame).
         let ordered: Vec<Option<palette::LocalPaletteGroup>> =
             pool.steal_map(scratch, grid.num_groups(), |group_index, _scratch| {
-                let mut group = palettes[group_index].clone()?;
-                palette::order_local_palette(&mut group);
-                Some(group)
+                palette::ordered_local_palette(palettes[group_index].as_ref()?)
             });
         let layout = frame.default_layout();
         let mut raced: Option<(MaSource<'_>, CoarseLearn)> = None;
-        for palettes in [&palettes, &ordered] {
+        let has_reordered = ordered.iter().any(Option::is_some);
+        for use_reordered in [false, true]
+            .into_iter()
+            .take(1 + usize::from(has_reordered))
+        {
+            let groups = palettes.iter().zip(&ordered).map(|(original, changed)| {
+                if use_reordered {
+                    changed.as_ref().or(original.as_ref())
+                } else {
+                    original.as_ref()
+                }
+            });
             let mixed = mixed_ma_source(
                 frame.ycocg,
                 frame.alpha,
                 frame.xsize,
-                palettes,
+                groups,
                 frame.alpha_constant,
             );
             let stage = learn_ma_candidate(
@@ -747,7 +832,7 @@ impl Tournament {
             sources.wp_params,
             frame.use_wp,
             &cand,
-            frame.local_trees,
+            frame.tree_search,
             &mut candidate,
         );
         if learned_tree_is_decisive(estimated_savings) {

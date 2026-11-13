@@ -45,23 +45,3 @@ pub(crate) fn polish_count_nonzero_sse41(values: &[i32]) -> usize {
     }
     values.len() - count - values[i..].iter().filter(|&&v| v == 0).count()
 }
-
-/// Separate multiply and add preserve the scalar polish's rounding (no FMA).
-/// The caller must ensure sse4.1 is available.
-#[target_feature(enable = "sse4.1")]
-pub(crate) fn polish_add_scaled_sse41(row: &mut [f32], delta: &[f32], sign: f32) {
-    assert_eq!(row.len(), delta.len());
-    let factor = _mm_set1_ps(sign);
-    let mut i = 0;
-    while i + 4 <= row.len() {
-        let v = unsafe { _mm_loadu_ps(row.as_ptr().add(i)) };
-        let d = unsafe { _mm_loadu_ps(delta.as_ptr().add(i)) };
-        let scaled = _mm_mul_ps(d, factor);
-        let sum = _mm_add_ps(v, scaled);
-        unsafe { _mm_storeu_ps(row.as_mut_ptr().add(i), sum) };
-        i += 4;
-    }
-    for (v, &d) in row[i..].iter_mut().zip(&delta[i..]) {
-        *v += sign * d;
-    }
-}

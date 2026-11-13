@@ -125,7 +125,7 @@ fn edge_view(
         }
     }
     let replaced = match frame_kind {
-        VarDctFrameKind::Patched(references, _) => {
+        VarDctFrameKind::Patched(references, ..) => {
             let mut replaced = vec![false; len];
             for reference in references
                 .iter()
@@ -171,7 +171,7 @@ pub(super) fn encode_frame_core(
         let eligible = ctx.function_fields
             && match frame_kind {
                 VarDctFrameKind::Regular => true,
-                VarDctFrameKind::Patched(references, _) => {
+                VarDctFrameKind::Patched(references, ..) => {
                     references.iter().all(|r| !r.alpha_only && r.ref_frame != 0)
                 }
                 VarDctFrameKind::ReferenceOnly { .. } => false,
@@ -616,7 +616,7 @@ fn encode_frame_core_masks(
                 ..ExtraCoding::default()
             },
             coeff_shifts,
-            VarDctFrameKind::Patched(&plan.references, None),
+            VarDctFrameKind::Patched(&plan.references, None, None),
             #[cfg(feature = "splines")]
             None,
             #[cfg(feature = "splines")]
@@ -780,7 +780,7 @@ struct ExtraCoding<'a> {
 fn color_is_unpatched(frame_kind: VarDctFrameKind<'_>) -> bool {
     match frame_kind {
         VarDctFrameKind::Regular => true,
-        VarDctFrameKind::Patched(references, _) => references.iter().all(|r| r.alpha_only),
+        VarDctFrameKind::Patched(references, ..) => references.iter().all(|r| r.alpha_only),
         VarDctFrameKind::ReferenceOnly { .. } => false,
     }
 }
@@ -996,7 +996,7 @@ fn encode_frame_core_inner(
     }
 
     let patch_luma = match frame_kind {
-        VarDctFrameKind::Patched(references, Some(atlases)) => Some((references, atlases)),
+        VarDctFrameKind::Patched(references, Some(atlases), _) => Some((references, atlases)),
         _ => None,
     };
     // Layer residuals and progressive/DC frames retain the EPF schedule.
@@ -2209,13 +2209,17 @@ fn encode_frame_core_inner(
     let dc_code = dc_code_owned.as_ref();
 
     // Write DC global with adaptive DC code.
-    if let VarDctFrameKind::Patched(references, _) = frame_kind {
-        crate::lossless::write_patch_dictionary(
-            references,
-            alpha.is_some(),
-            scratch,
-            &mut sections[0],
-        );
+    if let VarDctFrameKind::Patched(references, _, dictionary) = frame_kind {
+        if let Some(dictionary) = dictionary.filter(|_| alpha.is_none()) {
+            sections[0].append_bits(dictionary);
+        } else {
+            crate::lossless::write_patch_dictionary(
+                references,
+                alpha.is_some(),
+                scratch,
+                &mut sections[0],
+            );
+        }
     }
     #[cfg(feature = "splines")]
     if let Some(set) = splines {

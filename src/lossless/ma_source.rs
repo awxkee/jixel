@@ -526,14 +526,14 @@ pub(super) fn mixed_ma_source<'a>(
     ycocg: &'a Image3Si,
     alpha: Option<&'a AlphaPlane>,
     xsize: usize,
-    palettes: &'a [Option<palette::LocalPaletteGroup>],
+    palettes: impl IntoIterator<Item = Option<&'a palette::LocalPaletteGroup>>,
     alpha_constant: Option<i32>,
 ) -> MaSource<'a> {
     let mut source = rgb_ma_source(ycocg, alpha, xsize, 6, alpha_constant, 3);
     source.group_channels = palettes
-        .iter()
+        .into_iter()
         .map(|palette| {
-            let palette = palette.as_ref()?;
+            let palette = palette?;
             let num_c = palette.palette.len() / palette.nb_colors;
             Some(MaGroupChannels {
                 channels: vec![

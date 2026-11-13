@@ -36,8 +36,8 @@ use super::{
 use crate::adaptive_quant::dirty_log2f;
 use crate::coder_scratch::{CoderScratch, LZ77_MAX_CONTEXTS, LzEntropyScratch};
 use crate::entropy::{
-    EntropyCode, Histogram, PrefixCode, Token, build_huffman_codes_into, cluster_histograms_fixed,
-    f_log2,
+    EntropyCode, Histogram, HybridUintConfig, PrefixCode, Token, build_huffman_codes_into,
+    cluster_histograms_fixed, f_log2, uint_encode, uint_encode_with_config,
 };
 use crate::thread_pool::ThreadPool;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -58,7 +58,7 @@ pub(super) fn estimate_payload_bits<I>(
     huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
 ) -> u64
 where
-    I: Iterator<Item = LzToken> + Clone,
+    I: Iterator<Item = LzToken>,
 {
     let num_contexts = distance_context as usize + 1;
     assert!(num_contexts <= LZ77_MAX_CONTEXTS);
@@ -66,61 +66,51 @@ where
     grow_entropy_scratch(&mut scratch.prefix_codes, num_contexts, PrefixCode::zero());
     let histograms = &mut scratch.histograms[..num_contexts];
     histograms.fill(Histogram::new());
-    lz_add_histograms(
-        tokens.clone(),
-        None,
-        histograms,
-        LZ77_MIN_SYMBOL,
-        distance_context,
-    );
+    let mut bits = lz_add_histograms(tokens, histograms, LZ77_MIN_SYMBOL, distance_context);
     let codes = &mut scratch.prefix_codes[..num_contexts];
     build_huffman_codes_into(histograms, codes, huffman_pool);
-    let mut bits = 0u64;
-    for token in tokens {
-        if token.is_lz77() {
-            let (symbol, nbits, _) = lz77_length_encode(token.value);
-            bits += codes[token.context as usize].depths[(LZ77_MIN_SYMBOL + symbol) as usize]
-                as u64
-                + nbits as u64;
-            let (symbol, nbits, _) = crate::entropy::uint_encode(token.distance);
-            bits += codes[distance_context as usize].depths[symbol as usize] as u64 + nbits as u64;
-        } else {
-            let (symbol, nbits, _) = crate::entropy::uint_encode(token.value);
-            bits += codes[token.context as usize].depths[symbol as usize] as u64 + nbits as u64;
+    // Every occurrence of a symbol has the same depth. Price each histogram
+    // directly instead of symbolizing the whole stream again.
+    for (histogram, code) in histograms.iter().zip(codes) {
+        if histogram.total_count != 0 {
+            bits += histogram
+                .counts
+                .iter()
+                .zip(&code.depths)
+                .map(|(&count, &depth)| u64::from(count) * u64::from(depth))
+                .sum::<u64>();
         }
     }
     bits
 }
 
-/// `context_map: None` accumulates per raw context (identity), which supports
-/// context counts beyond the u8 map range used after clustering.
+/// Accumulate per raw context before clustering and return the extra bits.
+#[inline]
 fn lz_add_histograms<I>(
     toks: I,
-    context_map: Option<&[u8]>,
     histograms: &mut [Histogram],
     min_symbol: u32,
     distance_context: u32,
-) where
+) -> u64
+where
     I: IntoIterator<Item = LzToken>,
 {
-    let slot = |context: u32| -> usize {
-        match context_map {
-            Some(map) => map[context as usize] as usize,
-            None => context as usize,
-        }
-    };
+    let mut bits = 0;
     for t in toks {
         if t.is_lz77() {
-            let (len_tok, _, _) = lz77_length_encode(t.value);
-            histograms[slot(t.context)].add(min_symbol + len_tok);
+            let (len_tok, length_bits, _) = lz77_length_encode(t.value);
+            histograms[t.context as usize].add(min_symbol + len_tok);
 
-            let (symbol, _, _) = crate::entropy::uint_encode(t.distance);
-            histograms[slot(distance_context)].add(symbol);
+            let (symbol, distance_bits, _) = uint_encode(t.distance);
+            histograms[distance_context as usize].add(symbol);
+            bits += u64::from(length_bits + distance_bits);
         } else {
-            let (sym, _, _) = crate::entropy::uint_encode(t.value);
-            histograms[slot(t.context)].add(sym);
+            let (sym, literal_bits, _) = uint_encode(t.value);
+            histograms[t.context as usize].add(sym);
+            bits += u64::from(literal_bits);
         }
     }
+    bits
 }
 
 /// Materialize literals for paths that own LZ tokens. Learned-tree candidates
@@ -688,6 +678,78 @@ fn compact_clusters_first_use(
     next as usize
 }
 
+fn rebuild_lz_histograms<T: LzTokenSource>(
+    streams: &[&[T]],
+    context_map: &[u8],
+    min_symbol: u32,
+    tail_counts: &[(u32, u32)],
+    pool: Option<&ThreadPool>,
+    configs: &mut [HybridUintConfig],
+    histograms: &mut [Histogram],
+) {
+    let rebuild: Vec<_> = configs
+        .iter()
+        .map(|&config| config != HybridUintConfig::DEFAULT)
+        .collect();
+    if !rebuild.contains(&true) {
+        return;
+    }
+
+    // Keep the clustered default populations until a replacement is both
+    // complete and valid. Validate literals while counting their new symbols.
+    let distance_cluster = context_map[context_map.len() - 1] as usize;
+    let configs_ref: &[HybridUintConfig] = configs;
+    let (new_histograms, valid) = parallel_streams(
+        streams,
+        pool,
+        || (vec![Histogram::new(); configs_ref.len()], rebuild.clone()),
+        |(acc, valid), toks| {
+            for tok in lz_tokens(toks) {
+                let cluster = context_map[tok.context as usize] as usize;
+                if tok.is_lz77() {
+                    if valid[cluster] {
+                        let (length, _, _) = lz77_length_encode(tok.value);
+                        acc[cluster].add(min_symbol + length);
+                    }
+                    if valid[distance_cluster] {
+                        let (symbol, _, _) =
+                            uint_encode_with_config(tok.distance, configs_ref[distance_cluster]);
+                        acc[distance_cluster].add(symbol);
+                    }
+                } else if valid[cluster] {
+                    let (symbol, _, _) = uint_encode_with_config(tok.value, configs_ref[cluster]);
+                    if symbol < min_symbol {
+                        acc[cluster].add(symbol);
+                    } else {
+                        valid[cluster] = false;
+                    }
+                }
+            }
+        },
+        |(acc, valid), (part, part_valid)| {
+            merge_histograms(acc, &part);
+            for (a, b) in valid.iter_mut().zip(part_valid) {
+                *a &= b;
+            }
+        },
+    );
+
+    for (cluster, hist) in new_histograms.into_iter().enumerate() {
+        if valid[cluster] {
+            histograms[cluster] = hist;
+        } else {
+            configs[cluster] = HybridUintConfig::DEFAULT;
+        }
+    }
+    for &(context, count) in tail_counts {
+        let cluster = context_map[context as usize] as usize;
+        if valid[cluster] {
+            histograms[cluster].counts[0] += count;
+            histograms[cluster].total_count += count;
+        }
+    }
+}
+
 // Share entropy setup across iterator adapters while retaining specialized
 // token passes for each token representation.
 #[allow(clippy::too_many_arguments)]
@@ -725,7 +787,9 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
             streams,
             pool,
             || vec![Histogram::new(); num_contexts],
-            |acc, toks| lz_add_histograms(lz_tokens(toks), None, acc, min_symbol, distance_context),
+            |acc, toks| {
+                lz_add_histograms(lz_tokens(toks), acc, min_symbol, distance_context);
+            },
             |acc, part| merge_histograms(acc, &part),
         );
         histograms.clone_from_slice(&summed);
@@ -814,7 +878,14 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
             let strides_ref = &strides;
             let per_stream_values: Vec<Vec<Vec<u32>>> =
                 map_streams_indexed(streams, pool, |s, toks| {
-                    let mut ordinal = offsets[s].clone();
+                    let mut remaining: Vec<_> = offsets[s]
+                        .iter()
+                        .zip(strides_ref)
+                        .map(|(&offset, &stride)| {
+                            let phase = offset % stride;
+                            if phase == 0 { 0 } else { stride - phase }
+                        })
+                        .collect();
                     let mut local: Vec<Vec<u32>> = vec![Vec::new(); num_clusters];
                     for tok in lz_tokens(toks) {
                         let (cluster, value) = if tok.is_lz77() {
@@ -822,10 +893,12 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
                         } else {
                             (context_map_ref[tok.context as usize] as usize, tok.value)
                         };
-                        if ordinal[cluster].is_multiple_of(strides_ref[cluster]) {
+                        if remaining[cluster] == 0 {
                             local[cluster].push(value);
+                            remaining[cluster] = strides_ref[cluster] - 1;
+                        } else {
+                            remaining[cluster] -= 1;
                         }
-                        ordinal[cluster] += 1;
                     }
                     local
                 });
@@ -854,75 +927,15 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
                 }
             });
         }
-        // Validate every literal against the chosen config, including values
-        // outside the sampled ordinals. No duplicate literal vector is needed.
-        let configs_ref: &[crate::entropy::HybridUintConfig] = configs;
-        let valid = parallel_streams(
+        rebuild_lz_histograms(
             streams,
+            context_map_ref,
+            min_symbol,
+            &tail_counts,
             pool,
-            || vec![true; num_clusters],
-            |acc, toks| {
-                for tok in lz_tokens(toks) {
-                    if !tok.is_lz77() {
-                        let cluster = context_map_ref[tok.context as usize] as usize;
-                        if acc[cluster]
-                            && crate::entropy::uint_encode_with_config(
-                                tok.value,
-                                configs_ref[cluster],
-                            )
-                            .0 >= min_symbol
-                        {
-                            acc[cluster] = false;
-                        }
-                    }
-                }
-            },
-            |acc, part| {
-                for (a, b) in acc.iter_mut().zip(part) {
-                    *a &= b;
-                }
-            },
+            configs,
+            histograms,
         );
-        for (config, valid) in configs.iter_mut().zip(valid) {
-            if !valid {
-                *config = crate::entropy::HybridUintConfig::DEFAULT;
-            }
-        }
-        let configs_ref: &[crate::entropy::HybridUintConfig] = configs;
-        let summed = parallel_streams(
-            streams,
-            pool,
-            || vec![Histogram::new(); num_clusters],
-            |acc, toks| {
-                for tok in lz_tokens(toks) {
-                    if tok.is_lz77() {
-                        let (len_tok, _, _) = lz77_length_encode(tok.value);
-                        acc[context_map_ref[tok.context as usize] as usize]
-                            .add(min_symbol + len_tok);
-                        let cluster = context_map_ref[distance_context as usize] as usize;
-                        let (symbol, _, _) = crate::entropy::uint_encode_with_config(
-                            tok.distance,
-                            configs_ref[cluster],
-                        );
-                        acc[cluster].add(symbol);
-                    } else {
-                        let cluster = context_map_ref[tok.context as usize] as usize;
-                        let (symbol, _, _) = crate::entropy::uint_encode_with_config(
-                            tok.value,
-                            configs_ref[cluster],
-                        );
-                        acc[cluster].add(symbol);
-                    }
-                }
-            },
-            |acc, part| merge_histograms(acc, &part),
-        );
-        histograms.clone_from_slice(&summed);
-        for &(context, count) in &tail_counts {
-            let cluster = context_map_ref[context as usize] as usize;
-            histograms[cluster].counts[0] += count;
-            histograms[cluster].total_count += count;
-        }
     } else {
         configs.fill(crate::entropy::HybridUintConfig::DEFAULT);
     }
@@ -1002,5 +1015,78 @@ fn finish_lz_entropy<'a>(
         ans_histograms: &ans.histograms,
         ans_symbols: &ans.symbols,
         ans_reverse_maps: &ans.reverse_maps,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refined_histograms_keep_default_clusters_when_a_literal_is_invalid() {
+        let first = [
+            LzToken::pixel(0, 31),
+            LzToken::lz77(0, 20, 150),
+            LzToken::pixel(1, 12),
+            LzToken::pixel(2, 3),
+        ];
+        let second = [LzToken::pixel(1, 64), LzToken::pixel(0, 60)];
+        let streams = [first.as_slice(), second.as_slice()];
+        let mut defaults = vec![Histogram::new(); 4];
+        lz_add_histograms(first.into_iter().chain(second), &mut defaults, 64, 3);
+        let distance = defaults.pop().unwrap();
+        merge_histograms(&mut defaults[1..2], &[distance]);
+        let tails = [(0, 5), (2, 7)];
+        for (context, count) in tails {
+            defaults[context as usize].counts[0] += count;
+            defaults[context as usize].total_count += count;
+        }
+        let accepted = HybridUintConfig {
+            split_exponent: 5,
+            msb_in_token: 0,
+            lsb_in_token: 0,
+        };
+        let rejected = HybridUintConfig {
+            split_exponent: 6,
+            msb_in_token: 1,
+            lsb_in_token: 0,
+        };
+        let pool = ThreadPool::new_lossless(2);
+        for pool in [None, Some(&pool)] {
+            let mut histograms = defaults.clone();
+            let mut configs = [accepted, rejected, HybridUintConfig::DEFAULT];
+            rebuild_lz_histograms(
+                &streams,
+                &[0, 1, 2, 1],
+                64,
+                &tails,
+                pool,
+                &mut configs,
+                &mut histograms,
+            );
+            assert_eq!(
+                configs,
+                [
+                    accepted,
+                    HybridUintConfig::DEFAULT,
+                    HybridUintConfig::DEFAULT
+                ],
+            );
+            let mut expected = Histogram::new();
+            expected.counts[0] = 5;
+            expected.total_count = 5;
+            for symbol in [31, 32, 80] {
+                expected.add(symbol);
+            }
+            assert_eq!(histograms[0].counts, expected.counts);
+            assert_eq!(histograms[0].total_count, expected.total_count);
+            for cluster in [1, 2] {
+                assert_eq!(histograms[cluster].counts, defaults[cluster].counts);
+                assert_eq!(
+                    histograms[cluster].total_count,
+                    defaults[cluster].total_count
+                );
+            }
+        }
     }
 }

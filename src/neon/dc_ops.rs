@@ -482,21 +482,3 @@ pub(crate) fn dc_distortion_row_neon(
     }
     sum
 }
-
-#[target_feature(enable = "neon")]
-pub(crate) fn add_scaled_neon(out: &mut [f32], src: &[f32], factor: f32) {
-    assert!(src.len() >= out.len());
-    let end = out.len() / 4 * 4;
-    for x in (0..end).step_by(4) {
-        unsafe {
-            vst1q_f32(
-                out.as_mut_ptr().add(x),
-                vaddq_f32(
-                    vld1q_f32(out.as_ptr().add(x)),
-                    vmulq_f32(vdupq_n_f32(factor), vld1q_f32(src.as_ptr().add(x))),
-                ),
-            );
-        }
-    }
-    crate::dc_ops::add_scaled_scalar(&mut out[end..], &src[end..], factor);
-}

@@ -155,47 +155,24 @@ fn atan2f_gen_impl<Q: Fn(f64, f64, f64) -> f64>(y: f32, x: f32, fma: Q) -> f32 {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx", enable = "fma")]
-unsafe fn atan2f_fma_impl(y: f32, x: f32) -> f32 {
+pub(in crate::splines) unsafe fn atan2_fma(y: f32, x: f32) -> f32 {
     atan2f_gen_impl(y, x, f64::mul_add)
 }
 
 /// Computes atan2
 ///
 /// Max found ULP 0.49999842
-#[inline]
-pub(crate) fn f_atan2f(y: f32, x: f32) -> f32 {
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    {
-        atan2f_gen_impl(y, x, f_fmla)
-    }
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        use std::sync::OnceLock;
-        static EXECUTOR: OnceLock<unsafe fn(f32, f32) -> f32> = OnceLock::new();
-        let q = EXECUTOR.get_or_init(|| {
-            if std::arch::is_x86_feature_detected!("avx")
-                && std::arch::is_x86_feature_detected!("fma")
-            {
-                atan2f_fma_impl
-            } else {
-                fn def_atan2f(y: f32, x: f32) -> f32 {
-                    atan2f_gen_impl(y, x, f_fmla)
-                }
-                def_atan2f
-            }
-        });
-        // SAFETY: the AVX/FMA implementation is selected only after checking
-        // both features; the fallback requires no additional CPU features.
-        unsafe { q(y, x) }
-    }
+pub(in crate::splines) fn atan2_scalar(y: f32, x: f32) -> f32 {
+    atan2f_gen_impl(y, x, f_fmla)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::splines::SplinesContext;
 
     #[test]
     fn f_atan2_test() {
+        let f_atan2f = SplinesContext::get().atan2;
         assert_eq!(
             f_atan2f(
                 0.000000000000000000000000000000000000017907922,
