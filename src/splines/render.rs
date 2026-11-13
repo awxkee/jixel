@@ -2,15 +2,17 @@
 //! original order, including when a trial renders only a sparse set of blocks.
 
 use super::{
-    CHANNEL_WEIGHT, PixelBox, Point, QuantizedSpline, Y_TO_B, Y_TO_X, adjusted_quant, blob_weight,
-    blob_window, sample_curve,
+    CHANNEL_WEIGHT, LN_RENDER_CUTOFF, PixelBox, Point, QuantizedSpline, Y_TO_B, Y_TO_X,
+    adjusted_quant, blob_weight, blob_window, sample_curve,
 };
 use crate::adaptive_quant::dirty_log2f;
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
+use crate::simd::scaled_add::{AddScaledFn, add_scaled_scalar};
 use std::sync::Arc;
 
 struct DotPlacement {
+    add_scaled: AddScaledFn,
     template: Arc<super::dots::DotTemplate>,
     x0: i32,
     y0: i32,
@@ -26,8 +28,11 @@ impl DotPlacement {
         };
         let start = (y as i32 - self.y0) as usize * side + (x as i32 - self.x0) as usize;
         for (row, source) in rows.into_iter().zip(planes.chunks_exact(side * side)) {
-            for (out, &v) in row.iter_mut().zip(&source[start..]) {
-                *out += sign * v;
+            let src = &source[start..][..row.len()];
+            if row.len() < 8 {
+                add_scaled_scalar(row, src, sign);
+            } else {
+                (self.add_scaled)(row, src, sign);
             }
         }
     }
@@ -62,21 +67,6 @@ impl Sample {
 
 pub(crate) type RenderRowFn = fn(&Sample, f32, usize, [&mut [f32]; 3], f32);
 
-pub(crate) fn select_render_row_fn() -> RenderRowFn {
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    return |sample, dy, x0, rows, amp| unsafe {
-        crate::neon::spline_render_row_neon(sample, dy, x0, rows, amp)
-    };
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-        return |sample, dy, x0, rows, amp| unsafe {
-            crate::avx::spline_render_row_avx2(sample, dy, x0, rows, amp)
-        };
-    }
-    #[allow(unreachable_code)]
-    Sample::scalar_row
-}
-
 pub(super) struct RenderPlan {
     samples: Vec<Sample>,
     dot: Option<DotPlacement>,
@@ -97,7 +87,10 @@ impl RenderPlan {
             return Self::dot(
                 ctx,
                 sp,
-                Arc::new(super::dots::DotTemplate::new(super::dots::template_key(sp))),
+                Arc::new(super::dots::DotTemplate::new(
+                    ctx.spline_kernels,
+                    super::dots::template_key(sp),
+                )),
                 w,
                 h,
             );
@@ -125,19 +118,18 @@ impl RenderPlan {
             dot: None,
             bounds: None,
             width: w,
-            row: ctx.spline_render_row,
+            row: ctx.spline_kernels.render_row,
         };
         if arc <= 0.0 {
             return plan;
         }
         plan.samples.reserve(samples.len());
-        let continuous_idct = ctx.spline_continuous_idct;
+        let continuous_idct = ctx.spline_kernels.continuous_idct;
         let constant = dct[1..]
             .iter()
             .flatten()
             .all(|&coefficient| coefficient == 0.0)
             .then(|| continuous_idct(&dct, 0.0));
-        let r = 0.1f32.ln() * 5.0;
         for (k, sample) in samples.iter().enumerate() {
             let Point { x: cx, y: cy } = sample.position;
             let mult = sample.multiplier;
@@ -153,9 +145,11 @@ impl RenderPlan {
             for c in color {
                 max_color = max_color.max((c * mult).abs());
             }
-            let reach =
-                (-2.0 * sigma * sigma * (r - dirty_log2f(max_color) * std::f32::consts::LN_2))
-                    .sqrt();
+            let reach = (-2.0
+                * sigma
+                * sigma
+                * (LN_RENDER_CUTOFF - dirty_log2f(max_color) * std::f32::consts::LN_2))
+                .sqrt();
             let (x0, x1, y0, y1) = blob_window(cx, cy, reach, w, h);
             if x0 >= x1 || y0 >= y1 {
                 continue;
@@ -217,7 +211,7 @@ impl RenderPlan {
             dot: None,
             bounds: None,
             width: w,
-            row: ctx.spline_render_row,
+            row: ctx.spline_kernels.render_row,
         };
         let left = x0.clamp(0, w as i32) as usize;
         let top = y0.clamp(0, h as i32) as usize;
@@ -226,6 +220,7 @@ impl RenderPlan {
         if (!quantized || !template.empty) && left < right && top < bottom {
             plan.bounds = Some((left, top, right - 1, bottom - 1));
             plan.dot = Some(DotPlacement {
+                add_scaled: ctx.spline_kernels.add_scaled_f32,
                 template,
                 x0,
                 y0,
@@ -435,8 +430,10 @@ mod tests {
             // The bright, wide case also exercises heap scratch for templates
             // larger than the constructor's inline capacity.
             for level in [3, 10, 17, 30] {
-                let template =
-                    Arc::new(super::super::dots::DotTemplate::new((sigma, level, -3, 2)));
+                let template = Arc::new(super::super::dots::DotTemplate::new(
+                    ctx.spline_kernels,
+                    (sigma, level, -3, 2),
+                ));
                 for y in 0..8 {
                     for x in 0..8 {
                         let mut sp = QuantizedSpline {
@@ -447,7 +444,10 @@ mod tests {
                         sp.dct[1][0] = level;
                         sp.dct[0][0] = -3;
                         sp.dct[2][0] = 2;
-                        let atlas = super::super::dots::build_dot_patches(&[sp.clone()]);
+                        let atlas = super::super::dots::build_dot_patches(
+                            ctx.spline_kernels,
+                            &[sp.clone()],
+                        );
                         let mut expected = Image3F::new(w, h);
                         for reference in atlas.references() {
                             for (px, py) in reference.positions {
@@ -529,7 +529,7 @@ mod tests {
                                 sample.amp,
                             );
                             let [rx, ry, rb] = &mut actual;
-                            (ctx.spline_render_row)(
+                            (ctx.spline_kernels.render_row)(
                                 &sample,
                                 dy,
                                 x0,
@@ -573,7 +573,7 @@ mod tests {
                 dot: None,
                 bounds: None,
                 width,
-                row: ctx.spline_render_row,
+                row: ctx.spline_kernels.render_row,
             };
             for i in 0..count {
                 let (x, y) = if i % 2 == 0 {
@@ -721,7 +721,7 @@ mod tests {
             for c in color {
                 max_color = max_color.max((c * mult).abs());
             }
-            let reach = (-2.0 * sigma * sigma * (0.1f32.ln() * 5.0 - max_color.ln())).sqrt();
+            let reach = (-2.0 * sigma * sigma * (LN_RENDER_CUTOFF - max_color.ln())).sqrt();
             let (x0, x1, y0, y1) = blob_window(cx, cy, reach, w, h);
             if x0 >= x1 || y0 >= y1 {
                 continue;

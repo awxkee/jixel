@@ -449,6 +449,7 @@ fn llf_from_dc(ctx: &EncodingContext, strategy: u8) -> Option<&'static [f32]> {
         [const { OnceLock::new() }; NUM_STRATEGIES];
     TABLES[strategy as usize]
         .get_or_init(|| {
+            let add_scaled = ctx.spline_kernels.add_scaled_fma_f32;
             let (cov_x, cov_y) = (
                 AcStrategyImage::covered_blocks_x_of(strategy),
                 AcStrategyImage::covered_blocks_y_of(strategy),
@@ -515,14 +516,8 @@ fn llf_from_dc(ctx: &EncodingContext, strategy: u8) -> Option<&'static [f32]> {
                         continue;
                     }
 
-                    for ((value, inv_value), (&pivot_value, &pivot_inv_value)) in row
-                        .iter_mut()
-                        .zip(inverse_row)
-                        .zip(pivot.iter().zip(pivot_inverse.iter()))
-                    {
-                        *value -= factor * pivot_value;
-                        *inv_value -= factor * pivot_inv_value;
-                    }
+                    add_scaled(row, pivot, -factor);
+                    add_scaled(inverse_row, pivot_inverse, -factor);
                 }
             }
             Some(inverse)

@@ -115,7 +115,7 @@ impl Polyline {
             blocks,
             bounds,
             len,
-            distance_blocks: ctx.spline_distance,
+            distance_blocks: ctx.spline_kernels.segment_distance,
         }
     }
 
@@ -212,18 +212,7 @@ impl Segments {
 
 pub(crate) type SegmentDistanceFn = fn(Point<f32>, &[Segments]) -> f32;
 
-pub(crate) fn select_segment_distance_fn() -> SegmentDistanceFn {
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    return |point, blocks| unsafe { crate::neon::spline_distance_neon(point, blocks) };
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-        return |point, blocks| unsafe { crate::avx::spline_distance_avx2(point, blocks) };
-    }
-    #[allow(unreachable_code)]
-    segment_distance_scalar
-}
-
-fn segment_distance_scalar(p: Point<f32>, blocks: &[Segments]) -> f32 {
+pub(super) fn segment_distance_scalar(p: Point<f32>, blocks: &[Segments]) -> f32 {
     let mut best = f32::INFINITY;
     for block in blocks {
         for lane in 0..4 {

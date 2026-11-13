@@ -802,7 +802,7 @@ impl PreparedVarDct {
             }
             return;
         }
-        let plan = dots::build_dot_patches(&selected);
+        let plan = dots::build_dot_patches(ctx.spline_kernels, &selected);
         let atlas_alpha = zero_alpha_for_lossy(alpha, plan.width * plan.height);
         crate::lossless::encode_modular_xyb_atlas_tree_slot(
             &plan.atlas,

@@ -42,23 +42,3 @@ pub(crate) fn polish_count_nonzero_avx2(values: &[i32]) -> usize {
     }
     values.len() - count - values[i..].iter().filter(|&&v| v == 0).count()
 }
-
-/// Separate multiply and add preserve the scalar polish's rounding (no FMA).
-/// The caller must ensure avx2 is available.
-#[target_feature(enable = "avx2")]
-pub(crate) fn polish_add_scaled_avx2(row: &mut [f32], delta: &[f32], sign: f32) {
-    assert_eq!(row.len(), delta.len());
-    let factor = _mm256_set1_ps(sign);
-    let mut i = 0;
-    while i + 8 <= row.len() {
-        let v = unsafe { _mm256_loadu_ps(row.as_ptr().add(i)) };
-        let d = unsafe { _mm256_loadu_ps(delta.as_ptr().add(i)) };
-        let scaled = _mm256_mul_ps(d, factor);
-        let sum = _mm256_add_ps(v, scaled);
-        unsafe { _mm256_storeu_ps(row.as_mut_ptr().add(i), sum) };
-        i += 8;
-    }
-    for (v, &d) in row[i..].iter_mut().zip(&delta[i..]) {
-        *v += sign * d;
-    }
-}

@@ -33,11 +33,12 @@
 //! are sent to fitting; all original candidates keep their original targets.
 
 use super::detect::Chain;
-use super::{Point, fast_hypot, round_isize};
+use super::{Point, round_isize};
 use crate::coder_scratch::CoderScratch;
 use crate::dct::fmla;
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
+use crate::util::fast_hypot;
 
 const CHUNK: usize = 8;
 const MAX_CHUNKS: usize = 32;

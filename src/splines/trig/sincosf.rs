@@ -30,8 +30,10 @@ use super::common::f_fmla;
 use super::polyeval::f_estrin_polyeval5;
 use super::sincosf_eval::sincosf_eval;
 
-#[inline(always)]
-fn sincosf_gen_impl(x: f32) -> (f32, f32) {
+/// Sine and cosine
+///
+/// Max found ULP on working range 0.49999967
+pub(in crate::splines) fn sin_cos_scalar(x: f32) -> (f32, f32) {
     let x_abs = x.to_bits() & 0x7fff_ffffu32;
     let xd = x as f64;
 
@@ -125,7 +127,7 @@ fn sincosf_gen_impl(x: f32) -> (f32, f32) {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx", enable = "fma")]
-unsafe fn sincosf_fma_impl(x: f32) -> (f32, f32) {
+pub(in crate::splines) unsafe fn sin_cos_fma(x: f32) -> (f32, f32) {
     let x_abs = x.to_bits() & 0x7fff_ffffu32;
     let xd = x as f64;
 
@@ -205,40 +207,13 @@ unsafe fn sincosf_fma_impl(x: f32) -> (f32, f32) {
     (sf, cf)
 }
 
-/// Sine and cosine
-///
-/// Max found ULP on working range 0.49999967
-#[inline]
-pub(crate) fn f_sincosf(x: f32) -> (f32, f32) {
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    {
-        sincosf_gen_impl(x)
-    }
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        use std::sync::OnceLock;
-        static EXECUTOR: OnceLock<unsafe fn(f32) -> (f32, f32)> = OnceLock::new();
-        let q = EXECUTOR.get_or_init(|| {
-            if std::arch::is_x86_feature_detected!("avx")
-                && std::arch::is_x86_feature_detected!("fma")
-            {
-                sincosf_fma_impl
-            } else {
-                sincosf_gen_impl
-            }
-        });
-        // SAFETY: the AVX/FMA implementation is selected only after checking
-        // both features; the fallback requires no additional CPU features.
-        unsafe { q(x) }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::splines::SplinesContext;
 
     #[test]
     fn f_sincosf_test() {
+        let f_sincosf = SplinesContext::get().sin_cos;
         let sincos0 = f_sincosf(0.0);
         assert!(sincos0.0 < 1e-8);
         assert_eq!(sincos0.1, 1.0);
@@ -256,6 +231,7 @@ mod tests {
 
     #[test]
     fn f_sincosf_edge_test() {
+        let f_sincosf = SplinesContext::get().sin_cos;
         let s0 = f_sincosf(f32::INFINITY);
         assert!(s0.0.is_nan());
         assert!(s0.1.is_nan());

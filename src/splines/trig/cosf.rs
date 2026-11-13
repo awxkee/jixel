@@ -30,8 +30,8 @@ use super::common::f_fmla;
 use super::polyeval::f_polyeval5;
 use super::sincosf_eval::sincosf_eval;
 
-#[inline(always)]
-fn cosf_gen_impl(x: f32) -> f32 {
+/// Computes cosine with a 0.5 ULP error bound.
+pub(in crate::splines) fn cos_scalar(x: f32) -> f32 {
     let x_abs = x.to_bits() & 0x7fff_ffffu32;
     let x = f32::from_bits(x_abs);
     let xd = x as f64;
@@ -105,7 +105,7 @@ fn cosf_gen_impl(x: f32) -> f32 {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx", enable = "fma")]
-unsafe fn cosf_fma_impl(x: f32) -> f32 {
+pub(in crate::splines) unsafe fn cos_fma(x: f32) -> f32 {
     let x_abs = x.to_bits() & 0x7fff_ffffu32;
     let x = f32::from_bits(x_abs);
     let xd = x as f64;
@@ -162,41 +162,13 @@ unsafe fn cosf_fma_impl(x: f32) -> f32 {
     ) as f32
 }
 
-/// Computes cosine function
-///
-/// ULP 0.5
-///
-#[inline]
-pub(crate) fn f_cosf(x: f32) -> f32 {
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    {
-        cosf_gen_impl(x)
-    }
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        use std::sync::OnceLock;
-        static EXECUTOR: OnceLock<unsafe fn(f32) -> f32> = OnceLock::new();
-        let q = EXECUTOR.get_or_init(|| {
-            if std::arch::is_x86_feature_detected!("avx")
-                && std::arch::is_x86_feature_detected!("fma")
-            {
-                cosf_fma_impl
-            } else {
-                cosf_gen_impl
-            }
-        });
-        // SAFETY: the AVX/FMA implementation is selected only after checking
-        // both features; the fallback requires no additional CPU features.
-        unsafe { q(x) }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::splines::SplinesContext;
 
     #[test]
     fn f_cosf_test() {
+        let f_cosf = SplinesContext::get().cos;
         assert_eq!(f_cosf(0.0), 1.0);
         assert_eq!(f_cosf(std::f32::consts::PI), -1f32);
         assert_eq!(f_cosf(0.5), 0.87758255);

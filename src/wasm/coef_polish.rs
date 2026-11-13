@@ -41,23 +41,3 @@ pub(crate) fn polish_count_nonzero_wasm(values: &[i32]) -> usize {
     }
     values.len() - count - values[i..].iter().filter(|&&v| v == 0).count()
 }
-
-/// Separate multiply and add preserve the scalar polish's rounding (no FMA).
-/// The caller must ensure simd128 is available.
-#[target_feature(enable = "simd128")]
-pub(crate) fn polish_add_scaled_wasm(row: &mut [f32], delta: &[f32], sign: f32) {
-    assert_eq!(row.len(), delta.len());
-    let factor = f32x4_splat(sign);
-    let mut i = 0;
-    while i + 4 <= row.len() {
-        let v = unsafe { v128_load(row.as_ptr().add(i).cast()) };
-        let d = unsafe { v128_load(delta.as_ptr().add(i).cast()) };
-        let scaled = f32x4_mul(d, factor);
-        let sum = f32x4_add(v, scaled);
-        unsafe { v128_store(row.as_mut_ptr().add(i).cast(), sum) };
-        i += 4;
-    }
-    for (v, &d) in row[i..].iter_mut().zip(&delta[i..]) {
-        *v += sign * d;
-    }
-}

@@ -40,7 +40,8 @@
 
 use super::fit::Candidate;
 use super::{
-    CHANNEL_WEIGHT, Point, QUANT_ADJUST, QuantizedSpline, adjusted_quant, blob_weight, round_i32,
+    BlobWeightRow, CHANNEL_WEIGHT, LN_RENDER_CUTOFF, Point, QUANT_ADJUST, QuantizedSpline,
+    SplinesContext, adjusted_quant, round_i32,
 };
 use crate::adaptive_quant::{dirty_log2f, fast_exp2};
 use crate::coder_scratch::CoderScratch;
@@ -264,9 +265,9 @@ pub(crate) fn dot_params(sp: &QuantizedSpline) -> (Point<f32>, [f32; 3], f32) {
 
 /// Render reach, the spline renderer's rule.
 pub(crate) fn dot_reach(color: [f32; 3], sigma: f32) -> f32 {
-    let r = 0.1f32.ln() * 5.0;
     let max_color = color.iter().fold(0.01f32, |m, c| m.max(c.abs()));
-    (-2.0 * sigma * sigma * (r - dirty_log2f(max_color) * std::f32::consts::LN_2)).sqrt()
+    (-2.0 * sigma * sigma * (LN_RENDER_CUTOFF - dirty_log2f(max_color) * std::f32::consts::LN_2))
+        .sqrt()
 }
 
 /// Template box: top-left pixel and side.
@@ -295,6 +296,7 @@ type FitKernels = HashMap<FitKernelKey, FitKernel>;
 /// with that share.
 #[allow(clippy::too_many_arguments)]
 fn dot_alts(
+    kernels: &SplinesContext,
     cx: f32,
     cy: f32,
     n0: i32,
@@ -306,7 +308,7 @@ fn dot_alts(
     r: isize,
     polarity: f32,
     min_explained: f32,
-    kernels: &mut FitKernels,
+    cache: &mut FitKernels,
 ) -> Vec<(QuantizedSpline, f32)> {
     let side = (2 * r + 1) as usize;
     let (px, py) = (cx.round() as i32, cy.round() as i32);
@@ -321,20 +323,21 @@ fn dot_alts(
         let origin = ((x as i64).abs() + r as i64 >= 1 << 24
             || (y as i64).abs() + r as i64 >= 1 << 24)
             .then_some((x, y));
-        let kernel = kernels
+        let kernel = cache
             .entry((n, r, x - px, y - py, origin))
             .or_insert_with(|| {
                 let sigma = n as f32 * sigma_step();
+                let mut row = BlobWeightRow {
+                    center: px as f32,
+                    step: 1.0,
+                    dy: 0.0,
+                    inv_sigma: 1.0 / sigma,
+                    amp: 0.25 * sigma,
+                };
                 let mut weights = vec![0f32; side * side];
-                for dy in -r..=r {
-                    for dx in -r..=r {
-                        weights[((dy + r) as usize) * side + (dx + r) as usize] = blob_weight(
-                            (x as isize + dx) as f32 - px as f32,
-                            (y as isize + dy) as f32 - py as f32,
-                            1.0 / sigma,
-                            0.25 * sigma,
-                        );
-                    }
+                for (dy, out) in (-r..=r).zip(weights.chunks_exact_mut(side)) {
+                    row.dy = (y as isize + dy) as f32 - py as f32;
+                    (kernels.blob_weight_row)(row, x - r as i32, out);
                 }
                 let energy = weights.iter().map(|v| v * v).sum();
                 FitKernel { weights, energy }
@@ -390,6 +393,7 @@ fn dot_alts(
 
 /// Isolated extrema of the signed Y top-hat, strongest contrast first.
 pub(super) fn dot_candidates(
+    kernels: &SplinesContext,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     xyb: &Image3F,
@@ -404,7 +408,11 @@ pub(super) fn dot_candidates(
     let mut fitted: Vec<(usize, Candidate, Vec<f32>)> = pool
         .steal_map(scratch, peaks.len().div_ceil(PEAK_CHUNK), |chunk, _| {
             let start = chunk * PEAK_CHUNK;
-            let mut fitted = fit_peaks(xyb, &peaks[start..(start + PEAK_CHUNK).min(peaks.len())]);
+            let mut fitted = fit_peaks(
+                kernels,
+                xyb,
+                &peaks[start..(start + PEAK_CHUNK).min(peaks.len())],
+            );
             for (index, _, _) in &mut fitted {
                 *index += start;
             }
@@ -415,7 +423,7 @@ pub(super) fn dot_candidates(
         .collect();
     fitted.sort_unstable_by_key(|&(index, _, _)| (!peaks[index].0.abs().to_bits(), index));
     // Star fields keep loosely fitted bright dots: neighbors and nebulae
-    // share a star's fit window. Elsewhere such dots are non-Gaussian blobs
+    // share a star's fit window. Elsewhere, such dots are non-Gaussian blobs
     // the block model over-prices, and only compact fits compete.
     let compact = |explained: &f32| *explained >= MIN_EXPLAINED;
     let bright = |candidate: &Candidate| candidate.alts[0].dct[3][0] > 0;
@@ -445,10 +453,14 @@ const PEAK_CHUNK: usize = 1024;
 /// Fits dot alternatives to `peaks`, skipping peaks in busy surroundings.
 /// Returns each candidate's peak index and its alternatives' explained Y
 /// energy shares.
-fn fit_peaks(xyb: &Image3F, peaks: &[(f32, usize, usize)]) -> Vec<(usize, Candidate, Vec<f32>)> {
+fn fit_peaks(
+    kernels: &SplinesContext,
+    xyb: &Image3F,
+    peaks: &[(f32, usize, usize)],
+) -> Vec<(usize, Candidate, Vec<f32>)> {
     let mut out = Vec::new();
     let mut ring = Vec::with_capacity(32);
-    let mut kernels = FitKernels::new();
+    let mut cache = FitKernels::new();
     let mut luma = [0.0; FIT_AREA];
     let mut chroma = [[0.0; FIT_AREA]; 2];
     for (index, &(peak, x, y)) in peaks.iter().enumerate() {
@@ -535,6 +547,7 @@ fn fit_peaks(xyb: &Image3F, peaks: &[(f32, usize, usize)]) -> Vec<(usize, Candid
         };
         target(1, luma_bg, &mut luma);
         let alts = dot_alts(
+            kernels,
             cx,
             cy,
             n0,
@@ -554,7 +567,7 @@ fn fit_peaks(xyb: &Image3F, peaks: &[(f32, usize, usize)]) -> Vec<(usize, Candid
             } else {
                 MIN_EXPLAINED
             },
-            &mut kernels,
+            &mut cache,
         );
         if !alts.is_empty() {
             let (alts, explained) = alts.into_iter().unzip();
@@ -651,43 +664,36 @@ pub(super) struct DotTemplate {
 }
 
 impl DotTemplate {
-    pub(super) fn new(key: TemplateKey) -> Self {
+    pub(super) fn new(kernels: &SplinesContext, key: TemplateKey) -> Self {
         let (color, sigma) = template_params(key);
         let reach = dot_reach(color, sigma);
         let trial_radius = round_i32(reach);
         let trial_side = (2 * trial_radius + 1) as usize;
         let trial_area = trial_side * trial_side;
         let mut trial_xyb = vec![0f32; 3 * trial_area];
-        let (x_plane, yb_planes) = trial_xyb.split_at_mut(trial_area);
-        let (y_plane, b_plane) = yb_planes.split_at_mut(trial_area);
-        for (j, ((x_row, y_row), b_row)) in x_plane
-            .chunks_exact_mut(trial_side)
-            .zip(y_plane.chunks_exact_mut(trial_side))
-            .zip(b_plane.chunks_exact_mut(trial_side))
-            .enumerate()
-        {
-            let y = j as i32 - trial_radius;
-            for (i, ((x, y_out), b)) in x_row.iter_mut().zip(y_row).zip(b_row).enumerate() {
-                let dx = i as i32 - trial_radius;
-                let weight = blob_weight(dx as f32, y as f32, 1.0 / sigma, 0.25 * sigma);
-                *x = color[0] * weight;
-                *y_out = color[1] * weight;
-                *b = color[2] * weight;
-            }
-        }
         let atlas_radius = reach.ceil() as i32;
-        let (x0, y0) = (-atlas_radius, -atlas_radius);
         let side = (2 * atlas_radius + 1) as usize;
         let area = side * side;
         const INLINE_SIDE: usize = 25;
         let mut inline = [0i32; 3 * INLINE_SIDE * INLINE_SIDE];
+        let mut inline_weights = [0.0; INLINE_SIDE];
         let mut heap;
-        let planes = if side <= INLINE_SIDE {
-            &mut inline[..3 * area]
+        let mut heap_weights;
+        let (planes, weights) = if side <= INLINE_SIDE {
+            (&mut inline[..3 * area], &mut inline_weights[..side])
         } else {
             heap = vec![0i32; 3 * area];
-            &mut heap[..]
+            heap_weights = vec![0.0; side];
+            (&mut heap[..], &mut heap_weights[..])
         };
+        let mut weight_row = BlobWeightRow {
+            center: 0.0,
+            step: 1.0,
+            dy: 0.0,
+            inv_sigma: 1.0 / sigma,
+            amp: 0.25 * sigma,
+        };
+        let trial_offset = (atlas_radius - trial_radius) as usize;
         let mut radius = 0;
         let mut empty = true;
         let (y_plane, xb_planes) = planes.split_at_mut(area);
@@ -698,10 +704,29 @@ impl DotTemplate {
             .zip(by_plane.chunks_exact_mut(side))
             .enumerate()
         {
-            let dy = y0 + j as i32;
-            for (i, ((y, x), by)) in y_row.iter_mut().zip(x_row).zip(by_row).enumerate() {
-                let dx = x0 + i as i32;
-                let wgt = blob_weight(dx as f32, dy as f32, 1.0 / sigma, 0.25 * sigma);
+            let dy = j as i32 - atlas_radius;
+            weight_row.dy = dy as f32;
+            (kernels.blob_weight_row)(weight_row, -atlas_radius, weights);
+            // The trial is the centered sub-square of the atlas.
+            if (trial_offset..trial_offset + trial_side).contains(&j) {
+                let start = (j - trial_offset) * trial_side;
+                let trial_weights = &weights[trial_offset..trial_offset + trial_side];
+                for (plane, c) in trial_xyb.chunks_exact_mut(trial_area).zip(color) {
+                    for (out, &weight) in plane[start..start + trial_side]
+                        .iter_mut()
+                        .zip(trial_weights)
+                    {
+                        *out = c * weight;
+                    }
+                }
+            }
+            for (i, (((y, x), by), &wgt)) in y_row
+                .iter_mut()
+                .zip(x_row)
+                .zip(by_row)
+                .zip(&*weights)
+                .enumerate()
+            {
                 let yi = round_i32(color[1] * wgt * 512.0);
                 let xi = round_i32(color[0] * wgt * 4096.0);
                 let byi = round_i32(color[2] * wgt * 256.0) - yi;
@@ -710,17 +735,18 @@ impl DotTemplate {
                 *by = byi;
                 if yi != 0 || xi != 0 || byi != 0 {
                     empty = false;
+                    let dx = i as i32 - atlas_radius;
                     radius = radius.max(dx.abs().max(dy.abs()));
                 }
             }
         }
         let trimmed_side = (2 * radius + 1) as usize;
         let trimmed_area = trimmed_side * trimmed_side;
-        let offset = (-x0 - radius) as usize;
+        let offset = (atlas_radius - radius) as usize;
         let mut lattice = Vec::with_capacity(3 * trimmed_area);
-        for p in planes.chunks_exact(area) {
-            for j in offset..offset + trimmed_side {
-                lattice.extend_from_slice(&p[j * side + offset..][..trimmed_side]);
+        for plane in planes.chunks_exact(area) {
+            for row in plane.chunks_exact(side).skip(offset).take(trimmed_side) {
+                lattice.extend_from_slice(&row[offset..][..trimmed_side]);
             }
         }
         const INV_X_SCALE: f32 = 1.0 / 4096.0;
@@ -780,9 +806,12 @@ impl std::fmt::Debug for DotEncoding {
 }
 
 /// Groups dots by template and shelf-packs the atlas.
-pub(crate) fn build_dot_patches(dots: &[QuantizedSpline]) -> DotPatches {
+pub(crate) fn build_dot_patches(kernels: &SplinesContext, dots: &[QuantizedSpline]) -> DotPatches {
     let keys: std::collections::BTreeSet<_> = dots.iter().map(template_key).collect();
-    let templates = share_templates(keys.into_iter().map(|key| (key, DotTemplate::new(key))));
+    let templates = share_templates(
+        keys.into_iter()
+            .map(|key| (key, DotTemplate::new(kernels, key))),
+    );
     build_dot_patches_with_templates(dots, &templates, false)
 }
 
@@ -877,6 +906,7 @@ mod tests {
 
     #[test]
     fn dark_spots_fit_on_sloped_backgrounds_but_reject_texture() {
+        let kernels = SplinesContext::get();
         for slope in [0.0, 0.003, 0.008] {
             let mut image = Image3F::new(64, 64);
             for c in 0..3 {
@@ -888,7 +918,7 @@ mod tests {
                     }
                 }
             }
-            let fits = fit_peaks(&image, &[(-0.12, 32, 32)]);
+            let fits = fit_peaks(kernels, &image, &[(-0.12, 32, 32)]);
             assert_eq!(fits.len(), 1, "slope={slope}");
             assert!(fits[0].1.alts.iter().all(|sp| sp.dct[3][0] < 0));
             for y in 0..64 {
@@ -896,12 +926,13 @@ mod tests {
                     image.plane_row_mut(1, y)[x] += if (x + y) % 2 == 0 { 0.04 } else { -0.04 };
                 }
             }
-            assert!(fit_peaks(&image, &[(-0.12, 32, 32)]).is_empty());
+            assert!(fit_peaks(kernels, &image, &[(-0.12, 32, 32)]).is_empty());
         }
     }
 
     #[test]
     fn fitting_cache_preserves_large_coordinate_rounding() {
+        let kernels = SplinesContext::get();
         let r = 4isize;
         let side = (2 * r + 1) as usize;
         let mut targets: [Vec<f32>; 3] = std::array::from_fn(|_| Vec::new());
@@ -914,10 +945,11 @@ mod tests {
             }
         }
         assert_eq!(targets[1].len(), side * side);
-        let mut kernels = FitKernels::new();
+        let mut cache = FitKernels::new();
         for x in [32, 16_777_216, crate::encode_image::MAX_DIMENSION - 32, 40] {
             let fit = |cache: &mut FitKernels| {
                 dot_alts(
+                    kernels,
                     x as f32,
                     32.0,
                     4,
@@ -938,12 +970,13 @@ mod tests {
                 .map(|(sp, _)| template_key(sp))
                 .collect::<Vec<_>>()
             };
-            assert_eq!(fit(&mut kernels), fit(&mut FitKernels::new()), "x={x}");
+            assert_eq!(fit(&mut cache), fit(&mut FitKernels::new()), "x={x}");
         }
     }
 
     #[test]
     fn compact_fit_screen_rejects_long_edges_in_both_polarities() {
+        let kernels = SplinesContext::get();
         let r = 4isize;
         let side = (2 * r + 1) as usize;
         let mut targets = [
@@ -964,6 +997,7 @@ mod tests {
                 .map(|values| values.into_iter().map(|v| -polarity * v).collect());
             assert!(
                 dot_alts(
+                    kernels,
                     16.0,
                     16.0,
                     4,
@@ -1112,6 +1146,7 @@ mod tests {
         };
         let detect = |image: &Image3F, threads| {
             dot_candidates(
+                SplinesContext::get(),
                 &ThreadPool::new(threads),
                 &mut CoderScratch::default(),
                 image,
@@ -1137,10 +1172,11 @@ mod tests {
 
     #[test]
     fn signed_templates_have_opposite_lattice_pixels_and_equal_support() {
+        let kernels = SplinesContext::get();
         for sigma in [1, 4, 10] {
             for level in [3, 10, 17] {
-                let bright = DotTemplate::new((sigma, level, -3, 2));
-                let dark = DotTemplate::new((-sigma, level, -3, 2));
+                let bright = DotTemplate::new(kernels, (sigma, level, -3, 2));
+                let dark = DotTemplate::new(kernels, (-sigma, level, -3, 2));
                 assert_eq!(bright.radius, dark.radius);
                 assert_eq!(bright.atlas_radius, dark.atlas_radius);
                 assert_eq!(bright.side, dark.side);
@@ -1149,6 +1185,38 @@ mod tests {
                     bright.lattice,
                     dark.lattice.iter().map(|&v| -v).collect::<Vec<_>>()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn trial_pixels_use_the_center_of_the_atlas_weights() {
+        let kernels = SplinesContext::get();
+        for n in [1, 4, -10, 11] {
+            for level in [3, 17, 30] {
+                let key = (n, level, -3, 2);
+                let template = DotTemplate::new(kernels, key);
+                let (color, sigma) = template_params(key);
+                let radius = template.trial_radius;
+                let amp = 0.25 * sigma;
+                for (plane, c) in template
+                    .trial_xyb
+                    .chunks_exact(template.trial_side * template.trial_side)
+                    .zip(color)
+                {
+                    for (dy, row) in (-radius..=radius).zip(plane.chunks_exact(template.trial_side))
+                    {
+                        for (dx, &actual) in (-radius..=radius).zip(row) {
+                            let expected = c * super::super::blob_weight(
+                                dx as f32,
+                                dy as f32,
+                                1.0 / sigma,
+                                amp,
+                            );
+                            assert!((actual - expected).abs() <= 2e-6 * c.abs() * amp);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1163,6 +1231,7 @@ mod tests {
 
     #[test]
     fn atlas_layout_preserves_added_pixels() {
+        let kernels = SplinesContext::get();
         let mut splines = Vec::new();
         for (i, (x, y)) in [(16, 17), (42, 22), (31, 47), (57, 53)]
             .into_iter()
@@ -1179,7 +1248,10 @@ mod tests {
             splines.push(sp);
         }
         let keys: std::collections::BTreeSet<_> = splines.iter().map(template_key).collect();
-        let templates = share_templates(keys.into_iter().map(|key| (key, DotTemplate::new(key))));
+        let templates = share_templates(
+            keys.into_iter()
+                .map(|key| (key, DotTemplate::new(kernels, key))),
+        );
         let decode = |plan: &DotPatches| {
             let mut pixels = vec![[0i32; 3]; 80 * 80];
             for reference in plan.references() {

@@ -29,7 +29,7 @@
 
 use super::LosslessSettings;
 use super::encoder::{
-    MA_DECISIVE_MIN_SAVINGS, encode_frame_lossless_core_impl, learned_tree_is_decisive,
+    MA_DECISIVE_MIN_SAVINGS, TreeSearch, encode_frame_lossless_core_impl, learned_tree_is_decisive,
 };
 use super::entropy::{EntropyOfHistFn, entropy_of_hist_scalar, selected_entropy_of_hist_fn};
 use super::rct::forward_ycocg;
@@ -159,7 +159,7 @@ fn encode_core(image: &Image3Si, allow_palettes: bool) -> BitWriter {
         LosslessSettings::rgb8(crate::Speed::Slow, crate::DecodingSpeed::Slow),
         ModularFrameKind::Regular,
         allow_palettes,
-        true,
+        TreeSearch::Full,
         &pool,
         &mut scratch,
         &mut writer,

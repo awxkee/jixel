@@ -39,12 +39,13 @@ use super::geometry::Polyline;
 use super::lines::{LineIndex, curve_samples, unit_tangents};
 use super::select::{BlockModel, pretest};
 use super::{
-    CHANNEL_WEIGHT, Point, QUANT_ADJUST, QuantizedSpline, adjusted_quant, blob_weight,
-    catmull_rom_spans, fast_hypot, round_i32, sample_curve,
+    BlobWeightRow, CHANNEL_WEIGHT, FitMatrix, FitTargets, Point, QUANT_ADJUST, QuantizedSpline,
+    SplinesContext, adjusted_quant, catmull_rom_spans, round_i32, sample_curve,
 };
 use crate::coder_scratch::CoderScratch;
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
+use crate::util::fast_hypot;
 
 static SIGMA_LATTICE: [i32; 8] = [1, 2, 3, 4, 5, 6, 8, 10];
 const SEEDED_WIDTHS: usize = 2;
@@ -64,7 +65,7 @@ const MAX_CURVE_POINTS: usize = 24;
 const BORDER: i32 = 3;
 const BACKGROUND_SIGMA: f32 = 3.0;
 const MASK_RADIUS: isize = 2;
-const MAX_COEFFS: usize = 32;
+pub(super) const MAX_COEFFS: usize = 32;
 /// Refinement only needs the alignment signal: few color coefficients, tight window.
 const REFINE_COEFFS: usize = 3;
 const COMPACT_COEFFS: usize = 6;
@@ -490,8 +491,8 @@ struct WeightTable {
     cutoff_sq: f32,
 }
 
-#[derive(Default)]
 pub(crate) struct FitScratch {
+    kernels: &'static SplinesContext,
     raster: RasterSlots,
     rows: Vec<f64>,
     pixels: Vec<u32>,
@@ -502,6 +503,24 @@ pub(crate) struct FitScratch {
     basis: Vec<f64>,
     basis_coeffs: usize,
     origin: (usize, usize),
+}
+
+impl Default for FitScratch {
+    fn default() -> Self {
+        Self {
+            kernels: SplinesContext::get(),
+            raster: RasterSlots::default(),
+            rows: Vec::new(),
+            pixels: Vec::new(),
+            weight_luts: Vec::new(),
+            points: Vec::new(),
+            samples: Vec::new(),
+            arc: 0.0,
+            basis: Vec::new(),
+            basis_coeffs: 0,
+            origin: (0, 0),
+        }
+    }
 }
 
 impl FitScratch {
@@ -519,13 +538,14 @@ impl FitScratch {
         if self.basis_coeffs == coeffs {
             return;
         }
+        let cos = self.kernels.cos;
         self.basis.clear();
         for k in 0..self.samples.len() {
             let t = 31.0 * (k as f32 / self.arc).min(1.0);
             self.basis.extend((0..coeffs).map(|i| {
                 // Evaluate the angle in f32; retain f64 accumulation and solving.
                 std::f64::consts::SQRT_2
-                    * super::trig::f_cosf(std::f32::consts::PI / 32.0 * i as f32 * (t + 0.5)) as f64
+                    * cos(std::f32::consts::PI / 32.0 * i as f32 * (t + 0.5)) as f64
             }));
         }
         self.basis_coeffs = coeffs;
@@ -540,9 +560,15 @@ impl FitScratch {
             return i;
         }
         let len = ((reach as f32 + 1.0) * std::f32::consts::SQRT_2 * WEIGHT_LUT_STEPS) as usize + 2;
-        let weights: Vec<_> = (0..len)
-            .map(|i| blob_weight(i as f32 / WEIGHT_LUT_STEPS, 0.0, 1.0 / sigma, 1.0))
-            .collect();
+        let mut weights = vec![0.0; len];
+        let row = BlobWeightRow {
+            center: 0.0,
+            step: 1.0 / WEIGHT_LUT_STEPS,
+            dy: 0.0,
+            inv_sigma: 1.0 / sigma,
+            amp: 1.0,
+        };
+        (self.kernels.blob_weight_row)(row, 0, &mut weights);
         // Both interpolation factors are at most one. A cell whose endpoints
         // each pass this bound cannot contribute even at full sample amplitude.
         // Leave one extra cell for rounding in the squared-distance test.
@@ -591,30 +617,73 @@ enum Precision {
     Lean,
 }
 
+#[inline]
+pub(super) fn add_scaled_scalar(dst: &mut [f64], src: &[f64], scale: f64) {
+    for (dst, &src) in dst.iter_mut().zip(src) {
+        *dst += scale * src;
+    }
+}
+
+pub(super) fn accumulate_fit_scalar(
+    ata: &mut FitMatrix,
+    atb: &mut FitTargets,
+    row: &[f64],
+    target: [f64; 3],
+) {
+    for (i, (&value, ata_row)) in row.iter().zip(ata).enumerate() {
+        add_scaled_scalar(&mut ata_row[..=i], &row[..=i], value);
+    }
+    for (atb, target) in atb.iter_mut().zip(target) {
+        add_scaled_scalar(&mut atb[..row.len()], row, target);
+    }
+}
+
+#[inline]
+pub(super) fn sub_dot_scalar(mut acc: f64, left: &[f64], right: &[f64]) -> f64 {
+    for (&a, &b) in left.iter().zip(right) {
+        acc -= a * b;
+    }
+    acc
+}
+
+#[inline]
+fn sub_dot(kernels: &SplinesContext, acc: f64, left: &[f64], right: &[f64]) -> f64 {
+    // Most fits have three or six coefficients. A short reduction costs less
+    // inline and keeps the sequential rounding for these systems.
+    if left.len() < 8 {
+        sub_dot_scalar(acc, left, right)
+    } else {
+        (kernels.fit_sub_dot)(acc, left, right)
+    }
+}
+
 /// A leading block of the factor is also the factor for that block of ata.
-fn factor_leading(
-    ata: &[[f64; MAX_COEFFS]; MAX_COEFFS],
-    k: usize,
-) -> [[f64; MAX_COEFFS]; MAX_COEFFS] {
+fn factor_leading(kernels: &SplinesContext, ata: &FitMatrix, k: usize) -> FitMatrix {
     let mut l = [[0f64; MAX_COEFFS]; MAX_COEFFS];
     for i in 0..k {
         for j in 0..=i {
-            let mut sum = ata[i][j] + if i == j { 1e-9 } else { 0.0 };
-            for (&a, &b) in l[i][..j].iter().zip(&l[j][..j]) {
-                sum -= a * b;
-            }
-            l[i][j] = if i == j {
+            let sum = sub_dot(
+                kernels,
+                ata[i][j] + if i == j { 1e-9 } else { 0.0 },
+                &l[i][..j],
+                &l[j][..j],
+            );
+            let value = if i == j {
                 sum.max(1e-30).sqrt()
             } else {
                 sum / l[j][j]
             };
+            // Store the transpose in the upper triangle for backward substitution.
+            l[i][j] = value;
+            l[j][i] = value;
         }
     }
     l
 }
 
 fn solve_leading(
-    l: &[[f64; MAX_COEFFS]; MAX_COEFFS],
+    kernels: &SplinesContext,
+    l: &FitMatrix,
     k: usize,
     rhs: &[f64; MAX_COEFFS],
     out: &mut [f64; MAX_COEFFS],
@@ -622,18 +691,10 @@ fn solve_leading(
     out.fill(0.0);
     let mut y = [0f64; MAX_COEFFS];
     for i in 0..k {
-        let mut sum = rhs[i];
-        for (&a, &b) in l[i][..i].iter().zip(&y[..i]) {
-            sum -= a * b;
-        }
-        y[i] = sum / l[i][i];
+        y[i] = sub_dot(kernels, rhs[i], &l[i][..i], &y[..i]) / l[i][i];
     }
     for i in (0..k).rev() {
-        let mut sum = y[i];
-        for (row, &value) in l[i + 1..k].iter().zip(&out[i + 1..k]) {
-            sum -= row[i] * value;
-        }
-        out[i] = sum / l[i][i];
+        out[i] = sub_dot(kernels, y[i], &l[i][i + 1..k], &out[i + 1..k]) / l[i][i];
     }
 }
 
@@ -654,8 +715,9 @@ fn fit_at(
 
 /// Geometry and pixel terms shared by all coefficient budgets of one fit.
 struct FitSystem {
-    ata: [[f64; MAX_COEFFS]; MAX_COEFFS],
-    atb: [[f64; MAX_COEFFS]; 3],
+    kernels: &'static SplinesContext,
+    ata: FitMatrix,
+    atb: FitTargets,
     btb: [f64; 3],
     sigma_n: i32,
     coeffs: usize,
@@ -740,18 +802,12 @@ fn raster_system<const FIXED_COEFFS: usize>(
     let mut ata = [[0f64; MAX_COEFFS]; MAX_COEFFS];
     let mut atb = [[0f64; MAX_COEFFS]; 3];
     let mut btb = [0f64; 3];
+    let accumulate = scratch.kernels.fit_accumulate;
     for (&pix, row) in scratch.pixels.iter().zip(scratch.rows.chunks_exact(coeffs)) {
-        for (i, (&value, ata_row)) in row.iter().zip(&mut ata).enumerate() {
-            for (a, &b) in ata_row[..=i].iter_mut().zip(&row[..=i]) {
-                *a += value * b;
-            }
-        }
-        for ((atb, btb), target) in atb.iter_mut().zip(&mut btb).zip(targets) {
-            let t = target[pix as usize] as f64;
-            *btb += t * t;
-            for (a, &b) in atb.iter_mut().zip(row) {
-                *a += b * t;
-            }
+        let target = targets.each_ref().map(|plane| plane[pix as usize] as f64);
+        accumulate(&mut ata, &mut atb, row, target);
+        for (energy, value) in btb.iter_mut().zip(target) {
+            *energy += value * value;
         }
     }
     for i in 0..coeffs {
@@ -761,6 +817,7 @@ fn raster_system<const FIXED_COEFFS: usize>(
     }
 
     Some(FitSystem {
+        kernels: scratch.kernels,
         ata,
         atb,
         btb,
@@ -829,6 +886,7 @@ fn splat_rows<const FIXED_COEFFS: usize, const TILED: bool>(
     let sigma = params.sigma;
     let reach = params.reach;
     let samples = &scratch.samples;
+    let add_scaled = scratch.kernels.fit_add_scaled;
     for (sample, basis) in samples.iter().zip(scratch.basis.chunks_exact(coeffs)) {
         let Point { x: cx, y: cy } = sample.position;
         let mult = sample.multiplier;
@@ -886,9 +944,7 @@ fn splat_rows<const FIXED_COEFFS: usize, const TILED: bool>(
                     } else {
                         let row = &mut scratch.rows
                             [*slot as usize * coeffs..(*slot as usize + 1) * coeffs];
-                        for (r, &b) in row.iter_mut().zip(&basis[..coeffs]) {
-                            *r += weight as f64 * b;
-                        }
+                        add_scaled(row, basis, weight as f64);
                     }
                 }
             }
@@ -904,6 +960,7 @@ impl FitSystem {
     /// trusting the masked blur. Reuse the expensive rasterized basis rows.
     fn residual_system(&self, source: &Image3F, scratch: &FitScratch) -> Self {
         let mut result = Self {
+            kernels: self.kernels,
             ata: [[0.0; MAX_COEFFS]; MAX_COEFFS],
             atb: [[0.0; MAX_COEFFS]; 3],
             btb: [0.0; 3],
@@ -916,6 +973,7 @@ impl FitSystem {
         let (x0, y0) = scratch.origin;
         let planes = [0, 1, 2].map(|c| source.plane_data(c));
         let zero = [0.0; MAX_COEFFS];
+        let accumulate = self.kernels.fit_accumulate;
         for (slot, &pixel) in scratch.pixels.iter().enumerate() {
             let pixel = pixel as usize;
             let (x, y) = (pixel % w, pixel / w);
@@ -940,18 +998,11 @@ impl FitSystem {
                 for ((d, &a), &b) in diff.iter_mut().zip(row).zip(other) {
                     *d = a - b;
                 }
-                for (i, (ata, &value)) in result.ata.iter_mut().zip(&diff[..k]).enumerate() {
-                    for (a, &b) in ata[..=i].iter_mut().zip(&diff[..=i]) {
-                        *a += value * b;
-                    }
-                }
                 let neighbor_pixel = ny * w + nx;
-                for ((atb, btb), plane) in result.atb.iter_mut().zip(&mut result.btb).zip(planes) {
-                    let target = (plane[pixel] - plane[neighbor_pixel]) as f64;
-                    *btb += target * target;
-                    for (a, &d) in atb.iter_mut().zip(&diff[..k]) {
-                        *a += d * target;
-                    }
+                let target = planes.map(|plane| (plane[pixel] - plane[neighbor_pixel]) as f64);
+                accumulate(&mut result.ata, &mut result.atb, &diff[..k], target);
+                for (energy, value) in result.btb.iter_mut().zip(target) {
+                    *energy += value * value;
                 }
             }
         }
@@ -968,19 +1019,18 @@ impl FitSystem {
         let coeffs = self.coeffs;
         let (kx, ky, kb) = free.unwrap_or((coeffs, coeffs, coeffs));
         let (kx, ky, kb) = (kx.min(coeffs), ky.min(coeffs), kb.min(coeffs));
-        let factor = factor_leading(ata, kx.max(ky).max(kb));
+        let kernels = self.kernels;
+        let factor = factor_leading(kernels, ata, kx.max(ky).max(kb));
         let mut sol = [[0f64; MAX_COEFFS]; 3];
-        solve_leading(&factor, ky, &atb[1], &mut sol[1]);
-        solve_leading(&factor, kx, &atb[0], &mut sol[0]);
+        solve_leading(kernels, &factor, ky, &atb[1], &mut sol[1]);
+        solve_leading(kernels, &factor, kx, &atb[0], &mut sol[0]);
         // B is stored as a residual of Y (base correlation 1.0): fit the residual
         let mut rhs = atb[2];
         for (rhs, row) in rhs[..coeffs].iter_mut().zip(ata) {
-            for (&a, &y) in row[..coeffs].iter().zip(&sol[1]) {
-                *rhs -= a * y;
-            }
+            *rhs = sub_dot(kernels, *rhs, &row[..ky], &sol[1][..ky]);
         }
         let mut residual = [0f64; MAX_COEFFS];
-        solve_leading(&factor, kb, &rhs, &mut residual);
+        solve_leading(kernels, &factor, kb, &rhs, &mut residual);
         let [_, y, b] = &mut sol;
         for ((b, &y), &residual) in b[..coeffs].iter_mut().zip(y.iter()).zip(&residual) {
             *b = y + residual;
@@ -2452,10 +2502,47 @@ mod tests {
     }
 
     #[test]
+    fn fit_kernels_cover_each_coefficient_count_and_tail() {
+        let kernels = SplinesContext::get();
+        let row: [f64; MAX_COEFFS + 1] = std::array::from_fn(|i| (i as f64 - 13.0) * 0.17);
+        let target = [-0.91, 0.17, 0.42];
+        for k in 0..=MAX_COEFFS {
+            let basis = &row[1..=k];
+            let mut dst = [0.53; MAX_COEFFS + 2];
+            let mut expected = dst;
+            (kernels.fit_add_scaled)(&mut dst[1..=k], basis, target[0]);
+            add_scaled_scalar(&mut expected[1..=k], basis, target[0]);
+            for (actual, expected) in dst.into_iter().zip(expected) {
+                assert!((actual - expected).abs() <= 1e-14, "k={k}");
+            }
+
+            let mut ata = [[0.53; MAX_COEFFS]; MAX_COEFFS];
+            let mut atb = [[-0.41; MAX_COEFFS]; 3];
+            let (mut expected_ata, mut expected_atb) = (ata, atb);
+            (kernels.fit_accumulate)(&mut ata, &mut atb, basis, target);
+            accumulate_fit_scalar(&mut expected_ata, &mut expected_atb, basis, target);
+            for (actual, expected) in ata
+                .iter()
+                .chain(&atb)
+                .flatten()
+                .zip(expected_ata.iter().chain(&expected_atb).flatten())
+            {
+                assert!((actual - expected).abs() <= 1e-14, "k={k}");
+            }
+
+            let left = &row[..k];
+            let actual = (kernels.fit_sub_dot)(5.2, left, basis);
+            let expected = sub_dot_scalar(5.2, left, basis);
+            assert!((actual - expected).abs() <= 1e-12, "k={k}");
+        }
+    }
+
+    #[test]
     fn cholesky_recovers_known_solution_for_each_leading_size() {
         let ata = std::array::from_fn(|i| std::array::from_fn(|j| if i == j { 40.0 } else { 1.0 }));
         let expected: [f64; MAX_COEFFS] = std::array::from_fn(|i| (i as f64 - 15.0) * 0.125);
-        let factor = factor_leading(&ata, MAX_COEFFS);
+        let kernels = SplinesContext::get();
+        let factor = factor_leading(kernels, &ata, MAX_COEFFS);
         for k in 0..=MAX_COEFFS {
             let rhs = std::array::from_fn(|i| {
                 ata[i][..k]
@@ -2465,7 +2552,7 @@ mod tests {
                     .sum()
             });
             let mut actual = [1.0; MAX_COEFFS];
-            solve_leading(&factor, k, &rhs, &mut actual);
+            solve_leading(kernels, &factor, k, &rhs, &mut actual);
             for (&actual, &expected) in actual[..k].iter().zip(&expected) {
                 assert!((actual - expected).abs() < 1e-9, "k={k}");
             }

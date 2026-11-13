@@ -45,33 +45,28 @@ mod edge_select;
 mod extend;
 mod filter;
 mod fit;
+#[cfg(target_arch = "aarch64")]
+#[path = "neon/spline_fit.rs"]
+mod fit_neon;
 mod geometry;
 mod lines;
+#[cfg(target_arch = "aarch64")]
+#[path = "neon/splines.rs"]
+mod neon;
 mod render;
 mod select;
 mod transform;
 mod trig;
 
-#[cfg(any(
-    all(target_arch = "aarch64", feature = "neon"),
-    all(target_arch = "x86_64", feature = "avx")
-))]
+#[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", feature = "avx")))]
 pub(crate) use detect::{ALONG_PENALTY, MAX_SUBPIXEL_OFFSET, RidgeRow, ridge_row_scalar};
-pub(crate) use detect::{RidgeRowFn, select_ridge_row_fn};
+#[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", feature = "avx")))]
+pub(crate) use filter::{FilterBounds, vertical_row_scalar_tail};
 pub(crate) use fit::FitScratch;
-#[cfg(any(
-    all(target_arch = "aarch64", feature = "neon"),
-    all(target_arch = "x86_64", feature = "avx")
-))]
+#[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", feature = "avx")))]
 pub(crate) use geometry::Segments;
-pub(crate) use geometry::{SegmentDistanceFn, select_segment_distance_fn};
-#[cfg(any(
-    all(target_arch = "aarch64", feature = "neon"),
-    all(target_arch = "x86_64", feature = "avx")
-))]
+#[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", feature = "avx")))]
 pub(crate) use render::Sample;
-pub(crate) use render::{RenderRowFn, select_render_row_fn};
-pub(crate) use transform::{ContinuousIdctFn, select_continuous_idct_fn};
 
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
@@ -81,11 +76,174 @@ use crate::entropy::{
 };
 use crate::image::Image3F;
 use crate::path_order;
+use crate::simd::scaled_add::{AddScaledFn, selected_add_scaled_fn};
+use crate::util::fast_hypot;
+use std::sync::OnceLock;
+
+pub(crate) type FitMatrix = [[f64; fit::MAX_COEFFS]; fit::MAX_COEFFS];
+pub(crate) type FitTargets = [[f64; fit::MAX_COEFFS]; 3];
+
+/// Spline kernels selected once for the process and shared by every encoder.
+pub(crate) struct SplinesContext {
+    ridge_row: detect::RidgeRowFn,
+    segment_distance: geometry::SegmentDistanceFn,
+    render_row: render::RenderRowFn,
+    continuous_idct: transform::ContinuousIdctFn,
+    /// Fitting and dot templates use a fused erf polynomial on SIMD targets.
+    blob_weight_row: fn(BlobWeightRow, i32, &mut [f32]),
+    add_scaled_f32: AddScaledFn,
+    add_scaled_fma_f32: AddScaledFn,
+    filter_vertical_row: filter::FilterVerticalRowFn,
+    fit_add_scaled: fn(&mut [f64], &[f64], f64),
+    fit_accumulate: fn(&mut FitMatrix, &mut FitTargets, &[f64], [f64; 3]),
+    fit_sub_dot: fn(f64, &[f64], &[f64]) -> f64,
+    cos: fn(f32) -> f32,
+    sin_cos: fn(f32) -> (f32, f32),
+    atan2: fn(f32, f32) -> f32,
+}
+
+impl SplinesContext {
+    pub(crate) fn get() -> &'static Self {
+        static KERNELS: OnceLock<SplinesContext> = OnceLock::new();
+        KERNELS.get_or_init(Self::resolve)
+    }
+
+    fn resolve() -> Self {
+        let add_scaled_f32 = selected_add_scaled_fn();
+        let kernels = Self {
+            ridge_row: detect::ridge_row_scalar,
+            segment_distance: geometry::segment_distance_scalar,
+            render_row: render::Sample::scalar_row,
+            continuous_idct: transform::continuous_idct_scalar,
+            blob_weight_row: BlobWeightRow::fill_scalar,
+            add_scaled_f32,
+            add_scaled_fma_f32: add_scaled_f32,
+            filter_vertical_row: filter::vertical_row_scalar,
+            fit_add_scaled: fit::add_scaled_scalar,
+            fit_accumulate: fit::accumulate_fit_scalar,
+            fit_sub_dot: fit::sub_dot_scalar,
+            cos: trig::cos_scalar,
+            sin_cos: trig::sin_cos_scalar,
+            atan2: trig::atan2_scalar,
+        };
+
+        #[cfg(target_arch = "aarch64")]
+        let kernels = Self {
+            // SAFETY: NEON is part of the supported AArch64 target baseline.
+            ridge_row: |s, derivatives, out| unsafe {
+                neon::spline_ridge_row_neon(s, derivatives, out)
+            },
+            segment_distance: |p, blocks| unsafe { neon::spline_distance_neon(p, blocks) },
+            render_row: |sample, dy, x, rows, amp| unsafe {
+                neon::spline_render_row_neon(sample, dy, x, rows, amp)
+            },
+            continuous_idct: |dct, t| unsafe { neon::continuous_idct_neon(dct, t) },
+            blob_weight_row: |row, x, out| unsafe { neon::blob_weight_row_neon(row, x, out) },
+            add_scaled_fma_f32: |dst, src, scale| unsafe {
+                crate::simd::neon_add_scaled::add_scaled_fma_neon(dst, src, scale)
+            },
+            filter_vertical_row: |src, w, bounds, taps, dst| unsafe {
+                neon::vertical_row_neon(src, w, bounds, taps, dst)
+            },
+            fit_add_scaled: |dst, src, scale| unsafe { fit_neon::add_scaled_neon(dst, src, scale) },
+            fit_accumulate: |ata, atb, row, target| unsafe {
+                fit_neon::accumulate_fit_neon(ata, atb, row, target)
+            },
+            fit_sub_dot: |acc, left, right| unsafe { fit_neon::sub_dot_neon(acc, left, right) },
+            ..kernels
+        };
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let avx_fma = std::arch::is_x86_feature_detected!("avx")
+            && std::arch::is_x86_feature_detected!("fma");
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let kernels = if avx_fma {
+            // SAFETY: these callbacks require AVX and FMA.
+            Self {
+                cos: |x| unsafe { trig::cos_fma(x) },
+                sin_cos: |x| unsafe { trig::sin_cos_fma(x) },
+                atan2: |y, x| unsafe { trig::atan2_fma(y, x) },
+                ..kernels
+            }
+        } else {
+            kernels
+        };
+
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        let kernels = if avx2 {
+            Self {
+                // SAFETY: the vertical kernel only requires AVX2.
+                filter_vertical_row: |src, w, bounds, taps, dst| unsafe {
+                    crate::avx::vertical_row_avx2(src, w, bounds, taps, dst)
+                },
+                ..kernels
+            }
+        } else {
+            kernels
+        };
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if avx_fma && avx2 {
+            use crate::avx;
+            // SAFETY: these callbacks require AVX2 and FMA.
+            return Self {
+                ridge_row: |s, derivatives, out| unsafe {
+                    avx::spline_ridge_row_avx2(s, derivatives, out)
+                },
+                segment_distance: |p, blocks| unsafe { avx::spline_distance_avx2(p, blocks) },
+                render_row: |sample, dy, x, rows, amp| unsafe {
+                    avx::spline_render_row_avx2(sample, dy, x, rows, amp)
+                },
+                continuous_idct: |dct, t| unsafe { avx::continuous_idct_avx2(dct, t) },
+                blob_weight_row: |row, x, out| unsafe { avx::blob_weight_row_avx2(row, x, out) },
+                add_scaled_fma_f32: |dst, src, scale| unsafe {
+                    crate::simd::avx::add_scaled_fma_avx2(dst, src, scale)
+                },
+                fit_add_scaled: |dst, src, scale| unsafe {
+                    avx::add_scaled_f64_avx2(dst, src, scale)
+                },
+                fit_accumulate: |ata, atb, row, target| unsafe {
+                    avx::accumulate_fit_avx2(ata, atb, row, target)
+                },
+                fit_sub_dot: |acc, left, right| unsafe { avx::sub_dot_avx2(acc, left, right) },
+                ..kernels
+            };
+        }
+
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+        {
+            if std::arch::is_x86_feature_detected!("sse4.1") {
+                return Self {
+                    continuous_idct: |dct, t| unsafe { crate::sse::continuous_idct_sse41(dct, t) },
+                    ..kernels
+                };
+            }
+            if std::arch::is_x86_feature_detected!("sse2") {
+                return Self {
+                    continuous_idct: |dct, t| unsafe { crate::sse::continuous_idct_sse2(dct, t) },
+                    ..kernels
+                };
+            }
+        }
+
+        #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+        let kernels = Self {
+            continuous_idct: crate::wasm::continuous_idct_wasm,
+            ..kernels
+        };
+        kernels
+    }
+}
 
 /// X, Y, B, sigma.
 static CHANNEL_WEIGHT: [f32; 4] = [0.0042, 0.075, 0.07, 0.3333];
 const Y_TO_X: f32 = 0.0;
 const Y_TO_B: f32 = 1.0;
+
+/// Natural log of the Gaussian render cutoff `10^-5`.
+/// `ln((1/10)^5) = 5 * ln(1/10) = -5 * ln(10)`.
+const LN_RENDER_CUTOFF: f32 = -5.0 * std::f32::consts::LN_10;
 
 /// Frame-global `quantization_adjustment`: the sigma lattice step is
 /// `0.3333 / (1 + adjust / 8)`.
@@ -148,11 +306,6 @@ fn round_i32(value: f32) -> i32 {
 #[inline]
 fn round_isize(value: f32) -> isize {
     biased_for_rounding(value) as isize
-}
-
-#[inline]
-fn fast_hypot(x: f32, y: f32) -> f32 {
-    (x * x + y * y).sqrt()
 }
 
 #[derive(Clone, Debug)]
@@ -313,6 +466,25 @@ pub(crate) fn blob_weight(dx: f32, dy: f32, inv_sigma: f32, amp: f32) -> f32 {
     let e = fast_erf((dist * 0.5 + 0.353_553_39) * inv_sigma)
         - fast_erf((dist * 0.5 - 0.353_553_39) * inv_sigma);
     amp * e * e
+}
+
+/// A horizontal batch with `dx = (x as f32 - center) * step`.
+#[derive(Clone, Copy)]
+pub(crate) struct BlobWeightRow {
+    pub(crate) center: f32,
+    pub(crate) step: f32,
+    pub(crate) dy: f32,
+    pub(crate) inv_sigma: f32,
+    pub(crate) amp: f32,
+}
+
+impl BlobWeightRow {
+    fn fill_scalar(self, x0: i32, weights: &mut [f32]) {
+        for (x, out) in (x0..).zip(weights) {
+            let dx = (x as f32 - self.center) * self.step;
+            *out = blob_weight(dx, self.dy, self.inv_sigma, self.amp);
+        }
+    }
 }
 
 /// Half-open pixel window `(x0, x1, y0, y1)` of an arc sample with the given reach.
@@ -571,7 +743,7 @@ pub(crate) fn find_candidates(
         let chains = lines::split_corners(detect::detect_chains(ctx, scratch, xyb));
         if !chains.is_empty() {
             let extensions = extend::find_extensions(ctx, scratch, xyb, &chains);
-            let long_lines = lines::find_long_lines(&chains);
+            let long_lines = lines::find_long_lines(ctx.spline_kernels, &chains);
             (candidates, groups) = fit::fit_candidates(
                 ctx,
                 scratch,
@@ -585,7 +757,12 @@ pub(crate) fn find_candidates(
         }
     }
     if ctx.dots {
-        candidates.extend(dots::dot_candidates(&ctx.thread_pool, scratch, xyb));
+        candidates.extend(dots::dot_candidates(
+            ctx.spline_kernels,
+            &ctx.thread_pool,
+            scratch,
+            xyb,
+        ));
     }
     (!candidates.is_empty()).then_some(SplineCandidates(candidates, groups))
 }
@@ -651,6 +828,83 @@ pub(crate) fn select_splines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f32_scaled_add_kernels_cover_unaligned_rows_and_tails() {
+        let kernels = SplinesContext::get();
+        #[cfg(not(all(target_arch = "x86_64", feature = "avx")))]
+        let fused = cfg!(target_arch = "aarch64");
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        let fused = std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma");
+        let scale = 0.91f32;
+        let src: [f32; 67] = std::array::from_fn(|i| (i as f32 - 17.0) * 0.071);
+        let dst: [f32; 66] = std::array::from_fn(|i| (i as f32 - 23.0) * 0.083);
+        for len in 0..=64 {
+            for (add, fused) in [
+                (kernels.add_scaled_f32, false),
+                (kernels.add_scaled_fma_f32, fused),
+            ] {
+                let mut actual = dst;
+                let mut expected = dst;
+                add(&mut actual[1..1 + len], &src[2..], scale);
+                for (out, &value) in expected[1..1 + len].iter_mut().zip(&src[2..]) {
+                    *out = if fused {
+                        scale.mul_add(value, *out)
+                    } else {
+                        *out + scale * value
+                    };
+                }
+                assert_eq!(
+                    actual.map(f32::to_bits),
+                    expected.map(f32::to_bits),
+                    "len={len}, fused={fused}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blob_weight_rows_preserve_coordinates_and_tail_values() {
+        let fill = SplinesContext::get().blob_weight_row;
+        for (x0, center, step) in [
+            (-11, 0.0, 1.0),
+            (0, 0.0, 1.0 / 32.0),
+            (16_777_213, 16_777_219.0, 1.0),
+            (
+                crate::encode_image::MAX_DIMENSION as i32 - 111,
+                (crate::encode_image::MAX_DIMENSION - 128) as f32,
+                1.0,
+            ),
+        ] {
+            for inv_sigma in [0.29, 1.4, 4.5] {
+                let row = BlobWeightRow {
+                    center,
+                    step,
+                    dy: -0.75,
+                    inv_sigma,
+                    amp: 0.25 / inv_sigma,
+                };
+                let mut scalar = [0.0; 32];
+                let mut full = [0.0; 32];
+                row.fill_scalar(x0, &mut scalar);
+                fill(row, x0, &mut full);
+                for (i, (&actual, expected)) in full.iter().zip(scalar).enumerate() {
+                    // Fused Horner steps can shift either erf result by a few ulps.
+                    assert!(
+                        (actual - expected).abs() <= 2e-6 * row.amp,
+                        "x0={x0}, lane={i}, inv_sigma={inv_sigma}: {actual} vs {expected}"
+                    );
+                }
+                for len in 0..full.len() {
+                    let mut partial = [f32::NAN; 32];
+                    fill(row, x0, &mut partial[..len]);
+                    assert_eq!(partial[..len], full[..len], "x0={x0}, len={len}");
+                    assert!(partial[len..].iter().all(|x| x.is_nan()));
+                }
+            }
+        }
+    }
 
     #[test]
     fn coding_order_chains_neighboring_starts() {

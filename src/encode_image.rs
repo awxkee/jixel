@@ -1614,8 +1614,10 @@ fn encode_image_rgb(
         .vector_layers
         .then(|| crate::vector_layers::SplitSource::rgb(input, width, height))
         .flatten();
-    let (whole, crop_share) =
-        encode_image_arms(input, width, height, config, vector_source.as_ref())?;
+    let mut vector = vector_source
+        .as_ref()
+        .map(|source| VectorSearch::new(source, config.distance));
+    let (whole, crop_share) = encode_image_arms(input, width, height, config, vector.as_mut())?;
     // Crop frames race the whole-image encode on mixed composites unless the
     // vector layers took the image: crops over a plain VarDCT base do not
     // beat a near-lossless vector encode.
@@ -1628,9 +1630,55 @@ fn encode_image_rgb(
             encode_crop_stack(input, width, height, config, whole.len(), crop_share)?
         && (stack.len() as f64) < crop_share * whole.len() as f64
     {
-        return snapped_vector_race(input, vector_source.as_ref(), width, height, config, stack);
+        return snapped_vector_race(input, vector, width, height, config, stack);
     }
-    snapped_vector_race(input, vector_source.as_ref(), width, height, config, whole)
+    snapped_vector_race(input, vector, width, height, config, whole)
+}
+
+/// Work shared by the RGB vector budget fit, handover and final race.
+struct VectorSearch<'source, 'pixels> {
+    source: &'source crate::vector_layers::SplitSource<'pixels, 3>,
+    snap_reach: u8,
+    snapped: std::cell::OnceCell<Option<crate::vector_layers::SplitPlan<'source, 'pixels, 3>>>,
+    snapped_floor: Option<(u32, Vec<u8>)>,
+    plain_split: bool,
+    prefer_flattened: bool,
+}
+
+impl<'source, 'pixels> VectorSearch<'source, 'pixels> {
+    fn new(source: &'source crate::vector_layers::SplitSource<'pixels, 3>, distance: f32) -> Self {
+        Self {
+            source,
+            snap_reach: crate::vector_layers::snap_reach(distance),
+            snapped: std::cell::OnceCell::new(),
+            snapped_floor: None,
+            plain_split: false,
+            prefer_flattened: false,
+        }
+    }
+
+    fn split_snapped(&self, steps: u32) -> Option<crate::vector_layers::VectorSplit> {
+        self.snapped
+            .get_or_init(|| self.source.prepare(Some(self.snap_reach)))
+            .as_ref()?
+            .split_for_retry(steps, self.prefer_flattened)
+    }
+
+    fn encode_snapped_floor(
+        &mut self,
+        steps: u32,
+        width: usize,
+        height: usize,
+        config: &EncodeConfig,
+    ) -> Result<Option<&[u8]>, EncodeError> {
+        if let Some(split) = self.split_snapped(steps) {
+            let bytes = encode_vector_layers(split, width, height, config)?.bytes;
+            let (_, bytes) = self.snapped_floor.insert((steps, bytes));
+            Ok(Some(bytes))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// The vector layers of the fringe-snapped split against the finished encode,
@@ -1638,7 +1686,7 @@ fn encode_image_rgb(
 /// and the edge-cost budget misjudges, so only real bytes decide.
 fn snapped_vector_race(
     input: &[u8],
-    source: Option<&crate::vector_layers::SplitSource<'_, 3>>,
+    search: Option<VectorSearch<'_, '_>>,
     width: usize,
     height: usize,
     config: &EncodeConfig,
@@ -1652,9 +1700,7 @@ fn snapped_vector_race(
     {
         return Ok(current);
     }
-    let Some(plan) = source
-        .and_then(|source| source.prepare(Some(crate::vector_layers::snap_reach(config.distance))))
-    else {
+    let Some(mut search) = search else {
         return Ok(current);
     };
     // The finest edge precision whose encode comes under the finished one:
@@ -1668,10 +1714,17 @@ fn snapped_vector_race(
         .filter(|&s| s < nominal && s >= floor);
     let mut smallest: Option<Vec<u8>> = None;
     for steps in std::iter::once(nominal).chain(coarser) {
-        let Some(split) = plan.split(steps) else {
-            break;
+        let snapped = if let Some((_, bytes)) = search
+            .snapped_floor
+            .take_if(|(cached_steps, _)| *cached_steps == steps)
+        {
+            bytes
+        } else {
+            let Some(split) = search.split_snapped(steps) else {
+                break;
+            };
+            encode_vector_layers(split, width, height, config)?.bytes
         };
-        let snapped = encode_vector_layers(split, width, height, config)?.bytes;
         // A coarser encode gives edge quality away, and the finished encode
         // may be the vector one at full precision: it must save a tenth
         // (line art at distance 1 otherwise dropped under its distance 1.5
@@ -1698,12 +1751,7 @@ fn snapped_vector_race(
     if config.distance >= SNAP_HANDOVER_MIN_DISTANCE
         && let Some(smallest) = smallest
         && smallest.len() < 2 * current.len()
-        && source.is_some_and(|source| {
-            source
-                .prepare(None)
-                .and_then(|plan| plan.split(nominal))
-                .is_none()
-        })
+        && !search.plain_split
     {
         let ratio = smallest.len() as f32 / current.len() as f32;
         let mut finer_config = config.clone();
@@ -1745,7 +1793,8 @@ fn vector_handover(
     width: usize,
     height: usize,
     config: &EncodeConfig,
-    source: &crate::vector_layers::SplitSource<'_, 3>,
+    search: &mut VectorSearch<'_, '_>,
+    plan: crate::vector_layers::SplitPlan<'_, '_, 3>,
     steps: u32,
     mut smallest: usize,
     coarsest_coded: bool,
@@ -1753,9 +1802,10 @@ fn vector_handover(
     if config.speed < Speed::Slow {
         return Ok(None);
     }
-    let budget = |distance: f32| {
+    let edges = crate::vector_layers::vardct_edge_histogram(input, width, height);
+    let budget = |distance| {
         crate::vector_layers::VARDCT_BYTES_MARGIN
-            * crate::vector_layers::vardct_bytes(input, width, height, distance)
+            * crate::vector_layers::vardct_bytes_from_edges(&edges, distance)
     };
     // Far from the budget the fit never coded the coarsest precision.
     let coarsest = crate::vector_layers::coverage_steps(2.0 * config.distance).max(3);
@@ -1763,16 +1813,17 @@ fn vector_handover(
         && coarsest <= steps
         && (smallest as f64) < HANDOVER_MAX_MISS * budget(config.distance)
     {
-        for snap in [
-            None,
-            Some(crate::vector_layers::snap_reach(config.distance)),
-        ] {
-            if let Some(split) = source.prepare(snap).and_then(|plan| plan.split(coarsest)) {
-                let bytes = encode_vector_layers(split, width, height, config)?.bytes;
-                smallest = smallest.min(bytes.len());
-            }
+        if coarsest < steps
+            && let Some(split) = plan.split_for_retry(coarsest, search.prefer_flattened)
+        {
+            let bytes = encode_vector_layers(split, width, height, config)?.bytes;
+            smallest = smallest.min(bytes.len());
+        }
+        if let Some(bytes) = search.encode_snapped_floor(coarsest, width, height, config)? {
+            smallest = smallest.min(bytes.len());
         }
     }
+    drop(plan);
     let covers = |distance: f32| smallest as f64 <= budget(distance);
     let (mut lo, mut hi) = (config.distance / 2.0, config.distance);
     if !covers(lo) {
@@ -1802,14 +1853,14 @@ fn encode_image_arms(
     width: usize,
     height: usize,
     config: &EncodeConfig,
-    source: Option<&crate::vector_layers::SplitSource<'_, 3>>,
+    search: Option<&mut VectorSearch<'_, '_>>,
 ) -> Result<(Vec<u8>, Option<f64>), EncodeError> {
     // The ink plan serves both layer paths: the ink stack codes it, and the
     // vector race reads its glyph-text flag.
     let ink_plan = plan_ink(input, width, height, config);
     let glyph_text = config.patches && ink_plan.as_ref().is_some_and(|plan| plan.glyph_text);
-    let race = match source {
-        Some(source) => match vector_arm(input, width, height, config, source, glyph_text)? {
+    let race = match search {
+        Some(search) => match vector_arm(input, width, height, config, search, glyph_text)? {
             VectorArm::Stands(bytes) => return Ok((bytes, None)),
             VectorArm::Raced(race) => race,
         },
@@ -1903,17 +1954,18 @@ fn vector_arm(
     width: usize,
     height: usize,
     config: &EncodeConfig,
-    source: &crate::vector_layers::SplitSource<'_, 3>,
+    search: &mut VectorSearch<'_, '_>,
     glyph_text: bool,
 ) -> Result<VectorArm, EncodeError> {
     let mut race = VectorRace::default();
     let steps = crate::vector_layers::coverage_steps(config.distance);
-    let Some(plan) = source.prepare(None) else {
+    let Some(plan) = search.source.prepare(None) else {
         return Ok(VectorArm::Raced(race));
     };
     let Some(split) = plan.split(steps) else {
         return Ok(VectorArm::Raced(race));
     };
+    search.plain_split = true;
     // The model sizes the VarDCT encode within 0.78..1.39 of its measure;
     // the layers, far above VarDCT in quality, are kept up to that margin.
     // Repeated-glyph patches code thin text far below the model, which does
@@ -1932,7 +1984,12 @@ fn vector_arm(
         }
     };
     let encoded = encode_vector_layers(split, width, height, config)?;
-    let fit = fit_vector_to_budget(source, plan, encoded, steps, budget, width, height, config)?;
+    // Reuse a clear win from the nominal split to price alternate edge
+    // precisions. Close races keep both representations: some line art
+    // compresses better as separate fill and coverage frames.
+    search.prefer_flattened =
+        config.speed == Speed::Slow && encoded.bytes.len() as f64 <= 0.90 * encoded.layered as f64;
+    let fit = fit_vector_to_budget(search, &plan, encoded, steps, budget, width, height, config)?;
     match (fit.fitted, &race.plain) {
         (Some(bytes), None) => return Ok(VectorArm::Stands(bytes)),
         (Some(bytes), Some(_)) => race.vector = Some(bytes),
@@ -1942,7 +1999,8 @@ fn vector_arm(
                 width,
                 height,
                 config,
-                source,
+                search,
+                plan,
                 steps,
                 fit.smallest,
                 fit.coarsest_coded,
@@ -1969,8 +2027,8 @@ struct VectorFit {
 /// model picks, or at the floor precision on real bytes.
 #[allow(clippy::too_many_arguments)]
 fn fit_vector_to_budget(
-    source: &crate::vector_layers::SplitSource<'_, 3>,
-    plan: crate::vector_layers::SplitPlan<'_, '_, 3>,
+    search: &mut VectorSearch<'_, '_>,
+    plan: &crate::vector_layers::SplitPlan<'_, '_, 3>,
     encoded: VectorEncode,
     steps: u32,
     budget: f64,
@@ -2005,16 +2063,15 @@ fn fit_vector_to_budget(
     let modeled = (5.0 * room - 1.0).exp2().floor().clamp(1.0, steps as f64) as u32;
     let floor = crate::vector_layers::coverage_steps(2.0 * config.distance);
     if (floor..steps).contains(&modeled)
-        && let Some(split) = plan.split(modeled)
+        && let Some(split) = plan.split_for_retry(modeled, search.prefer_flattened)
     {
-        drop(plan);
         fit.fitted = Some(encode_vector_layers(split, width, height, config)?.bytes);
     } else if modeled < floor && (3..steps).contains(&floor) {
         // The fit reads the two-frame model, which runs well over the single
         // frame and knows nothing of the fringe snap: at the floor the real
         // encodes decide (the plain split passed the gates, so the snapped
         // one is safe here).
-        let best = encode_vector_floor(source, plan, floor, width, height, config)?;
+        let best = encode_vector_floor(search, plan, floor, width, height, config)?;
         if let Some(best) = &best {
             fit.smallest = fit.smallest.min(best.len());
         }
@@ -2027,27 +2084,22 @@ fn fit_vector_to_budget(
 /// The smaller of the plain and the fringe-snapped vector encode at the
 /// floor precision.
 fn encode_vector_floor(
-    source: &crate::vector_layers::SplitSource<'_, 3>,
-    plan: crate::vector_layers::SplitPlan<'_, '_, 3>,
+    search: &mut VectorSearch<'_, '_>,
+    plan: &crate::vector_layers::SplitPlan<'_, '_, 3>,
     floor: u32,
     width: usize,
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Option<Vec<u8>>, EncodeError> {
-    let plain_floor = plan.split(floor);
-    drop(plan);
+    let plain_floor = plan.split_for_retry(floor, search.prefer_flattened);
     let mut best = plain_floor
         .map(|split| encode_vector_layers(split, width, height, config))
         .transpose()?
         .map(|encoded| encoded.bytes);
-    if let Some(split) = source
-        .prepare(Some(crate::vector_layers::snap_reach(config.distance)))
-        .and_then(|plan| plan.split(floor))
+    if let Some(bytes) = search.encode_snapped_floor(floor, width, height, config)?
+        && best.as_ref().is_none_or(|b| bytes.len() < b.len())
     {
-        let bytes = encode_vector_layers(split, width, height, config)?.bytes;
-        if best.as_ref().is_none_or(|b| bytes.len() < b.len()) {
-            best = Some(bytes);
-        }
+        best = Some(bytes.to_vec());
     }
     Ok(best)
 }
@@ -2247,7 +2299,6 @@ struct InkStack {
     width: usize,
     height: usize,
     ctx: EncodingContext,
-    base_frame: BitWriter,
     /// Ink colors and coverage levels; index zero is transparent.
     inks: Vec<[u8; 3]>,
     ink: Vec<u8>,
@@ -2270,7 +2321,6 @@ impl InkStack {
             width,
             height,
             ctx,
-            base_frame,
             inks: plan.inks,
             ink: plan.ink,
             coverage: plan.coverage,
@@ -2287,10 +2337,46 @@ impl InkStack {
         } else {
             1
         };
+        let header = stack.image_header(config, alpha, &mut scratch);
+        let base_bits = header.bits_written() + base_frame.bits_written();
+        // Even before the ink frame and container overhead, a base that
+        // fills the budget rules out every precision above the hard mask.
+        if base_bits.div_ceil(8) as f64 > budget {
+            if floor > 1 {
+                return Ok(None);
+            }
+            levels = 1;
+        }
+        let transform = ColorTransform::for_integer(
+            8,
+            config.color_encoding.transfer,
+            config.color_encoding.primaries,
+            config.intensity_target,
+        );
+        let mut gain_map = None;
         loop {
-            let bytes = stack.assemble(config, alpha, levels, &mut scratch)?;
-            if bytes.len() as f64 <= budget || levels == 1 {
-                return Ok(Some(bytes));
+            let ink_frame = stack.encode_coverage(config, &transform, levels, &mut scratch)?;
+            let codestream_bytes = (base_bits + ink_frame.bits_written()).div_ceil(8);
+            // A container can only add bytes. Assemble only the candidates
+            // that can meet the budget, plus the hard mask when it stands.
+            if codestream_bytes as f64 <= budget || levels == 1 {
+                let mut w = header.clone();
+                w.append_bits(&base_frame);
+                w.append_bits(&ink_frame);
+                if gain_map.is_none() && config.gain_map.is_some() {
+                    gain_map = encode_gain_map(config)?;
+                }
+                let bytes = finalize_container(
+                    w.into_bytes(),
+                    config.exif.as_deref(),
+                    config.xmp.as_deref(),
+                    config.brotli_compression.as_deref(),
+                    false,
+                    gain_map.as_ref(),
+                )?;
+                if bytes.len() as f64 <= budget || levels == 1 {
+                    return Ok(Some(bytes));
+                }
             }
             if levels == floor {
                 return Ok(None);
@@ -2303,31 +2389,12 @@ impl InkStack {
         }
     }
 
-    /// Image header, saved base frame and final palette ink frame with the
-    /// coverage on `levels` steps above zero.
-    fn assemble(
+    fn image_header(
         &self,
         config: &EncodeConfig,
         alpha: Option<&AlphaPlane>,
-        levels: u32,
         scratch: &mut CoderScratch,
-    ) -> Result<Vec<u8>, EncodeError> {
-        let mut palette = Vec::with_capacity(1 + self.inks.len() * levels as usize);
-        palette.push(([0u8; 3], 0u8));
-        for &ink in &self.inks {
-            for step in 1..=levels {
-                palette.push((ink, ((step * 255 + levels / 2) / levels) as u8));
-            }
-        }
-        let steps: [u8; 256] = std::array::from_fn(|a| ((a as u32 * levels + 127) / 255) as u8);
-        let indices = self.ink.iter().zip(&self.coverage).map(|(&k, &a)| {
-            let step = usize::from(steps[usize::from(a)]);
-            if k == 0 || step == 0 {
-                0
-            } else {
-                (usize::from(k) - 1) * levels as usize + step
-            }
-        });
+    ) -> BitWriter {
         // The image header reads only the alpha bit depth.
         let opaque = alpha.is_none().then(|| AlphaPlane::from_u8(Vec::new()));
         let base_alpha = alpha.or(opaque.as_ref()).expect("base alpha");
@@ -2355,30 +2422,42 @@ impl InkStack {
             scratch,
             &mut w,
         );
-        w.append_bits(&self.base_frame);
-        let transform = ColorTransform::for_integer(
-            8,
-            config.color_encoding.transfer,
-            config.color_encoding.primaries,
-            config.intensity_target,
-        );
-        w.append_bits(&encode_ink_frame(
+        w
+    }
+
+    /// Final palette ink frame with coverage on `levels` steps above zero.
+    fn encode_coverage(
+        &self,
+        config: &EncodeConfig,
+        transform: &ColorTransform<TransferLut>,
+        levels: u32,
+        scratch: &mut CoderScratch,
+    ) -> Result<BitWriter, EncodeError> {
+        let mut palette = Vec::with_capacity(1 + self.inks.len() * levels as usize);
+        palette.push(([0u8; 3], 0u8));
+        for &ink in &self.inks {
+            for step in 1..=levels {
+                palette.push((ink, ((step * 255 + levels / 2) / levels) as u8));
+            }
+        }
+        let steps: [u8; 256] = std::array::from_fn(|a| ((a as u32 * levels + 127) / 255) as u8);
+        let indices = self.ink.iter().zip(&self.coverage).map(|(&k, &a)| {
+            let step = usize::from(steps[usize::from(a)]);
+            if k == 0 || step == 0 {
+                0
+            } else {
+                (usize::from(k) - 1) * levels as usize + step
+            }
+        });
+        encode_ink_frame(
             &self.ctx,
-            &transform,
+            transform,
             &palette,
             indices,
             self.width,
             self.height,
             config,
             scratch,
-        )?);
-        finalize_container(
-            w.into_bytes(),
-            config.exif.as_deref(),
-            config.xmp.as_deref(),
-            config.brotli_compression.as_deref(),
-            false,
-            encode_gain_map(config)?.as_ref(),
         )
     }
 }
@@ -2936,8 +3015,6 @@ fn encode_vector_layers(
         .any(|&a| a != 0)
         .then_some((layer, AlphaPlane::from_u8(coverage)));
     let mut image = Image3Si::new(width, height);
-    convert(&base, &mut image);
-    let base = band.is_some().then_some(base);
     let mut scratch = Box::new(CoderScratch::lossless());
     let mut w = BitWriter::new();
     w.write(8, 0xFF);
@@ -2982,9 +3059,10 @@ fn encode_vector_layers(
     let header = band.as_ref().map(|_| w.clone());
     let start = w.bits_written();
     // Art with transparency codes smaller as one frame nearly always (61 of
-    // 62 encodes, 0.73 of the two frames on average): only that one is coded.
+    // 62 encodes, 0.73 of the two frames on average).
     let single_only = transparent && band.is_some();
     if !single_only {
+        convert(&base, &mut image);
         crate::lossless::encode_frame_lossless_layer(
             &image,
             &base_alpha,
@@ -3016,7 +3094,8 @@ fn encode_vector_layers(
     }
     let band_bytes = (w.bits_written() - start) / 8 - base_bytes;
     let mut layered_bytes = w.bits_written().div_ceil(8);
-    if let Some(((layer, coverage), mut composite)) = band.zip(base) {
+    if let Some((layer, coverage)) = band {
+        let mut composite = base;
         // The same pixels as one lossless frame (a palette of the fills and
         // their mixes on flat art): the band blended over the base.
         let AlphaPlane::U8(alpha) = coverage else {
@@ -5286,6 +5365,11 @@ mod encode_smoke_tests {
             encoded.bytes.len(),
             encoded.layered
         );
+        let source = crate::vector_layers::SplitSource::rgb(&rgb, size, size).unwrap();
+        let plan = source.prepare(None).unwrap();
+        let split = plan.split_for_retry(steps, true).expect("flat art splits");
+        let flattened = encode_vector_layers(split, size, size, &config).unwrap();
+        assert_eq!(flattened.bytes, encoded.bytes);
     }
 
     #[test]
@@ -6788,6 +6872,7 @@ mod encode_smoke_tests {
 #[cfg(test)]
 mod lossy_alpha_tests {
     use super::*;
+    use crate::util::fast_hypot;
 
     const W: usize = 160;
     const H: usize = 136;
@@ -6802,7 +6887,7 @@ mod lossy_alpha_tests {
     }
 
     fn disc_radius(x: usize, y: usize) -> f32 {
-        (x as f32 - W as f32 / 2.0).hypot(y as f32 - H as f32 / 2.0) / H as f32
+        fast_hypot(x as f32 - W as f32 / 2.0, y as f32 - H as f32 / 2.0) / H as f32
     }
 
     fn soft(x: usize, y: usize) -> u8 {
@@ -6924,7 +7009,7 @@ mod lossy_alpha_tests {
         let mut rgba = Vec::with_capacity(w * h * 4);
         for y in 0..h {
             for x in 0..w {
-                let r = ((x as f32 - 128.0).hypot(y as f32 - 128.0) / 128.0).min(1.0);
+                let r = (fast_hypot(x as f32 - 128.0, y as f32 - 128.0) / 128.0).min(1.0);
                 let a = (8.0 + 200.0 * (1.0 - r)) as u8;
                 let t = ((x * 7 + y * 13) % 64) as u8;
                 rgba.extend([120 + t, 80 + t / 2, 200 - t, a]);
@@ -6956,7 +7041,7 @@ mod lossy_alpha_tests {
                 ]
                 .iter()
                 .map(|&(cx, cy, r): &(f32, f32, f32)| {
-                    let d = (x as f32 - cx).hypot(y as f32 - cy) - r;
+                    let d = fast_hypot(x as f32 - cx, y as f32 - cy) - r;
                     (0.5 - d / 1.5).clamp(0.0, 1.0)
                 })
                 .fold(0.0f32, f32::max);

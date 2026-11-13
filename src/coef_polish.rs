@@ -51,6 +51,7 @@ use crate::encoding_context::EncodingContext;
 use crate::entropy::{FrozenTokenPrices, Token, pack_signed};
 use crate::group::DequantBias;
 use crate::image::Image3F;
+use crate::simd::scaled_add::{AddScaledFn, selected_add_scaled_fn};
 use crate::ssimulacra2::{Rect, Ssimulacra2Checkpoint, Ssimulacra2State};
 
 /// Proposals verified per channel and round, best trellis proxy first.
@@ -186,7 +187,6 @@ fn rank_options_cap(options: &mut Vec<PolishOption>, cap: usize) {
 }
 
 type CountNonzeroFn = fn(&[i32]) -> usize;
-type AddScaledFn = fn(&mut [f32], &[f32], f32);
 
 #[cfg(any(
     test,
@@ -199,50 +199,24 @@ fn count_nonzero_scalar(values: &[i32]) -> usize {
     values.iter().filter(|&&v| v != 0).count()
 }
 
-#[cfg(any(
-    test,
-    not(any(
-        all(target_arch = "aarch64", feature = "neon"),
-        all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
-    ))
-))]
-fn add_scaled_scalar(row: &mut [f32], delta: &[f32], sign: f32) {
-    assert_eq!(row.len(), delta.len());
-    for (v, &d) in row.iter_mut().zip(delta) {
-        *v += sign * d;
-    }
-}
-
-fn select_kernels() -> (CountNonzeroFn, AddScaledFn) {
+fn select_count_nonzero_fn() -> CountNonzeroFn {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    return (
-        |v| unsafe { crate::neon::polish_count_nonzero_neon(v) },
-        |r, d, s| unsafe { crate::neon::polish_add_scaled_neon(r, d, s) },
-    );
+    return |v| unsafe { crate::neon::polish_count_nonzero_neon(v) };
     #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
-    return (
-        crate::wasm::polish_count_nonzero_wasm,
-        crate::wasm::polish_add_scaled_wasm,
-    );
+    return crate::wasm::polish_count_nonzero_wasm;
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     if is_x86_feature_detected!("avx2") {
-        return (
-            |v| unsafe { crate::avx::polish_count_nonzero_avx2(v) },
-            |r, d, s| unsafe { crate::avx::polish_add_scaled_avx2(r, d, s) },
-        );
+        return |v| unsafe { crate::avx::polish_count_nonzero_avx2(v) };
     }
     #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
     if is_x86_feature_detected!("sse4.1") {
-        return (
-            |v| unsafe { crate::sse::polish_count_nonzero_sse41(v) },
-            |r, d, s| unsafe { crate::sse::polish_add_scaled_sse41(r, d, s) },
-        );
+        return |v| unsafe { crate::sse::polish_count_nonzero_sse41(v) };
     }
     #[cfg(not(any(
         all(target_arch = "aarch64", feature = "neon"),
         all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
     )))]
-    (count_nonzero_scalar, add_scaled_scalar)
+    count_nonzero_scalar
 }
 
 fn count_nonzero_except_llf(
@@ -422,7 +396,6 @@ impl CoefPolisher {
         cv: Option<CvJudge>,
     ) -> Self {
         let base_d = state.deficit();
-        let (count_nonzero, add_scaled) = select_kernels();
         Self {
             recon,
             state,
@@ -435,8 +408,8 @@ impl CoefPolisher {
             delta_pix: Vec::new(),
             plane_delta: Default::default(),
             options: Vec::with_capacity(MAX_POSITIONS * 2),
-            count_nonzero,
-            add_scaled,
+            count_nonzero: select_count_nonzero_fn(),
+            add_scaled: selected_add_scaled_fn(),
             area_budget: false,
         }
     }
@@ -1221,59 +1194,34 @@ mod tests {
         }
     }
 
-    fn check_kernels(count: CountNonzeroFn, add: AddScaledFn) {
+    fn check_count_nonzero(count: CountNonzeroFn) {
         let values: Vec<i32> = (0..16386)
             .map(|i| [0, -1, i32::MIN, 0, i32::MAX, 7, 0][i % 7])
             .collect();
         for len in (0..129).chain([255, 256, 1023, 16384]) {
             let input = &values[1..1 + len];
             assert_eq!(count(input), count_nonzero_scalar(input), "len={len}");
-            let delta: Vec<f32> = (0..len)
-                .map(|i| [0.0, -0.0, f32::MIN_POSITIVE, 1e-8, -0.7, 1e10, -1e-10][i % 7])
-                .collect();
-            for sign in [-1.0, 1.0, 0.73] {
-                let mut actual: Vec<f32> = (0..len + 2)
-                    .map(|i| [0.0, -0.0, 0.3, -0.2, 1e-8, 1e10][i % 6])
-                    .collect();
-                let mut expected = actual.clone();
-                add_scaled_scalar(&mut expected[1..len + 1], &delta, sign);
-                add(&mut actual[1..len + 1], &delta, sign);
-                assert!(
-                    actual
-                        .iter()
-                        .zip(&expected)
-                        .all(|(a, b)| a.to_bits() == b.to_bits()),
-                    "len={len}, sign={sign}"
-                );
-            }
         }
     }
 
     #[test]
-    fn selected_kernels_preserve_scalar_bits_and_handle_tails() {
-        let (count, add) = select_kernels();
-        check_kernels(count, add);
+    fn selected_nonzero_count_matches_scalar() {
+        check_count_nonzero(select_count_nonzero_fn());
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     #[test]
-    fn avx2_kernels_preserve_scalar_bits_and_handle_tails() {
+    fn avx2_nonzero_count_matches_scalar() {
         if is_x86_feature_detected!("avx2") {
-            check_kernels(
-                |v| unsafe { crate::avx::polish_count_nonzero_avx2(v) },
-                |r, d, s| unsafe { crate::avx::polish_add_scaled_avx2(r, d, s) },
-            );
+            check_count_nonzero(|v| unsafe { crate::avx::polish_count_nonzero_avx2(v) });
         }
     }
 
     #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
     #[test]
-    fn sse41_kernels_preserve_scalar_bits_and_handle_tails() {
+    fn sse41_nonzero_count_matches_scalar() {
         if is_x86_feature_detected!("sse4.1") {
-            check_kernels(
-                |v| unsafe { crate::sse::polish_count_nonzero_sse41(v) },
-                |r, d, s| unsafe { crate::sse::polish_add_scaled_sse41(r, d, s) },
-            );
+            check_count_nonzero(|v| unsafe { crate::sse::polish_count_nonzero_sse41(v) });
         }
     }
 
@@ -1312,7 +1260,7 @@ mod tests {
 
     #[test]
     fn cached_nonzero_counts_match_full_recounts_for_every_move() {
-        let (count, _) = select_kernels();
+        let count = select_count_nonzero_fn();
         let orders = crate::coeff_order::CoeffOrders::natural();
         for (strategy, cx, cy) in [
             (0, 1, 1),

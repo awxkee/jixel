@@ -792,7 +792,7 @@ fn lowpass_energy(plane: &[f32], w: usize, h: usize, kernel: &[f32], tmp: &mut V
         tmp.fill(0.0);
         return 0.0;
     }
-    let add_scaled = crate::dc_ops::selected_add_scaled_fn();
+    let add_scaled = crate::simd::scaled_add::selected_add_scaled_fn();
     let r = kernel.len() / 2;
     let padded_len = w + kernel.len() - 1;
     // Reuse the plane's scratch allocation for the padded source row and

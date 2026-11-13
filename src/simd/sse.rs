@@ -281,3 +281,24 @@ pub(crate) mod f32 {
         _mm_cvttps_epi32(v)
     }
 }
+
+#[target_feature(enable = "sse4.1")]
+pub(crate) fn add_scaled_sse41(out: &mut [f32], src: &[f32], factor: f32) {
+    let (src_blocks, src) = src[..out.len()].as_chunks::<4>();
+    let (out_blocks, out) = out.as_chunks_mut::<4>();
+    let scale = _mm_set1_ps(factor);
+    for (dst, src) in out_blocks.iter_mut().zip(src_blocks) {
+        let dst = dst.as_mut_ptr();
+        // SAFETY: both arrays contain four elements.
+        unsafe {
+            _mm_storeu_ps(
+                dst,
+                _mm_add_ps(
+                    _mm_loadu_ps(dst),
+                    _mm_mul_ps(scale, _mm_loadu_ps(src.as_ptr())),
+                ),
+            );
+        }
+    }
+    crate::simd::scaled_add::add_scaled_scalar(out, src, factor);
+}

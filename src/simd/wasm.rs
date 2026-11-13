@@ -223,3 +223,23 @@ pub(crate) mod f32 {
         i32x4_trunc_sat_f32x4(v)
     }
 }
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn add_scaled_wasm(out: &mut [f32], src: &[f32], factor: f32) {
+    use self::f32::{load, store};
+
+    let (src_blocks, src) = src[..out.len()].as_chunks::<4>();
+    let (out_blocks, out) = out.as_chunks_mut::<4>();
+    let scale = f32x4_splat(factor);
+    for (dst, src) in out_blocks.iter_mut().zip(src_blocks) {
+        let dst = dst.as_mut_ptr();
+        // SAFETY: both arrays contain four elements.
+        unsafe {
+            store(
+                dst,
+                f32x4_add(load(dst), f32x4_mul(scale, load(src.as_ptr()))),
+            );
+        }
+    }
+    crate::simd::scaled_add::add_scaled_scalar(out, src, factor);
+}

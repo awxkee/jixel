@@ -259,32 +259,6 @@ pub(crate) fn dc_distortion_row_scalar(
     sum
 }
 
-pub(crate) type AddScaledFn = fn(&mut [f32], &[f32], f32);
-
-#[allow(unreachable_code)]
-pub(crate) fn selected_add_scaled_fn() -> AddScaledFn {
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    if std::arch::is_x86_feature_detected!("avx2") {
-        return |a, b, c| unsafe { crate::avx::add_scaled_avx2(a, b, c) };
-    }
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
-    if std::arch::is_x86_feature_detected!("sse4.1") {
-        return |a, b, c| unsafe { crate::sse::add_scaled_sse41(a, b, c) };
-    }
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    return |a, b, c| unsafe { crate::neon::add_scaled_neon(a, b, c) };
-    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
-    return crate::wasm::add_scaled_wasm;
-    add_scaled_scalar
-}
-
-#[allow(dead_code)]
-pub(crate) fn add_scaled_scalar(out: &mut [f32], src: &[f32], factor: f32) {
-    for (out, &src) in out.iter_mut().zip(src) {
-        *out += factor * src;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +522,7 @@ mod tests {
 #[cfg(test)]
 mod search_row_tests {
     use super::*;
+    use crate::simd::scaled_add::{AddScaledFn, add_scaled_scalar, selected_add_scaled_fn};
 
     #[derive(Clone, Copy)]
     struct Rows {
@@ -572,7 +547,7 @@ mod search_row_tests {
                 dc_distortion: |a, b, c, d, e, f| unsafe {
                     crate::avx::dc_distortion_row_avx2(a, b, c, d, e, f)
                 },
-                add_scaled: |a, b, c| unsafe { crate::avx::add_scaled_avx2(a, b, c) },
+                add_scaled: |a, b, c| unsafe { crate::simd::avx::add_scaled_avx2(a, b, c) },
             });
         }
         #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
@@ -584,7 +559,7 @@ mod search_row_tests {
                 dc_distortion: |a, b, c, d, e, f| unsafe {
                     crate::sse::dc_distortion_row_sse41(a, b, c, d, e, f)
                 },
-                add_scaled: |a, b, c| unsafe { crate::sse::add_scaled_sse41(a, b, c) },
+                add_scaled: |a, b, c| unsafe { crate::simd::sse::add_scaled_sse41(a, b, c) },
             });
         }
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -596,7 +571,9 @@ mod search_row_tests {
                 dc_distortion: |a, b, c, d, e, f| unsafe {
                     crate::neon::dc_distortion_row_neon(a, b, c, d, e, f)
                 },
-                add_scaled: |a, b, c| unsafe { crate::neon::add_scaled_neon(a, b, c) },
+                add_scaled: |a, b, c| unsafe {
+                    crate::simd::neon_add_scaled::add_scaled_neon(a, b, c)
+                },
             });
         }
         #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
@@ -604,7 +581,7 @@ mod search_row_tests {
             rows.push(Rows {
                 dc_error: crate::wasm::dc_error_row_wasm,
                 dc_distortion: crate::wasm::dc_distortion_row_wasm,
-                add_scaled: crate::wasm::add_scaled_wasm,
+                add_scaled: crate::simd::wasm::add_scaled_wasm,
             });
         }
         rows.push(Rows {

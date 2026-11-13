@@ -31,7 +31,7 @@
 //! with one ordinary Palette instead of two.
 //!
 //! The nested form sends the coordinate through a second Palette whose table
-//! carries explicit deltas. jxl-oxide 0.12 sizes that table from the colour
+//! carries explicit deltas. jxl-oxide 0.12 sizes that table from the color
 //! count alone and cannot read it. Here the coordinate plane is coded
 //! directly, group by group, under a context tree that predicts it exactly
 //! away from the first row and column of each group:

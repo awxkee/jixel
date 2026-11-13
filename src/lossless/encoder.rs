@@ -82,6 +82,16 @@ pub(super) fn learned_tree_is_decisive(estimated_savings: f64) -> bool {
     estimated_savings >= MA_DECISIVE_MIN_SAVINGS
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum TreeSearch {
+    /// Include a second, per-group tree when its rate estimate qualifies.
+    Full,
+    /// Use the frame-wide learned trees only.
+    Global,
+    /// Use frame-wide trees and rank the vector palette before the full race.
+    Vector,
+}
+
 /// Codes one lossless frame of `linear` (YCoCg planes, or one gray plane)
 /// and `alpha`. Returns whether a learned tree won decisively, which tells
 /// the caller a tile-patch plan cannot beat this frame.
@@ -101,7 +111,11 @@ pub(crate) fn encode_frame_lossless_core(
         settings,
         frame_kind,
         true,
-        local_trees,
+        if local_trees {
+            TreeSearch::Full
+        } else {
+            TreeSearch::Global
+        },
         pool,
         scratch,
         writer,
@@ -117,12 +131,12 @@ pub(super) fn encode_frame_lossless_core_impl(
     settings: LosslessSettings,
     frame_kind: ModularFrameKind<'_>,
     allow_palette_candidates: bool,
-    local_trees: bool,
+    tree_search: TreeSearch,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) -> bool {
-    let frame = CoreFrame::new(linear, alpha, settings, frame_kind, local_trees);
+    let frame = CoreFrame::new(linear, alpha, settings, frame_kind, tree_search);
 
     // Step 1: a few-color image codes as a palette and an index channel.
     if allow_palette_candidates
@@ -258,8 +272,7 @@ struct CoreFrame<'a> {
     settings: LosslessSettings,
     effort: Effort,
     kind: ModularFrameKind<'a>,
-    /// Learned-tree frames may give groups their own trees.
-    local_trees: bool,
+    tree_search: TreeSearch,
     xsize: usize,
     ysize: usize,
     num_color: usize,
@@ -295,7 +308,7 @@ impl<'a> CoreFrame<'a> {
         alpha: Option<&'a AlphaPlane>,
         settings: LosslessSettings,
         kind: ModularFrameKind<'a>,
-        local_trees: bool,
+        tree_search: TreeSearch,
     ) -> Self {
         let effort = *settings.speed.effort();
         let (xsize, ysize) = (ycocg.xsize(), ycocg.ysize());
@@ -307,7 +320,7 @@ impl<'a> CoreFrame<'a> {
             settings,
             effort,
             kind,
-            local_trees,
+            tree_search,
             xsize,
             ysize,
             num_color,
@@ -411,7 +424,7 @@ impl<'a> CoreFrame<'a> {
                 self.settings,
                 self.kind,
                 false,
-                self.local_trees,
+                self.tree_search,
                 pool,
                 scratch,
                 &mut normal_writer,

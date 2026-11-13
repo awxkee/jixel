@@ -488,21 +488,3 @@ pub(crate) fn dc_distortion_row_wasm(
     }
     sum
 }
-
-#[target_feature(enable = "simd128")]
-pub(crate) fn add_scaled_wasm(out: &mut [f32], src: &[f32], factor: f32) {
-    assert!(src.len() >= out.len());
-    let end = out.len() / 4 * 4;
-    for x in (0..end).step_by(4) {
-        unsafe {
-            fstore(
-                out.as_mut_ptr().add(x),
-                f32x4_add(
-                    fload(out.as_ptr().add(x)),
-                    f32x4_mul(f32x4_splat(factor), fload(src.as_ptr().add(x))),
-                ),
-            );
-        }
-    }
-    crate::dc_ops::add_scaled_scalar(&mut out[end..], &src[end..], factor);
-}

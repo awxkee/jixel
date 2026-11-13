@@ -1462,7 +1462,7 @@ pub(super) fn rd_select(
     let dot_templates = dots::share_templates(keys.iter().copied().zip(ctx.thread_pool.steal_map(
         scratch,
         keys.len(),
-        |i, _| dots::DotTemplate::new(keys[i]),
+        |i, _| dots::DotTemplate::new(ctx.spline_kernels, keys[i]),
     )));
     // All placements of a template share its price within each pass.
     let first_dot_price = dot_start.map(|bits| bits + DOT_FIRST_PASS_TEMPLATE_BITS);
@@ -2183,7 +2183,7 @@ mod tests {
                 .collect();
             let templates = dots::share_templates(
                 keys.into_iter()
-                    .map(|key| (key, dots::DotTemplate::new(key))),
+                    .map(|key| (key, dots::DotTemplate::new(ctx.spline_kernels, key))),
             );
             let mut original = Image3F::new(w, h);
             for sp in &selected {

@@ -31,7 +31,10 @@
 pub(crate) mod avx;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 pub(crate) mod neon;
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod neon_add_scaled;
 pub(crate) mod rgb8_blend;
+pub(crate) mod scaled_add;
 #[cfg(any(
     all(target_arch = "x86_64", feature = "avx"),
     all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse")

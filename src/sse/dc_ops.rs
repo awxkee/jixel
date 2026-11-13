@@ -494,21 +494,3 @@ pub(crate) fn dc_distortion_row_sse41(
     }
     sum
 }
-
-#[target_feature(enable = "sse4.1")]
-pub(crate) fn add_scaled_sse41(out: &mut [f32], src: &[f32], factor: f32) {
-    assert!(src.len() >= out.len());
-    let end = out.len() / 4 * 4;
-    for x in (0..end).step_by(4) {
-        unsafe {
-            _mm_storeu_ps(
-                out.as_mut_ptr().add(x),
-                _mm_add_ps(
-                    _mm_loadu_ps(out.as_ptr().add(x)),
-                    _mm_mul_ps(_mm_set1_ps(factor), _mm_loadu_ps(src.as_ptr().add(x))),
-                ),
-            );
-        }
-    }
-    crate::dc_ops::add_scaled_scalar(&mut out[end..], &src[end..], factor);
-}

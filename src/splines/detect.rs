@@ -27,11 +27,12 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use super::Point;
 use super::filter::FilterPlan;
-use super::{Point, fast_hypot};
 use crate::coder_scratch::CoderScratch;
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
+use crate::util::fast_hypot;
 
 static SCALES: [f32; 4] = [0.7, 1.0, 1.5, 2.2];
 const HYSTERESIS_HIGH: f32 = 0.02;
@@ -114,21 +115,6 @@ impl RidgeRow<'_> {
 
 /// Derivative rows are hxx, hyy, hxy, gx and gy, in that order.
 pub(crate) type RidgeRowFn = fn(f32, [&[f32]; 5], RidgeRow<'_>);
-
-pub(crate) fn select_ridge_row_fn() -> RidgeRowFn {
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    return |s, derivatives, output| unsafe {
-        crate::neon::spline_ridge_row_neon(s, derivatives, output)
-    };
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-        return |s, derivatives, output| unsafe {
-            crate::avx::spline_ridge_row_avx2(s, derivatives, output)
-        };
-    }
-    #[allow(unreachable_code)]
-    ridge_row_scalar
-}
 
 pub(crate) fn ridge_row_scalar(s: f32, derivatives: [&[f32]; 5], output: RidgeRow<'_>) {
     output.validate(derivatives);
@@ -267,13 +253,14 @@ fn ridge_map(
                     .zip(band.offset.chunks_exact_mut(w));
                 for (row, outputs) in rows.enumerate() {
                     let y = band.start / w + row;
-                    v0.vertical_row(&r2, w, y, hxx);
-                    v2.vertical_row(&r0, w, y, hyy);
-                    v1.vertical_row(&r1, w, y, hxy);
-                    v0.vertical_row(&r1, w, y, gx);
-                    v1.vertical_row(&r0, w, y, gy);
+                    let kernels = ctx.spline_kernels;
+                    v0.vertical_row(kernels, &r2, w, y, hxx);
+                    v2.vertical_row(kernels, &r0, w, y, hyy);
+                    v1.vertical_row(kernels, &r1, w, y, hxy);
+                    v0.vertical_row(kernels, &r1, w, y, gx);
+                    v1.vertical_row(kernels, &r0, w, y, gy);
                     let (((((strengths, nx), ny), scales), polarities), offsets) = outputs;
-                    (ctx.spline_ridge_row)(
+                    (ctx.spline_kernels.ridge_row)(
                         s,
                         [hxx, hyy, hxy, gx, gy],
                         RidgeRow {
@@ -929,7 +916,7 @@ mod tests {
                 let (mut expected, mut actual) = (make_map(), make_map());
                 for s in [0.7, 0.7, 1.0, 1.5, 2.2] {
                     ridge_row_scalar(s, derivatives, row(&mut expected, range.clone()));
-                    (ctx.spline_ridge_row)(s, derivatives, row(&mut actual, range.clone()));
+                    (ctx.spline_kernels.ridge_row)(s, derivatives, row(&mut actual, range.clone()));
                     for (a, b) in [
                         (&actual.strength, &expected.strength),
                         (&actual.nx, &expected.nx),

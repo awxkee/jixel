@@ -42,23 +42,3 @@ pub(crate) fn polish_count_nonzero_neon(values: &[i32]) -> usize {
     }
     values.len() - count - values[i..].iter().filter(|&&v| v == 0).count()
 }
-
-/// Separate multiply and add preserve the scalar polish's rounding (no FMA).
-/// The caller must ensure neon is available.
-#[target_feature(enable = "neon")]
-pub(crate) fn polish_add_scaled_neon(row: &mut [f32], delta: &[f32], sign: f32) {
-    assert_eq!(row.len(), delta.len());
-    let factor = vdupq_n_f32(sign);
-    let mut i = 0;
-    while i + 4 <= row.len() {
-        let v = unsafe { vld1q_f32(row.as_ptr().add(i)) };
-        let d = unsafe { vld1q_f32(delta.as_ptr().add(i)) };
-        let scaled = vmulq_f32(d, factor);
-        let sum = vaddq_f32(v, scaled);
-        unsafe { vst1q_f32(row.as_mut_ptr().add(i), sum) };
-        i += 4;
-    }
-    for (v, &d) in row[i..].iter_mut().zip(&delta[i..]) {
-        *v += sign * d;
-    }
-}

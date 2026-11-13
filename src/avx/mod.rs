@@ -49,6 +49,8 @@ mod noise;
 mod quant;
 mod quantize_xyb;
 #[cfg(feature = "splines")]
+mod spline_fit;
+#[cfg(feature = "splines")]
 mod splines;
 mod xyb;
 mod yellow_opsin;
@@ -63,8 +65,8 @@ pub(crate) use cfl::{
 };
 pub(crate) use color::color_matrix_shaper_avx2;
 pub(crate) use dc_ops::{
-    add_scaled_avx2, adjust_b_dc_avx2, compensate_b_dc_avx2, dc_distortion_row_avx2,
-    dc_error_row_avx2, reconstruct_dc_avx2,
+    adjust_b_dc_avx2, compensate_b_dc_avx2, dc_distortion_row_avx2, dc_error_row_avx2,
+    reconstruct_dc_avx2,
 };
 pub(crate) use dct::{
     dc_from_dct8x32_avx2, dc_from_dct16x32_avx2, dc_from_dct32x16_avx2, dc_from_dct32x32_avx2,
@@ -111,9 +113,12 @@ pub(crate) use yellow_opsin::sampled_b_gradient_ratio_avx2;
 pub(crate) use ytob::{accumulate_ytob_weights_avx2, fill_ytob_residuals_avx2, fill_ytob_row_avx2};
 
 #[cfg(feature = "splines")]
+pub(crate) use spline_fit::{accumulate_fit_avx2, add_scaled_f64_avx2, sub_dot_avx2};
+#[cfg(feature = "splines")]
 pub(crate) use splines::{
-    continuous_idct_avx2, spline_distance_avx2, spline_render_row_avx2, spline_ridge_row_avx2,
+    blob_weight_row_avx2, continuous_idct_avx2, spline_distance_avx2, spline_render_row_avx2,
+    spline_ridge_row_avx2, vertical_row_avx2,
 };
 
 #[cfg(feature = "extraslow")]
-pub(crate) use coef_polish::{polish_add_scaled_avx2, polish_count_nonzero_avx2};
+pub(crate) use coef_polish::polish_count_nonzero_avx2;

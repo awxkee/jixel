@@ -51,28 +51,6 @@ fn fast_cos(x: f32) -> f32 {
 /// Coefficients are interleaved by channel and already multiplied by sqrt(2).
 pub(crate) type ContinuousIdctFn = fn(&[[f32; 4]; 32], f32) -> [f32; 4];
 
-pub(crate) fn select_continuous_idct_fn() -> ContinuousIdctFn {
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    return |dct, t| unsafe { crate::neon::continuous_idct_neon(dct, t) };
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-        return |dct, t| unsafe { crate::avx::continuous_idct_avx2(dct, t) };
-    }
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
-    {
-        if std::is_x86_feature_detected!("sse4.1") {
-            return |dct, t| unsafe { crate::sse::continuous_idct_sse41(dct, t) };
-        }
-        if std::is_x86_feature_detected!("sse2") {
-            return |dct, t| unsafe { crate::sse::continuous_idct_sse2(dct, t) };
-        }
-    }
-    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
-    return crate::wasm::continuous_idct_wasm;
-    #[allow(unreachable_code)]
-    continuous_idct_scalar
-}
-
 pub(super) fn continuous_idct_scalar(dct: &[[f32; 4]; 32], t: f32) -> [f32; 4] {
     let mut result = [0.0; 4];
     for (i, row) in dct.iter().enumerate() {
@@ -105,7 +83,7 @@ mod tests {
         let interleaved = std::array::from_fn(|i| {
             std::array::from_fn(|c| std::f32::consts::SQRT_2 * channels[c][i])
         });
-        let selected = crate::encoding_context::EncodingContext::default().spline_continuous_idct;
+        let selected = crate::splines::SplinesContext::get().continuous_idct;
         let steps = if cfg!(miri) { 8 } else { 256 };
         for k in 0..=steps {
             let t = 31.0 * k as f32 / steps as f32;

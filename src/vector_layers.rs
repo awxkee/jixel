@@ -94,26 +94,56 @@ pub(crate) fn band_bytes_ratio(steps: u32) -> f64 {
 pub(crate) const VARDCT_BYTES_MARGIN: f64 = 1.39;
 
 pub(crate) fn vardct_bytes(rgb: &[u8], width: usize, height: usize, distance: f32) -> f64 {
-    let px = rgb.as_chunks::<3>().0;
     let d = distance.max(0.1);
     let cost: [f32; 256] = std::array::from_fn(|v| (1.0 + v as f32 / (4.0 * d)).log2());
-    let step = |a: [u8; 3], b: [u8; 3]| {
-        cost[(0..3).map(|k| a[k].abs_diff(b[k])).max().unwrap() as usize] as f64
-    };
     let mut bits = 0.0;
+    visit_edges(rgb, width, height, |v| bits += f64::from(cost[v]));
+    1.16 * bits / 8.0 * d.powf(-0.41) as f64
+}
+
+/// Evaluate the edge budget at several distances from one image traversal.
+pub(crate) fn vardct_edge_histogram(rgb: &[u8], width: usize, height: usize) -> [usize; 256] {
+    let mut counts = [0; 256];
+    visit_edges(rgb, width, height, |v| {
+        if v != 0 {
+            counts[v] += 1;
+        }
+    });
+    counts
+}
+
+pub(crate) fn vardct_bytes_from_edges(counts: &[usize; 256], distance: f32) -> f64 {
+    let d = distance.max(0.1);
+    let bits: f64 = counts
+        .iter()
+        .enumerate()
+        .skip(1)
+        .map(|(v, &count)| count as f64 * f64::from((1.0 + v as f32 / (4.0 * d)).log2()))
+        .sum();
+    1.16 * bits / 8.0 * d.powf(-0.41) as f64
+}
+
+fn visit_edges(rgb: &[u8], width: usize, height: usize, mut visit: impl FnMut(usize)) {
+    let px = rgb.as_chunks::<3>().0;
+    let delta = |a: [u8; 3], b: [u8; 3]| {
+        usize::from(
+            a[0].abs_diff(b[0])
+                .max(a[1].abs_diff(b[1]))
+                .max(a[2].abs_diff(b[2])),
+        )
+    };
     for y in 0..height {
         let row = &px[y * width..(y + 1) * width];
         for x in 1..width {
-            bits += step(row[x - 1], row[x]);
+            visit(delta(row[x - 1], row[x]));
         }
         if y > 0 {
             let above = &px[(y - 1) * width..y * width];
             for x in 0..width {
-                bits += step(above[x], row[x]);
+                visit(delta(above[x], row[x]));
             }
         }
     }
-    1.16 * bits / 8.0 * d.powf(-0.41) as f64
 }
 
 /// Open-addressing histogram for the exact colors of flat art.
@@ -578,7 +608,7 @@ impl<'a> SplitSource<'a, 4> {
     }
 }
 
-impl<const CHANNELS: usize> SplitSource<'_, CHANNELS> {
+impl<'pixels, const CHANNELS: usize> SplitSource<'pixels, CHANNELS> {
     #[inline]
     fn pixel(&self, i: usize) -> [u8; 3] {
         let p = self.pixels[i];
@@ -634,7 +664,10 @@ impl<const CHANNELS: usize> SplitSource<'_, CHANNELS> {
 
     /// The split's plan; `snap` folds resampling fringe within that many
     /// levels onto the palette (see [`snap_reach`]).
-    pub(crate) fn prepare(&self, snap: Option<u8>) -> Option<SplitPlan<'_, '_, CHANNELS>> {
+    pub(crate) fn prepare<'source>(
+        &'source self,
+        snap: Option<u8>,
+    ) -> Option<SplitPlan<'source, 'pixels, CHANNELS>> {
         let n = self.width * self.height;
         let mut labels = self.labels();
         let snapped = if let Some(max_reach) = snap {
@@ -790,6 +823,11 @@ impl Mix {
     }
 }
 
+#[inline]
+fn coverage_byte(step: u32, steps: u32) -> u8 {
+    ((step * 255 + steps / 2) / steps) as u8
+}
+
 fn alpha_mix(
     p: [f32; 3],
     alpha: u8,
@@ -911,7 +949,7 @@ impl<const CHANNELS: usize> SplitPlan<'_, '_, CHANNELS> {
             };
             base[i] = palette[color as usize];
             if step > 0 && step < steps {
-                coverage[i] = ((step * 255 + steps / 2) / steps) as u8;
+                coverage[i] = coverage_byte(step, steps);
                 layer[i] = palette[mix.top as usize];
             }
         }
@@ -942,6 +980,49 @@ impl<const CHANNELS: usize> SplitPlan<'_, '_, CHANNELS> {
             layer: layer.into_flattened(),
             coverage,
             base_alpha,
+        })
+    }
+}
+
+impl SplitPlan<'_, '_, 3> {
+    /// Render a one-frame RGB retry directly from the sparse edge plan.
+    /// The coverage and upper-color planes are only needed for layered frames.
+    pub(crate) fn split_for_retry(&self, steps: u32, flattened: bool) -> Option<VectorSplit> {
+        if !flattened {
+            return self.split(steps);
+        }
+        let palette = &self.source.palette;
+        let mut base = self.source.pixels.to_vec();
+        for &(i, label) in &self.snapped {
+            base[i] = palette[label as usize];
+        }
+        let mut band = 0;
+        let max_band = MAX_BAND_SHARE * base.len() as f32;
+        for &(i, mix) in &self.mixes {
+            let step = mix.step(steps);
+            let bottom = palette[mix.bottom as usize];
+            let top = palette[mix.top as usize];
+            base[i] = if step == steps {
+                top
+            } else if step == 0 {
+                bottom
+            } else {
+                band += 1;
+                if band as f32 > max_band {
+                    return None;
+                }
+                let alpha = u16::from(coverage_byte(step, steps));
+                std::array::from_fn(|c| {
+                    ((u16::from(bottom[c]) * (255 - alpha) + u16::from(top[c]) * alpha + 127) / 255)
+                        as u8
+                })
+            };
+        }
+        Some(VectorSplit {
+            base: base.into_flattened(),
+            layer: Vec::new(),
+            coverage: Vec::new(),
+            base_alpha: None,
         })
     }
 }

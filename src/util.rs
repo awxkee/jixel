@@ -32,6 +32,19 @@ use crate::encode_image::MAX_DIMENSION;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
+/// Euclidean length for bounded inputs, without rescaling to avoid overflow or underflow.
+#[cfg(any(feature = "splines", test))]
+#[inline]
+pub(crate) fn fast_hypot(x: f32, y: f32) -> f32 {
+    (x * x + y * y).sqrt()
+}
+
+/// Double-precision Euclidean length for bounded inputs.
+#[inline]
+pub(crate) fn fast_hypot_f64(x: f64, y: f64) -> f64 {
+    (x * x + y * y).sqrt()
+}
+
 pub(crate) fn try_vec_fill<T: Clone>(value: T, len: usize) -> Result<Vec<T>, EncodeError> {
     let size = len
         .checked_mul(size_of::<T>())

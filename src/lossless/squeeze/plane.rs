@@ -319,6 +319,7 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
 mod tests {
     use super::*;
     use crate::lossless::tree::{TREE_CTX_PREDICTOR, TREE_CTX_PROPERTY, TREE_CTX_SPLIT_VAL};
+    use crate::util::fast_hypot;
 
     #[test]
     fn common_factor_division_preserves_signed_quotients() {
@@ -354,7 +355,7 @@ mod tests {
                 ]
                 .iter()
                 .map(|&(cx, cy, r): &(f32, f32, f32)| {
-                    (0.5 - ((x - cx).hypot(y - cy) - r) / 1.5).clamp(0.0, 1.0)
+                    (0.5 - (fast_hypot(x - cx, y - cy) - r) / 1.5).clamp(0.0, 1.0)
                 })
                 .fold(0.0f32, f32::max)
             })

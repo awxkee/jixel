@@ -42,6 +42,7 @@ use crate::coder_scratch::CoderScratch;
 use crate::encoding_context::EncodingContext;
 use crate::entropy::pack_signed;
 use crate::image::Image3F;
+use crate::util::fast_hypot;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
@@ -158,7 +159,7 @@ fn smooth(contour: &Contour) -> (Vec<Point<f32>>, Vec<Point<f32>>) {
         } else {
             Point::new(p.x / weight, p.y / weight)
         });
-        let norm = normal.x.hypot(normal.y).max(1e-8);
+        let norm = fast_hypot(normal.x, normal.y).max(1e-8);
         normals.push(Point::new(normal.x / norm, normal.y / norm));
     }
     (points, normals)
@@ -198,7 +199,7 @@ fn delta_bits(value: i32) -> f64 {
 const DELTA_TABLE_REACH: i32 = 1024;
 
 /// `delta_bits` tabulated for the double deltas the DP prices in bulk.
-static DELTA_TABLE: std::sync::LazyLock<Vec<f64>> = std::sync::LazyLock::new(|| {
+static DELTA_TABLE: LazyLock<Vec<f64>> = LazyLock::new(|| {
     (-DELTA_TABLE_REACH..=DELTA_TABLE_REACH)
         .map(delta_bits)
         .collect()
@@ -238,7 +239,7 @@ fn dp_controls(
             curve[(i + reach).min(n - 1)],
         );
         let (dx, dy) = (b.x - a.x, b.y - a.y);
-        let length = dx.hypot(dy).max(1e-6);
+        let length = fast_hypot(dx, dy).max(1e-6);
         Point::new(dx / length, dy / length)
     };
     let normal_error = |i: usize, p: Point<f32>| {
@@ -274,7 +275,7 @@ fn dp_controls(
     let span_error = |i0: usize, i1: usize, a: Point<i32>, b: Point<i32>, tangents| {
         let (ta, tb): (Point<f32>, Point<f32>) = tangents;
         let (ax, ay, bx, by) = (a.x as f32, a.y as f32, b.x as f32, b.y as f32);
-        let length = (bx - ax).hypot(by - ay);
+        let length = fast_hypot(bx - ax, by - ay);
         let mut error = 0.0f64;
         for i in i0 + 1..=i1 {
             let u = (i - i0) as f32 / (i1 - i0) as f32;
@@ -873,7 +874,7 @@ mod dp_tests {
                     curve[(i + 1).min(curve.len() - 1)],
                 );
                 let (dx, dy) = (b.x - a.x, b.y - a.y);
-                let length = dx.hypot(dy);
+                let length = fast_hypot(dx, dy);
                 Point::new(-dy / length, dx / length)
             })
             .collect()
@@ -895,7 +896,7 @@ mod dp_tests {
                         let (dx, dy) = (w[1].x - w[0].x, w[1].y - w[0].y);
                         let l2 = (dx * dx + dy * dy).max(1e-9);
                         let t = (((p.x - w[0].x) * dx + (p.y - w[0].y) * dy) / l2).clamp(0.0, 1.0);
-                        (p.x - w[0].x - t * dx).hypot(p.y - w[0].y - t * dy)
+                        fast_hypot(p.x - w[0].x - t * dx, p.y - w[0].y - t * dy)
                     })
                     .fold(f32::INFINITY, f32::min)
             })
