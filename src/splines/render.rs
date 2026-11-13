@@ -132,12 +132,19 @@ impl RenderPlan {
         }
         plan.samples.reserve(samples.len());
         let continuous_idct = ctx.spline_continuous_idct;
+        let constant = dct[1..]
+            .iter()
+            .flatten()
+            .all(|&coefficient| coefficient == 0.0)
+            .then(|| continuous_idct(&dct, 0.0));
         let r = 0.1f32.ln() * 5.0;
         for (k, sample) in samples.iter().enumerate() {
             let Point { x: cx, y: cy } = sample.position;
             let mult = sample.multiplier;
-            let t = 31.0 * (k as f32 / arc).min(1.0);
-            let [x, y, b, sigma] = continuous_idct(&dct, t);
+            let [x, y, b, sigma] = constant.unwrap_or_else(|| {
+                let t = 31.0 * (k as f32 / arc).min(1.0);
+                continuous_idct(&dct, t)
+            });
             let color = [x, y, b];
             if !(sigma.is_finite() && sigma != 0.0 && (1.0 / sigma).is_finite()) {
                 continue;
@@ -362,6 +369,10 @@ pub(super) struct TiledSpline {
 impl TiledSpline {
     pub(super) fn bounds(&self) -> Option<PixelBox> {
         self.plan.bounds
+    }
+
+    pub(super) fn draw(&self, image: &mut Image3F, sign: f32) {
+        self.plan.draw(image, sign);
     }
 
     pub(super) fn draw_tile(&self, tile: &Tile, pixels: &mut [[f32; 64]; 3], sign: f32) {
@@ -622,7 +633,7 @@ mod tests {
     fn prepared_render_matches_original_sample_arithmetic() {
         let kernels = crate::encoding_context::EncodingContext::default();
         for (w, h) in [(37, 29), (129, 87)] {
-            for width in [0, 1, 4, -3] {
+            for (width, constant) in [(0, false), (1, false), (4, false), (-3, false), (4, true)] {
                 let mut sp = QuantizedSpline {
                     points: vec![
                         Point::new(-2, 1),
@@ -633,10 +644,12 @@ mod tests {
                 };
                 sp.dct[0][0] = -11;
                 sp.dct[1][0] = 7;
-                sp.dct[1][2] = -3;
-                sp.dct[2][1] = 9;
                 sp.dct[3][0] = width;
-                sp.dct[3][3] = if width == 0 { 0 } else { 1 };
+                if !constant {
+                    sp.dct[1][2] = -3;
+                    sp.dct[2][1] = 9;
+                    sp.dct[3][3] = if width == 0 { 0 } else { 1 };
+                }
                 for sign in [-1.0, 1.0] {
                     let mut original = Image3F::new(w, h);
                     for c in 0..3 {

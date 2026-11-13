@@ -43,6 +43,7 @@ use crate::encoding_context::EncodingContext;
 use crate::entropy::pack_signed;
 use crate::image::Image3F;
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 const MAX_CONTOURS: usize = 256;
 const MAX_PAIRS: usize = 64;
@@ -60,6 +61,7 @@ const DP_LAMBDA: f64 = 16.0;
 const DP_MAX_DEVIATION: f32 = 1.0;
 const MAX_PROFILE_SECTIONS: usize = 32;
 const PROFILE_REACH: i32 = 8;
+const PROFILE_LEN: usize = (2 * PROFILE_REACH + 1) as usize;
 const PROFILE_COHERENCE: f64 = 0.65;
 const FIT_EXPLAINED: f64 = 0.05;
 const UNIT: i32 = 1024;
@@ -68,6 +70,21 @@ static WEIGHTS: [f64; 3] = [14.0, 1.0, 0.6];
 static WIDTHS: [i32; 4] = [2, 3, 4, 5];
 static OFFSETS: [f32; 3] = [0.5, 1.0, 1.5];
 static AMPLITUDES: [f32; 3] = [0.5, 0.75, 1.0];
+
+// Every contour is scored against the same width and offset combinations.
+static PROFILE_TEMPLATES: LazyLock<[[[f64; PROFILE_LEN]; OFFSETS.len()]; WIDTHS.len()]> =
+    LazyLock::new(|| {
+        WIDTHS.map(|width| {
+            let sigma = width as f32 * CHANNEL_WEIGHT[3] / adjusted_quant(QUANT_ADJUST);
+            OFFSETS.map(|offset| {
+                std::array::from_fn(|i| {
+                    let t = (i as i32 - PROFILE_REACH) as f32 * 0.5;
+                    ((-0.5 * ((t - offset) / sigma).powi(2)).exp()
+                        - (-0.5 * ((t + offset) / sigma).powi(2)).exp()) as f64
+                })
+            })
+        })
+    });
 
 #[derive(Clone, Debug)]
 pub(super) struct EdgePair {
@@ -399,12 +416,9 @@ fn build_points(
     Some(sides)
 }
 
-fn profile_gain(profiles: &[[f32; 3]], sigma: f32, offset: f32) -> f64 {
+fn profile_gain(profiles: &[[f32; 3]], template: &[f64; PROFILE_LEN]) -> f64 {
     let (mut dot, mut norm) = ([0.0; 3], 0.0f64);
-    for (i, target) in profiles.iter().enumerate() {
-        let t = (i % (2 * PROFILE_REACH + 1) as usize) as f32 * 0.5 - PROFILE_REACH as f32 * 0.5;
-        let value = ((-0.5 * ((t - offset) / sigma).powi(2)).exp()
-            - (-0.5 * ((t + offset) / sigma).powi(2)).exp()) as f64;
+    for (target, &value) in profiles.iter().zip(template.iter().cycle()) {
         norm += value * value;
         for c in 0..3 {
             dot[c] += value * target[c] as f64;
@@ -452,10 +466,9 @@ fn shortlist(source: &Image3F, target: &Target, contour: &Contour) -> Option<Geo
     }
     let (w, h) = (source.xsize(), source.ysize());
     let mut best: Option<Geometry> = None;
-    for width in WIDTHS {
-        let sigma = width as f32 * CHANNEL_WEIGHT[3] / adjusted_quant(QUANT_ADJUST);
-        for offset in OFFSETS {
-            let gain = profile_gain(&profiles, sigma, offset);
+    for (width, templates) in WIDTHS.into_iter().zip(PROFILE_TEMPLATES.iter()) {
+        for (offset, template) in OFFSETS.into_iter().zip(templates) {
+            let gain = profile_gain(&profiles, template);
             if gain / energy < PROFILE_COHERENCE
                 || best.as_ref().is_some_and(|old| old.score >= gain)
                 || [1.0, -1.0]
@@ -771,25 +784,28 @@ mod tests {
 
     #[test]
     fn incoherent_normal_residuals_have_no_shared_profile_gain() {
+        let sigma = WIDTHS[2] as f32 * CHANNEL_WEIGHT[3] / adjusted_quant(QUANT_ADJUST);
+        let offset = OFFSETS[1];
+        let template = &PROFILE_TEMPLATES[2][1];
         let section: Vec<_> = (-PROFILE_REACH..=PROFILE_REACH)
             .map(|j| {
                 let t = j as f32 * 0.5;
                 [
                     0.0,
-                    (-0.5 * ((t - 1.0) / 0.8).powi(2)).exp()
-                        - (-0.5 * ((t + 1.0) / 0.8).powi(2)).exp(),
+                    (-0.5 * ((t - offset) / sigma).powi(2)).exp()
+                        - (-0.5 * ((t + offset) / sigma).powi(2)).exp(),
                     0.0,
                 ]
             })
             .collect();
-        let coherent = profile_gain(&section, 0.8, 1.0) / profile_energy(&section);
+        let coherent = profile_gain(&section, template) / profile_energy(&section);
         assert!(coherent > 0.99);
         let incoherent: Vec<_> = section
             .iter()
             .copied()
             .chain(section.iter().map(|v| v.map(|x| -x)))
             .collect();
-        assert!(profile_gain(&incoherent, 0.8, 1.0) / profile_energy(&incoherent) < 1e-12);
+        assert!(profile_gain(&incoherent, template) / profile_energy(&incoherent) < 1e-12);
     }
 
     #[test]

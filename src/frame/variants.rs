@@ -82,6 +82,8 @@ pub(super) fn lattice_variants(
                 prefix,
                 base,
                 references,
+                #[cfg(feature = "splines")]
+                dot_dictionary: None,
                 epf_atlases: None,
                 #[cfg(feature = "splines")]
                 splines: None,
@@ -436,6 +438,8 @@ pub(super) fn prepare_vardct_variant(
             prefix: patched_writer,
             base,
             references,
+            #[cfg(feature = "splines")]
+            dot_dictionary: None,
             epf_atlases,
             #[cfg(feature = "splines")]
             splines: base_splines,
@@ -454,6 +458,8 @@ pub(super) fn prepare_vardct_variant(
                     prefix: BitWriter::new(),
                     base: regular,
                     references: Vec::new(),
+                    #[cfg(feature = "splines")]
+                    dot_dictionary: None,
                     epf_atlases: None,
                     #[cfg(feature = "splines")]
                     splines: regular_splines,
@@ -677,6 +683,8 @@ pub(super) fn prepare_vardct_variant(
             prefix: patched_writer,
             base,
             references,
+            #[cfg(feature = "splines")]
+            dot_dictionary: None,
             epf_atlases: None,
             #[cfg(feature = "splines")]
             splines: base_splines,
@@ -698,6 +706,8 @@ pub(super) fn prepare_vardct_variant(
         prefix: BitWriter::new(),
         base: xyb,
         references: Vec::new(),
+        #[cfg(feature = "splines")]
+        dot_dictionary: None,
         epf_atlases: None,
         #[cfg(feature = "splines")]
         splines,
@@ -712,6 +722,9 @@ pub(super) struct PreparedVarDct {
     /// Selected splines/patches removed and inverse Gaborish already applied.
     base: Image3F,
     references: Vec<crate::patches::PatchReference>,
+    /// The complete dictionary, when this frame's references are only dots.
+    #[cfg(feature = "splines")]
+    dot_dictionary: Option<Arc<BitWriter>>,
     epf_atlases: Option<EpfPatchAtlases>,
     #[cfg(feature = "splines")]
     splines: Option<crate::splines::SplineSet>,
@@ -727,6 +740,8 @@ impl PreparedVarDct {
             prefix: BitWriter::new(),
             base,
             references: Vec::new(),
+            #[cfg(feature = "splines")]
+            dot_dictionary: None,
             epf_atlases: None,
             #[cfg(feature = "splines")]
             splines: None,
@@ -779,7 +794,12 @@ impl PreparedVarDct {
             && let Some(encoding) = encoding
         {
             self.prefix.append_bits(&encoding.atlas);
-            self.references.extend(encoding.references);
+            if self.references.is_empty() {
+                self.references = encoding.references;
+                self.dot_dictionary = Some(encoding.dictionary);
+            } else {
+                self.references.extend(encoding.references);
+            }
             return;
         }
         let plan = dots::build_dot_patches(&selected);
@@ -826,6 +846,15 @@ impl PreparedVarDct {
                     }
             })
         });
+        #[cfg(feature = "splines")]
+        let dictionary = self.dot_dictionary.as_deref();
+        #[cfg(not(feature = "splines"))]
+        let dictionary = None;
+        let frame_kind = if self.references.is_empty() {
+            VarDctFrameKind::Regular
+        } else {
+            VarDctFrameKind::Patched(&self.references, epf_atlases.as_ref(), dictionary)
+        };
         writer.append_bits(&self.prefix);
         drop(self.prefix);
         encode_frame_core(
@@ -835,11 +864,7 @@ impl PreparedVarDct {
             self.base,
             alpha,
             coeff_shifts,
-            if self.references.is_empty() {
-                VarDctFrameKind::Regular
-            } else {
-                VarDctFrameKind::Patched(&self.references, epf_atlases.as_ref())
-            },
+            frame_kind,
             #[cfg(feature = "splines")]
             self.splines.as_ref(),
             #[cfg(feature = "splines")]
@@ -864,7 +889,11 @@ impl PreparedVarDct {
         #[cfg(feature = "splines")]
         self.materialize_dots(ctx, scratch, alpha);
         let mut extras = BitWriter::new();
-        if !self.references.is_empty() {
+        #[cfg(feature = "splines")]
+        let dictionary = self.dot_dictionary.as_deref().filter(|_| alpha.is_none());
+        #[cfg(not(feature = "splines"))]
+        let dictionary: Option<&BitWriter> = None;
+        if dictionary.is_none() && !self.references.is_empty() {
             crate::lossless::write_patch_dictionary(
                 &self.references,
                 alpha.is_some(),
@@ -877,7 +906,7 @@ impl PreparedVarDct {
             crate::splines::write_splines(set, scratch, &mut extras);
         }
         let bits = self.prefix.bits_written() as f64
-            + extras.bits_written() as f64
+            + (dictionary.map_or(0, BitWriter::bits_written) + extras.bits_written()) as f64
             + noise_estimate_bits(ctx)
             + estimate_residual_bits(ctx, scratch, distance, &self.base, alpha, coeff_shifts)?;
         self.estimated_bits = Some(bits);

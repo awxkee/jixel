@@ -43,8 +43,15 @@ pub(crate) struct LossyPatches {
 #[derive(Clone, Copy)]
 pub(crate) enum VarDctFrameKind<'a> {
     Regular,
-    ReferenceOnly { width: usize, height: usize },
-    Patched(&'a [PatchReference], Option<&'a EpfPatchAtlases>),
+    ReferenceOnly {
+        width: usize,
+        height: usize,
+    },
+    Patched(
+        &'a [PatchReference],
+        Option<&'a EpfPatchAtlases>,
+        Option<&'a crate::bit_writer::BitWriter>,
+    ),
 }
 
 pub(crate) struct GlyphAtlasLuma {

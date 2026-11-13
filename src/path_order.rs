@@ -31,7 +31,11 @@
 //! signed deltas (spline starts, patch occurrences): an open Hamiltonian path
 //! priced by the hybrid-uint tokens it emits.
 
+use crate::coder_scratch::CoderScratch;
 use crate::entropy::{pack_signed, uint_encode};
+use crate::thread_pool::ThreadPool;
+use std::cmp::Reverse;
+use std::sync::Mutex;
 
 const ALPHABET: usize = 128;
 const HELD_KARP_MAX: usize = 9;
@@ -137,8 +141,25 @@ pub(crate) fn order_sets(
     movable: &[bool],
     given: Vec<Vec<usize>>,
     one_context: bool,
+    workers: Option<(&ThreadPool, &mut CoderScratch)>,
 ) -> Vec<Vec<usize>> {
     const PRICE_ROUNDS: usize = 2;
+    const NEIGHBOR_CACHE_BYTES: usize = 4 * 1024 * 1024;
+    // Large dot dictionaries have several expensive sets. Limit the number
+    // of simultaneous searches to bound their transient workspace.
+    const MAX_SEARCH_THREADS: usize = 4;
+    const PARALLEL_SET_POINTS: usize = 512;
+    let mut workers = workers.filter(|(pool, _)| {
+        pool.num_threads() > 1
+            && sets
+                .iter()
+                .zip(movable)
+                .filter(|(points, movable)| {
+                    **movable && (PARALLEL_SET_POINTS..=MAX_POINTS).contains(&points.len())
+                })
+                .nth(1)
+                .is_some()
+    });
     let sweeps: Vec<Vec<Vec<usize>>> = sets
         .iter()
         .zip(movable)
@@ -163,15 +184,48 @@ pub(crate) fn order_sets(
             (best, orders) = (bits, candidate);
         }
     }
-    for _ in 0..PRICE_ROUNDS {
+    // Neighbor order depends only on the points. Retain it for repricing,
+    // with a cap on storage across all sets in a dictionary.
+    let mut neighbors_by_set: Vec<Option<NeighborLists>> = (0..sets.len()).map(|_| None).collect();
+    let remaining_bytes = Mutex::new(NEIGHBOR_CACHE_BYTES);
+    for round in 0..PRICE_ROUNDS {
         let (first, delta) = learn(sets, &orders, one_context);
         let cost = PathCost {
             first: &first,
             delta: &delta,
         };
-        for (r, points) in sets.iter().enumerate() {
-            if movable[r] {
-                orders[r] = order(points, &cost, &orders[r]);
+        let search = |r: usize, path: &mut Vec<usize>, cached: &mut Option<NeighborLists>| {
+            let mut neighbors = cached.take();
+            *path = order(&sets[r], &cost, std::mem::take(path), &mut neighbors);
+            if round + 1 < PRICE_ROUNDS
+                && let Some(neighbors) = neighbors
+            {
+                let mut available = remaining_bytes.lock().unwrap();
+                if let Some(remaining) = available.checked_sub(neighbors.capacity_bytes()) {
+                    *available = remaining;
+                    *cached = Some(neighbors);
+                }
+            }
+        };
+        let tasks = orders
+            .iter_mut()
+            .zip(&mut neighbors_by_set)
+            .enumerate()
+            .filter(|(r, _)| movable[*r]);
+        if let Some((pool, scratch)) = &mut workers {
+            // Prices are fixed for this round. Independent searches can start
+            // with the largest sets and still update results in their own slots.
+            let mut tasks: Vec<_> = tasks.collect();
+            tasks.sort_unstable_by_key(|(r, _)| Reverse(sets[*r].len()));
+            pool.steal_for_each_mut_with_threads(
+                scratch,
+                &mut tasks,
+                MAX_SEARCH_THREADS,
+                |_, (r, (path, cached)), _| search(*r, path, cached),
+            );
+        } else {
+            for (r, (path, cached)) in tasks {
+                search(r, path, cached);
             }
         }
     }
@@ -216,16 +270,22 @@ fn self_priced(sets: &[Vec<Pos>], orders: &[Vec<usize>], one_context: bool) -> f
 
 /// Cheapest open path through `points` under `cost`: exact for small sets,
 /// otherwise 2-opt and Or-opt from `initial` over spatial neighbors.
-fn order(points: &[Pos], cost: &PathCost, initial: &[usize]) -> Vec<usize> {
+fn order(
+    points: &[Pos],
+    cost: &PathCost,
+    initial: Vec<usize>,
+    neighbors: &mut Option<NeighborLists>,
+) -> Vec<usize> {
     debug_assert_eq!(points.len(), initial.len());
     if points.len() <= 1 {
-        initial.to_vec()
+        initial
     } else if points.len() <= HELD_KARP_MAX {
         held_karp(points, cost)
     } else if points.len() <= MAX_POINTS {
-        LocalSearch::new(points, cost, initial.to_vec()).run()
+        let neighbors = neighbors.get_or_insert_with(|| neighbor_lists(points));
+        LocalSearch::new(points, cost, initial, neighbors).run()
     } else {
-        initial.to_vec()
+        initial
     }
 }
 
@@ -306,10 +366,21 @@ fn held_karp(points: &[Pos], cost: &PathCost) -> Vec<usize> {
     path
 }
 
+struct NeighborLists {
+    offsets: Vec<usize>,
+    indices: Vec<usize>,
+}
+
+impl NeighborLists {
+    fn capacity_bytes(&self) -> usize {
+        (self.offsets.capacity() + self.indices.capacity()) * size_of::<usize>()
+    }
+}
+
 /// Up to `NEIGHBORS` nearest points (Chebyshev) of each point plus its
 /// neighbors in row-major and column-major order, which keep long runs along
 /// one row or column reachable.
-fn neighbor_lists(points: &[Pos]) -> (Vec<usize>, Vec<usize>) {
+fn neighbor_lists(points: &[Pos]) -> NeighborLists {
     let n = points.len();
     let (min_x, max_x) = points
         .iter()
@@ -405,7 +476,10 @@ fn neighbor_lists(points: &[Pos]) -> (Vec<usize>, Vec<usize>) {
         }
         offsets.push(lists.len());
     }
-    (offsets, lists)
+    NeighborLists {
+        offsets,
+        indices: lists,
+    }
 }
 
 struct LocalSearch<'a> {
@@ -417,8 +491,7 @@ struct LocalSearch<'a> {
     forward: Vec<f64>,
     /// `backward[k]`: the same steps walked the other way.
     backward: Vec<f64>,
-    offsets: Vec<usize>,
-    neighbors: Vec<usize>,
+    neighbors: &'a NeighborLists,
     /// Points next to a move of this round or the last; the others had no
     /// improving move and are skipped (don't-look bits).
     looking: Vec<bool>,
@@ -426,9 +499,13 @@ struct LocalSearch<'a> {
 }
 
 impl<'a> LocalSearch<'a> {
-    fn new(points: &'a [Pos], cost: &'a PathCost<'a>, path: Vec<usize>) -> Self {
+    fn new(
+        points: &'a [Pos],
+        cost: &'a PathCost<'a>,
+        path: Vec<usize>,
+        neighbors: &'a NeighborLists,
+    ) -> Self {
         let n = points.len();
-        let (offsets, neighbors) = neighbor_lists(points);
         let mut search = Self {
             points,
             cost,
@@ -436,7 +513,6 @@ impl<'a> LocalSearch<'a> {
             pos: vec![0; n],
             forward: vec![0.0; n],
             backward: vec![0.0; n],
-            offsets,
             neighbors,
             looking: vec![true; n],
             touched: vec![false; n],
@@ -478,7 +554,8 @@ impl<'a> LocalSearch<'a> {
     }
 
     fn neighbors(&self, i: usize) -> &[usize] {
-        &self.neighbors[self.offsets[i]..self.offsets[i + 1]]
+        let NeighborLists { offsets, indices } = self.neighbors;
+        &indices[offsets[i]..offsets[i + 1]]
     }
 
     fn looks_at(&self, i: usize) -> bool {
@@ -723,7 +800,7 @@ mod tests {
         for seed in 1..4 {
             let points = scatter(300, seed);
             let initial: Vec<usize> = (0..points.len()).collect();
-            let path = order(&points, &cost, &initial);
+            let path = order(&points, &cost, initial.clone(), &mut None);
             let mut sorted = path.clone();
             sorted.sort_unstable();
             assert_eq!(sorted, initial);
@@ -752,7 +829,7 @@ mod tests {
             first: &prices,
             delta: &prices,
         };
-        let path = order(&points, &cost, &initial);
+        let path = order(&points, &cost, initial.clone(), &mut None);
         assert!(cost.of(&points, &path) < cost.of(&points, &initial) - 10.0);
     }
 }

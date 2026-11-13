@@ -28,6 +28,7 @@
  */
 
 use crate::color_encoding::{Primaries, TransferFunction};
+use crate::util::fast_exp;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -156,7 +157,7 @@ fn hlg_to_linear(v: f32) -> f32 {
     if v <= 0.5 {
         v * v / 3.0
     } else {
-        (((v - C) / A).exp() + B) / 12.0
+        (fast_exp((v - C) / A) + B) / 12.0
     }
 }
 

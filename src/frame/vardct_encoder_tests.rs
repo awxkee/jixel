@@ -25,7 +25,8 @@ fn repeated_alpha_race_preserves_every_incoming_bit_offset() {
         image.plane_row_mut(1, y).fill(0.4);
         image.plane_row_mut(2, y).fill(0.2);
     }
-    for offset in 0..8 {
+    // Byte-aligned and mid-byte: the splice has no other case.
+    for offset in [0, 5] {
         let mut ctx = EncodingContext::new(
             crate::Speed::Slow,
             crate::Arbiter::Ssimulacra2,
@@ -102,7 +103,8 @@ fn function_field_race_preserves_offsets_and_exact_fallback() {
     );
     assert!(!crate::function_fields::fit(&alpha, width, height).is_empty());
     let mut saw_smaller_frame = false;
-    for offset in 0..8 {
+    // Byte-aligned and mid-byte: the splice has no other case.
+    for offset in [0, 5] {
         let config = crate::EncodeConfig::default()
             .with_distance(1.5)
             .with_speed(crate::Speed::Slow)
@@ -170,7 +172,7 @@ fn function_field_race_preserves_offsets_and_exact_fallback() {
 
         // An exact-alpha request cannot substitute an approximate function,
         // even when the function would make a substantially smaller file.
-        if offset == 0 || offset == 7 {
+        {
             let mut ctx = ctx;
             ctx.extra_squeeze_distance = 0.0;
             let mut exact = prefix.clone();

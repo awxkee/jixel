@@ -447,13 +447,15 @@ impl RasterSlots {
         }
     }
 
-    /// The next contiguous part of x..end in this row.
     #[inline]
-    fn row_chunk(&mut self, y: usize, x: usize, end: usize) -> &mut [i32] {
-        if self.tile_stride == 0 {
-            let row = y * self.width;
-            return &mut self.slots[row + x..row + end];
-        }
+    fn dense_row_chunk(&mut self, y: usize, x: usize, end: usize) -> &mut [i32] {
+        let row = y * self.width;
+        &mut self.slots[row + x..row + end]
+    }
+
+    /// The part of x..end in the current tile.
+    #[inline]
+    fn tiled_row_chunk(&mut self, y: usize, x: usize, end: usize) -> &mut [i32] {
         let tile = &mut self.tiles[y / SLOT_TILE * self.tile_stride + x / SLOT_TILE];
         if *tile == MISSING_TILE {
             *tile = self.slots.len();
@@ -660,15 +662,20 @@ struct FitSystem {
     arc: f32,
 }
 
-fn fit_system(
-    targets: &[Vec<f32>; 3],
-    w: usize,
-    h: usize,
+struct RasterParams {
+    sigma_n: i32,
+    sigma: f32,
+    reach: isize,
+    coeffs: usize,
+    table: usize,
+}
+
+fn prepare_raster(
     points: &[Point<i32>],
     sigma_n: i32,
     precision: Precision,
     scratch: &mut FitScratch,
-) -> Option<FitSystem> {
+) -> Option<RasterParams> {
     scratch.geometry(points);
     let arc = scratch.arc;
     if arc < MIN_ARC {
@@ -688,16 +695,31 @@ fn fit_system(
     }
     scratch.prepare_basis(coeffs);
     let table = scratch.weight_table(sigma_n, sigma, reach);
+    Some(RasterParams {
+        sigma_n,
+        sigma,
+        reach,
+        coeffs,
+        table,
+    })
+}
+
+fn fit_system(
+    targets: &[Vec<f32>; 3],
+    w: usize,
+    h: usize,
+    points: &[Point<i32>],
+    sigma_n: i32,
+    precision: Precision,
+    scratch: &mut FitScratch,
+) -> Option<FitSystem> {
+    let params = prepare_raster(points, sigma_n, precision, scratch)?;
     // Expose the common three- and six-column fits to the compiler while
     // preserving the raster and normal-equation accumulation order.
-    match coeffs {
-        REFINE_COEFFS => raster_system::<REFINE_COEFFS>(
-            targets, w, h, sigma_n, sigma, reach, coeffs, table, scratch,
-        ),
-        COMPACT_COEFFS => raster_system::<COMPACT_COEFFS>(
-            targets, w, h, sigma_n, sigma, reach, coeffs, table, scratch,
-        ),
-        _ => raster_system::<0>(targets, w, h, sigma_n, sigma, reach, coeffs, table, scratch),
+    match params.coeffs {
+        REFINE_COEFFS => raster_system::<REFINE_COEFFS>(targets, w, h, params, scratch),
+        COMPACT_COEFFS => raster_system::<COMPACT_COEFFS>(targets, w, h, params, scratch),
+        _ => raster_system::<0>(targets, w, h, params, scratch),
     }
 }
 
@@ -705,21 +727,56 @@ fn raster_system<const FIXED_COEFFS: usize>(
     targets: &[Vec<f32>; 3],
     w: usize,
     h: usize,
-    sigma_n: i32,
-    sigma: f32,
-    reach: isize,
-    coeffs: usize,
-    table: usize,
+    params: RasterParams,
     scratch: &mut FitScratch,
 ) -> Option<FitSystem> {
     let coeffs = if FIXED_COEFFS == 0 {
-        coeffs
+        params.coeffs
     } else {
         FIXED_COEFFS
     };
-    let arc = scratch.arc;
-    let table = &scratch.weight_luts[table];
-    let weight_lut = &table.weights;
+    raster_rows::<FIXED_COEFFS>(w, h, &params, scratch)?;
+
+    let mut ata = [[0f64; MAX_COEFFS]; MAX_COEFFS];
+    let mut atb = [[0f64; MAX_COEFFS]; 3];
+    let mut btb = [0f64; 3];
+    for (&pix, row) in scratch.pixels.iter().zip(scratch.rows.chunks_exact(coeffs)) {
+        for (i, (&value, ata_row)) in row.iter().zip(&mut ata).enumerate() {
+            for (a, &b) in ata_row[..=i].iter_mut().zip(&row[..=i]) {
+                *a += value * b;
+            }
+        }
+        for ((atb, btb), target) in atb.iter_mut().zip(&mut btb).zip(targets) {
+            let t = target[pix as usize] as f64;
+            *btb += t * t;
+            for (a, &b) in atb.iter_mut().zip(row) {
+                *a += b * t;
+            }
+        }
+    }
+    for i in 0..coeffs {
+        for j in i + 1..coeffs {
+            ata[i][j] = ata[j][i];
+        }
+    }
+
+    Some(FitSystem {
+        ata,
+        atb,
+        btb,
+        sigma_n: params.sigma_n,
+        coeffs,
+        arc: scratch.arc,
+    })
+}
+
+fn raster_rows<const FIXED_COEFFS: usize>(
+    w: usize,
+    h: usize,
+    params: &RasterParams,
+    scratch: &mut FitScratch,
+) -> Option<()> {
+    let reach = params.reach;
     let samples = &scratch.samples;
 
     let (mut bx0, mut by0, mut bx1, mut by1) = (isize::MAX, isize::MAX, isize::MIN, isize::MIN);
@@ -746,6 +803,32 @@ fn raster_system<const FIXED_COEFFS: usize>(
     scratch.rows.clear();
     scratch.pixels.clear();
 
+    // The layout stays fixed across all samples. Dense rows need only one
+    // slot slice, while tiled rows can cross several independently stored tiles.
+    if tiled {
+        splat_rows::<FIXED_COEFFS, true>(w, params, (bx0, by0, bx1, by1), scratch);
+    } else {
+        splat_rows::<FIXED_COEFFS, false>(w, params, (bx0, by0, bx1, by1), scratch);
+    }
+    (!scratch.pixels.is_empty()).then_some(())
+}
+
+fn splat_rows<const FIXED_COEFFS: usize, const TILED: bool>(
+    w: usize,
+    params: &RasterParams,
+    (bx0, by0, bx1, by1): (isize, isize, isize, isize),
+    scratch: &mut FitScratch,
+) {
+    let coeffs = if FIXED_COEFFS == 0 {
+        params.coeffs
+    } else {
+        FIXED_COEFFS
+    };
+    let table = &scratch.weight_luts[params.table];
+    let weight_lut = &table.weights;
+    let sigma = params.sigma;
+    let reach = params.reach;
+    let samples = &scratch.samples;
     for (sample, basis) in samples.iter().zip(scratch.basis.chunks_exact(coeffs)) {
         let Point { x: cx, y: cy } = sample.position;
         let mult = sample.multiplier;
@@ -771,9 +854,14 @@ fn raster_system<const FIXED_COEFFS: usize>(
             }
             let mut x = x_start;
             while x < x_end {
-                let slots = scratch.raster.row_chunk((y - by0) as usize, x, x_end);
+                let local_y = (y - by0) as usize;
+                let slots = if TILED {
+                    scratch.raster.tiled_row_chunk(local_y, x, x_end)
+                } else {
+                    scratch.raster.dense_row_chunk(local_y, x, x_end)
+                };
                 let start = bx0 as usize + x;
-                x += slots.len();
+                x = if TILED { x + slots.len() } else { x_end };
                 for (x, slot) in (start..).zip(slots) {
                     let dx = x as f32 - cx;
                     let distance_sq = dx * dx + dy_sq;
@@ -806,41 +894,6 @@ fn raster_system<const FIXED_COEFFS: usize>(
             }
         }
     }
-    if scratch.pixels.is_empty() {
-        return None;
-    }
-
-    let mut ata = [[0f64; MAX_COEFFS]; MAX_COEFFS];
-    let mut atb = [[0f64; MAX_COEFFS]; 3];
-    let mut btb = [0f64; 3];
-    for (&pix, row) in scratch.pixels.iter().zip(scratch.rows.chunks_exact(coeffs)) {
-        for (i, (&value, ata_row)) in row.iter().zip(&mut ata).enumerate() {
-            for (a, &b) in ata_row[..=i].iter_mut().zip(&row[..=i]) {
-                *a += value * b;
-            }
-        }
-        for ((atb, btb), target) in atb.iter_mut().zip(&mut btb).zip(targets) {
-            let t = target[pix as usize] as f64;
-            *btb += t * t;
-            for (a, &b) in atb.iter_mut().zip(row) {
-                *a += b * t;
-            }
-        }
-    }
-    for i in 0..coeffs {
-        for j in i + 1..coeffs {
-            ata[i][j] = ata[j][i];
-        }
-    }
-
-    Some(FitSystem {
-        ata,
-        atb,
-        btb,
-        sigma_n,
-        coeffs,
-        arc,
-    })
 }
 
 impl FitSystem {
@@ -966,15 +1019,15 @@ fn fit_best(
     h: usize,
     points: &[Point<i32>],
     widths: &[i32],
-    free: Option<(usize, usize, usize)>,
     scratch: &mut FitScratch,
-) -> Option<Fit> {
-    let mut best: Option<Fit> = None;
+) -> Option<(Fit, FitSystem)> {
+    let mut best: Option<(Fit, FitSystem)> = None;
     for &n in widths {
-        if let Some(fit) = fit_at(targets, w, h, points, n, free, Precision::Full, scratch)
-            && best.as_ref().is_none_or(|b| fit.gain() > b.gain())
-        {
-            best = Some(fit);
+        if let Some(system) = fit_system(targets, w, h, points, n, Precision::Full, scratch) {
+            let fit = system.solve(None);
+            if best.as_ref().is_none_or(|(b, _)| fit.gain() > b.gain()) {
+                best = Some((fit, system));
+            }
         }
     }
     best
@@ -1236,6 +1289,7 @@ fn inside(points: &[Point<i32>], w: usize, h: usize) -> bool {
 struct Primary {
     points: Vec<Point<i32>>,
     fit: Fit,
+    system: FitSystem,
     spline: QuantizedSpline,
 }
 
@@ -1259,15 +1313,7 @@ fn quick_primary(
             .abs()
             .total_cmp(&(b as f32 * sigma_step() - predicted).abs())
     });
-    let fit = fit_best(
-        targets,
-        w,
-        h,
-        &points,
-        &seeds[..SEEDED_WIDTHS],
-        None,
-        scratch,
-    )?;
+    let (fit, system) = fit_best(targets, w, h, &points, &seeds[..SEEDED_WIDTHS], scratch)?;
     if fit.explained() < QUICK_MIN_EXPLAINED {
         return None;
     }
@@ -1275,6 +1321,7 @@ fn quick_primary(
     Some(Primary {
         points,
         fit,
+        system,
         spline,
     })
 }
@@ -1293,6 +1340,7 @@ fn expand(
     let Primary {
         mut points,
         mut fit,
+        mut system,
         ..
     } = primary;
     if fit.explained() > REFINE_MIN_EXPLAINED {
@@ -1305,10 +1353,10 @@ fn expand(
         let nearby = &SIGMA_LATTICE[at.saturating_sub(1)..(at + 2).min(SIGMA_LATTICE.len())];
         // Width and geometry change pixel support, so compare error removed
         // rather than raw residual errors over different sets of pixels.
-        if let Some(better) = fit_best(targets, w, h, &refined, nearby, None, scratch)
+        if let Some((better, better_system)) = fit_best(targets, w, h, &refined, nearby, scratch)
             && better.gain() > fit.gain()
         {
-            (points, fit) = (refined, better);
+            (points, fit, system) = (refined, better, better_system);
         }
     }
     if fit.explained() < MIN_EXPLAINED || !inside(&points, w, h) {
@@ -1342,16 +1390,37 @@ fn expand(
         if !inside(geometry, w, h) || geometry.array_windows::<2>().any(|p| p[0] == p[1]) {
             continue;
         }
-        let Some(system) = fit_system(
-            targets,
-            w,
-            h,
-            geometry,
-            fit.sigma_n,
-            Precision::Full,
-            scratch,
-        ) else {
-            continue;
+        let other;
+        let system = if g == 0 {
+            // The winning equations are already available. Rebuild only the
+            // basis rows needed by the gradient fit.
+            let Some(params) = prepare_raster(geometry, fit.sigma_n, Precision::Full, scratch)
+            else {
+                continue;
+            };
+            let rows = match params.coeffs {
+                REFINE_COEFFS => raster_rows::<REFINE_COEFFS>(w, h, &params, scratch),
+                COMPACT_COEFFS => raster_rows::<COMPACT_COEFFS>(w, h, &params, scratch),
+                _ => raster_rows::<0>(w, h, &params, scratch),
+            };
+            if rows.is_none() {
+                continue;
+            }
+            &system
+        } else {
+            let Some(fitted) = fit_system(
+                targets,
+                w,
+                h,
+                geometry,
+                fit.sigma_n,
+                Precision::Full,
+                scratch,
+            ) else {
+                continue;
+            };
+            other = fitted;
+            &other
         };
         for free in [None, Some(lean)] {
             if g == 0 && free.is_none() {
@@ -1815,8 +1884,8 @@ mod tests {
             for (y, start, end) in [(0, 0, 2), (15, 14, 35), (16, 14, 35), (64, 93, 97)] {
                 let mut x = start;
                 while x < end {
-                    let chunk = tiled.row_chunk(y, x, end);
-                    let reference = dense.row_chunk(y, x, x + chunk.len());
+                    let chunk = tiled.tiled_row_chunk(y, x, end);
+                    let reference = dense.dense_row_chunk(y, x, x + chunk.len());
                     for (i, (slot, expected)) in chunk.iter_mut().zip(reference).enumerate() {
                         *slot = (y * w + x + i + offset) as i32;
                         *expected = *slot;
@@ -1853,17 +1922,9 @@ mod tests {
             targets[1][55 * w + x] += 0.1;
         }
         let mut scratch = FitScratch::default();
-        let initial = fit_at(
-            &targets,
-            w,
-            h,
-            &points,
-            5,
-            None,
-            Precision::Full,
-            &mut scratch,
-        )
-        .unwrap();
+        let initial_system =
+            fit_system(&targets, w, h, &points, 5, Precision::Full, &mut scratch).unwrap();
+        let initial = initial_system.solve(None);
         let wider = fit_at(
             &targets,
             w,
@@ -1882,6 +1943,7 @@ mod tests {
             spline: quantize(&points, &initial),
             points,
             fit: initial,
+            system: initial_system,
         };
         let chain = Chain {
             points: (16..=112).map(|x| Point::new(x as f32, 48.0)).collect(),
@@ -1992,28 +2054,71 @@ mod tests {
                     COMPACT_COEFFS
                 };
                 assert_eq!(fixed.coeffs, coeffs);
-                let sigma = sigma_n as f32 * sigma_step();
-                let reach = if precision == Precision::Probe {
-                    (2.6 * sigma + 1.0).ceil()
-                } else {
-                    (3.6 * sigma + 1.5).ceil()
-                } as isize;
-                let table = scratch.weight_table(sigma_n, sigma, reach);
-                let dynamic = raster_system::<0>(
-                    &targets,
-                    w,
-                    h,
-                    sigma_n,
-                    sigma,
-                    reach,
-                    coeffs,
-                    table,
-                    &mut scratch,
-                )
-                .unwrap();
+                let params = prepare_raster(&points, sigma_n, precision, &mut scratch).unwrap();
+                let dynamic = raster_system::<0>(&targets, w, h, params, &mut scratch).unwrap();
                 assert_eq!(fixed.ata, dynamic.ata);
                 assert_eq!(fixed.atb, dynamic.atb);
                 assert_eq!(fixed.btb, dynamic.btb);
+            }
+        }
+    }
+
+    #[test]
+    fn winning_fit_equations_match_rebuilt_rows_after_other_fits() {
+        let (w, h) = (165, 124);
+        let mut source = Image3F::new(w, h);
+        let targets = std::array::from_fn(|c| {
+            let data: Vec<_> = (0..w * h)
+                .map(|i| ((i * 19 + c * 31) % 101) as f32 * 0.003 - 0.15)
+                .collect();
+            for (y, row) in data.chunks_exact(w).enumerate() {
+                source.plane_row_mut(c, y).copy_from_slice(row);
+            }
+            data
+        });
+        let shapes = [
+            [Point::new(5, 9), Point::new(42, 14), Point::new(75, 20)],
+            [Point::new(4, 3), Point::new(63, 79), Point::new(153, 115)],
+        ];
+        let mut scratch = FitScratch::default();
+        for points in shapes {
+            let (fit, system) = fit_best(&targets, w, h, &points, &[2, 4, 6], &mut scratch)
+                .expect("candidate fits");
+            fit_system(
+                &targets,
+                w,
+                h,
+                &shapes[0],
+                2,
+                Precision::Probe,
+                &mut scratch,
+            )
+            .unwrap();
+            let params =
+                prepare_raster(&points, fit.sigma_n, Precision::Full, &mut scratch).unwrap();
+            raster_rows::<0>(w, h, &params, &mut scratch).unwrap();
+            let gradient = system.residual_system(&source, &scratch);
+            let rebuilt = fit_system(
+                &targets,
+                w,
+                h,
+                &points,
+                fit.sigma_n,
+                Precision::Full,
+                &mut scratch,
+            )
+            .unwrap();
+            let rebuilt_gradient = rebuilt.residual_system(&source, &scratch);
+            for (a, b) in [(&system, &rebuilt), (&gradient, &rebuilt_gradient)] {
+                assert_eq!(
+                    a.ata.map(|row| row.map(f64::to_bits)),
+                    b.ata.map(|row| row.map(f64::to_bits))
+                );
+                assert_eq!(
+                    a.atb.map(|row| row.map(f64::to_bits)),
+                    b.atb.map(|row| row.map(f64::to_bits))
+                );
+                assert_eq!(a.btb.map(f64::to_bits), b.btb.map(f64::to_bits));
             }
         }
     }

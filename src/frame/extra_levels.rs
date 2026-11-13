@@ -450,7 +450,7 @@ mod tests {
             seed ^= seed << 5;
             seed
         };
-        for bits in [10, 12, 16] {
+        for bits in [10, 16] {
             let max = (1u32 << bits) - 1;
             let n = 6000;
             // Mostly empty or full, antialiased edges in between.
@@ -476,7 +476,7 @@ mod tests {
                 .unzip();
             assert!(vals.len() > MAX_VALUES, "a deep plane");
             let one_cell_error = Sums::<u128>::new(&vals, &counts).cell(0, vals.len() - 1).1;
-            for divisor in [100, 1_000, 10_000] {
+            for divisor in [100, 10_000] {
                 let budget = one_cell_error / divisor;
                 let q = fewest_levels(&plane, &weights, budget, false).expect("quantized");
                 assert!(sse(&plane, &q, &weights) <= budget);

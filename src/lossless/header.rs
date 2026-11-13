@@ -441,10 +441,21 @@ pub(crate) fn write_patch_dictionary(
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
+    write_patch_dictionary_with_pool(references, has_alpha, scratch, w, None);
+}
+
+pub(crate) fn write_patch_dictionary_with_pool(
+    references: &[PatchReference],
+    has_alpha: bool,
+    scratch: &mut CoderScratch,
+    w: &mut BitWriter,
+    pool: Option<&crate::thread_pool::ThreadPool>,
+) {
     let given = encode_patch_dictionary(&patch_dictionary_tokens(references, has_alpha), scratch);
     // Occurrences are coded as deltas from the previous one; race a priced
     // shortest-path order against the given one on the real stream.
-    if let Some(reordered) = reorder_occurrences(references) {
+    if let Some(reordered) = reorder_occurrences(references, pool.map(|pool| (pool, &mut *scratch)))
+    {
         let candidate =
             encode_patch_dictionary(&patch_dictionary_tokens(&reordered, has_alpha), scratch);
         if candidate.bits_written() < given.bits_written() {
@@ -545,7 +556,10 @@ fn occurrences_commute(reference: &PatchReference) -> bool {
 
 /// Occurrence orders minimizing the priced position and offset tokens, or
 /// `None` when no entry may move or none moved.
-fn reorder_occurrences(references: &[PatchReference]) -> Option<Vec<PatchReference>> {
+fn reorder_occurrences(
+    references: &[PatchReference],
+    workers: Option<(&crate::thread_pool::ThreadPool, &mut CoderScratch)>,
+) -> Option<Vec<PatchReference>> {
     let movable: Vec<bool> = references
         .iter()
         .map(|r| r.positions.len() > 1 && occurrences_commute(r))
@@ -563,7 +577,7 @@ fn reorder_occurrences(references: &[PatchReference]) -> Option<Vec<PatchReferen
         })
         .collect();
     let given = points.iter().map(|p| (0..p.len()).collect()).collect();
-    let orders = path_order::order_sets(&points, &movable, given, false);
+    let orders = path_order::order_sets(&points, &movable, given, false, workers);
     if orders
         .iter()
         .all(|order| order.iter().enumerate().all(|(k, &i)| k == i))
@@ -663,7 +677,7 @@ mod tests {
     fn reorder_moves_only_commuting_entries_and_keeps_their_occurrences() {
         let overlapping = entry(vec![(300, 0), (0, 0), (150, 0), (5, 5)], false);
         let free = entry(scattered(200), false);
-        let reordered = reorder_occurrences(&[overlapping.clone(), free.clone()]).unwrap();
+        let reordered = reorder_occurrences(&[overlapping.clone(), free.clone()], None).unwrap();
         assert_eq!(reordered[0].positions, overlapping.positions);
         assert_ne!(reordered[1].positions, free.positions);
         let mut a = reordered[1].positions.clone();
@@ -682,5 +696,36 @@ mod tests {
         let mut w = BitWriter::new();
         write_patch_dictionary(&references, false, &mut scratch, &mut w);
         assert!(w.bits_written() < given.bits_written());
+    }
+
+    #[test]
+    fn parallel_dictionary_matches_serial_with_shared_prices() {
+        let pool = crate::thread_pool::ThreadPool::new_lossless(4);
+        let references = [
+            entry(scattered(823), true),
+            entry(scattered(701), true),
+            entry(scattered(57), false),
+            entry(vec![(0, 0), (1, 0), (0, 1)], false),
+        ];
+        let mut scratch = CoderScratch::lossless();
+        let serial_order = reorder_occurrences(&references, None).unwrap();
+        let parallel_order = reorder_occurrences(&references, Some((&pool, &mut scratch))).unwrap();
+        for (a, b) in serial_order.iter().zip(&parallel_order) {
+            assert_eq!(a.positions, b.positions);
+        }
+        let mut serial = BitWriter::new();
+        let mut parallel = BitWriter::new();
+        write_patch_dictionary(&references, false, &mut scratch, &mut serial);
+        write_patch_dictionary_with_pool(
+            &references,
+            false,
+            &mut scratch,
+            &mut parallel,
+            Some(&pool),
+        );
+        assert_eq!(serial.bits_written(), parallel.bits_written());
+        serial.zero_pad_to_byte();
+        parallel.zero_pad_to_byte();
+        assert_eq!(serial.into_bytes(), parallel.into_bytes());
     }
 }

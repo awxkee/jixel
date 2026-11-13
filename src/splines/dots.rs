@@ -762,10 +762,11 @@ pub(super) fn share_templates(
         .collect()
 }
 
-/// The final RGB atlas encoding can be carried from RD pruning to output.
+/// Encoded dot atlas and its matching dictionary, priced without alpha.
 #[derive(Clone)]
 pub(crate) struct DotEncoding {
     pub(crate) atlas: Arc<crate::bit_writer::BitWriter>,
+    pub(crate) dictionary: Arc<crate::bit_writer::BitWriter>,
     pub(crate) references: Vec<PatchReference>,
 }
 
@@ -785,8 +786,8 @@ pub(crate) fn build_dot_patches(dots: &[QuantizedSpline]) -> DotPatches {
     build_dot_patches_with_templates(dots, &templates, false)
 }
 
-pub(super) fn build_dot_patches_with_templates(
-    dots: &[QuantizedSpline],
+pub(super) fn build_dot_patches_with_templates<'a>(
+    dots: impl IntoIterator<Item = &'a QuantizedSpline>,
     templates: &HashMap<TemplateKey, Arc<DotTemplate>>,
     trim: bool,
 ) -> DotPatches {

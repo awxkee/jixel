@@ -401,7 +401,7 @@ fn priced_order<'a>(chain: &[&'a QuantizedSpline]) -> Vec<&'a QuantizedSpline> {
         .map(|sp| (sp.points[0].x, sp.points[0].y))
         .collect();
     let given = vec![(0..points.len()).collect()];
-    let order = path_order::order_sets(&[points], &[true], given, true);
+    let order = path_order::order_sets(&[points], &[true], given, true, None);
     order[0].iter().map(|&i| chain[i]).collect()
 }
 

@@ -574,13 +574,28 @@ impl LineIndex {
 
     /// Whether a curve with these samples belongs to this line.
     pub(super) fn holds(&self, positions: &[Point<f32>], tangents: &[Point<f32>]) -> bool {
-        let near = self.count_near(positions, tangents);
-        near as f32 >= MEMBER_SHARE * positions.len() as f32 || near >= MEMBER_SAMPLES
+        let needed = ((MEMBER_SHARE * positions.len() as f32).ceil() as usize).min(MEMBER_SAMPLES);
+        self.has_near(positions, tangents, needed)
     }
 
     /// Whether a curve this long overlaps this line enough to share it.
     pub(super) fn overlaps(&self, positions: &[Point<f32>], tangents: &[Point<f32>]) -> bool {
-        self.count_near(positions, tangents) >= MEMBER_SAMPLES
+        self.has_near(positions, tangents, MEMBER_SAMPLES)
+    }
+
+    fn has_near(&self, positions: &[Point<f32>], tangents: &[Point<f32>], needed: usize) -> bool {
+        if needed == 0 {
+            return true;
+        }
+        if positions.len().min(tangents.len()) < needed {
+            return false;
+        }
+        positions
+            .iter()
+            .zip(tangents)
+            .filter(|&(&q, &t)| self.near(q, t))
+            .nth(needed - 1)
+            .is_some()
     }
 }
 
@@ -860,8 +875,22 @@ mod tests {
         let index = LineIndex::new(&line, &unit_tangents(&line));
         let run = |points: Vec<Point<f32>>| {
             let tangents = unit_tangents(&points);
-            index.holds(&points, &tangents)
+            let count = index.count_near(&points, &tangents);
+            assert_eq!(index.overlaps(&points, &tangents), count >= MEMBER_SAMPLES);
+            let holds = index.holds(&points, &tangents);
+            assert_eq!(
+                holds,
+                count as f32 >= MEMBER_SHARE * points.len() as f32 || count >= MEMBER_SAMPLES
+            );
+            holds
         };
+        for len in [0, 1, 23, 24, 39, 40, 41, 120] {
+            for inside in 0..=len {
+                run((0..len)
+                    .map(|i| Point::new(i as f32, if i < inside { 50.0 } else { 60.0 }))
+                    .collect());
+            }
+        }
         assert!(run((40..=80).map(|x| Point::new(x as f32, 51.0)).collect()));
         assert!(!run((40..=80)
             .map(|y| Point::new(100.0, y as f32))

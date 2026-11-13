@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::ColorSpace;
+use crate::dct::fmla;
 use crate::encode_image::MAX_DIMENSION;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
@@ -269,6 +270,47 @@ fn round_i32_portable(value: f32) -> i32 {
         value
     };
     biased as i32
+}
+
+/// Approximate `e^x` for `-87 <= x <= 88`, where the binary scaling factor is
+/// normal. NaN propagates.
+#[inline]
+pub(crate) fn fast_exp(x: f32) -> f32 {
+    debug_assert!(x.is_nan() || (-87.0..=88.0).contains(&x));
+    const LN2_HI: f32 = 0.693_145_75;
+    const LN2_LO: f32 = 1.428_606_8e-6;
+
+    let exponent = round_i32(x * std::f32::consts::LOG2_E);
+    let r = fmla(exponent as f32, -LN2_HI, x);
+    let r = fmla(exponent as f32, -LN2_LO, r);
+    let square = r * r;
+    // Approximate r * (exp(r) + 1) / (exp(r) - 1), then solve for exp(r).
+    let p = fmla(-0.002_775_669, square, 0.166_667_07);
+    let p = fmla(p, square, 2.0);
+    let scale = f32::from_bits(((exponent + 127) as u32) << 23);
+    (1.0 + 2.0 * r / (p - r)) * scale
+}
+
+#[cfg(test)]
+#[test]
+fn fast_exp_approximates_exp_over_its_domain() {
+    let check = |x: f32| {
+        let expected = (x as f64).exp() as f32;
+        let actual = fast_exp(x);
+        assert!(actual.to_bits().abs_diff(expected.to_bits()) <= 2, "x={x}");
+    };
+    for i in -8700..=8800 {
+        check(i as f32 / 100.0);
+    }
+    for exponent in -125..127 {
+        let boundary = (exponent as f32 + 0.5) * std::f32::consts::LN_2;
+        check(boundary.next_down());
+        check(boundary);
+        check(boundary.next_up());
+    }
+    assert_eq!(fast_exp(0.0), 1.0);
+    assert_eq!(fast_exp(-0.0), 1.0);
+    assert!(fast_exp(f32::NAN).is_nan());
 }
 
 #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
