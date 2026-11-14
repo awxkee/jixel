@@ -101,9 +101,10 @@ impl Pyramid {
         xyb: &Image3F,
         distance: f32,
         screen: bool,
+        vertical_first: bool,
         pool: &ThreadPool,
     ) -> Option<Self> {
-        let steps = lossy_squeeze_steps(xyb.xsize(), xyb.ysize(), 3);
+        let steps = lossy_squeeze_steps(xyb.xsize(), xyb.ysize(), 3, vertical_first);
         let row_mul = if screen { SCREEN_ROW_MUL } else { [1.0; 3] };
         let pyramid = Self::xyb_with(
             xyb,

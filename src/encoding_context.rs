@@ -77,6 +77,7 @@ pub(crate) struct EncodingContext {
     pub(crate) crop_base: bool,
     /// Lossy arm selection from the public config
     pub(crate) lossy_modular: crate::LossyModular,
+    pub(crate) modular_vertical_first: bool,
     /// Code VarDCT frames' DC as a separate DC frame (see
     /// `EncodeConfig::progressive_dc`).
     pub(crate) progressive_dc: bool,
@@ -618,6 +619,7 @@ impl EncodingContext {
             frame_role: FrameRole::Last,
             crop_base: false,
             lossy_modular: crate::LossyModular::Off,
+            modular_vertical_first: false,
             progressive_dc: false,
             progressive_dc_levels: None,
             group_order: crate::GroupOrder::Scanline,

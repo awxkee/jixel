@@ -495,6 +495,10 @@ pub struct EncodeConfig {
     pub upsampling: bool,
     /// Lossy encoding arm selection (see [`LossyModular`]). Default `Off`.
     pub lossy_modular: LossyModular,
+    /// Start the shared Squeeze pyramid vertically in XYB frames encoded
+    /// with [LossyModular::Force]. This opt-in can change the decoded
+    /// reconstruction. Defaults to false (start along the longer dimension).
+    pub modular_vertical_first: bool,
     /// Experimental: lift line/text colors into one palette frame with
     /// coverage alpha, blended over a VarDCT base that is free under the ink.
     /// Source color and edge statistics select the decomposition before the
@@ -698,6 +702,7 @@ impl Default for EncodeConfig {
             decoding_speed: DecodingSpeed::Slow,
             near_lossless: 0,
             lossy_modular: LossyModular::Off,
+            modular_vertical_first: false,
             ink_layer: false,
             vector_layers: false,
             crop_frames: false,
@@ -1117,6 +1122,13 @@ impl EncodeConfig {
         self
     }
 
+    /// Start the shared XYB Squeeze pyramid vertically when forcing lossy Modular.
+    /// See [EncodeConfig::modular_vertical_first].
+    pub fn with_modular_vertical_first(mut self, enabled: bool) -> Self {
+        self.modular_vertical_first = enabled;
+        self
+    }
+
     /// Experimental ink layer for cel and line art (see
     /// [`EncodeConfig::ink_layer`]).
     pub fn with_ink_layer(mut self, ink_layer: bool) -> Self {
@@ -1324,6 +1336,7 @@ pub(crate) fn lossy_context(
     };
     let mut ctx = EncodingContext::new(config.speed, config.arbiter, xyb, distance, num_threads);
     ctx.lossy_modular = config.lossy_modular;
+    ctx.modular_vertical_first = config.modular_vertical_first;
     ctx.progressive_dc = config.progressive_dc;
     ctx.progressive_dc_levels = config.progressive_dc_levels;
     ctx.group_order = config.group_order;
@@ -7095,6 +7108,35 @@ mod lossy_alpha_tests {
             .with_distance(1.5);
         let bytes = encode_image_with_alpha(&rgba, w, h, &config).unwrap().len();
         assert!(bytes < 3150, "{bytes}");
+    }
+
+    #[test]
+    fn vertical_first_requires_forced_xyb_modular() {
+        let (w, h) = (37, 29);
+        let pixels: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let v = (i * 13 + i / w * 29) as u8;
+                [v, v, v]
+            })
+            .collect();
+        let config = EncodeConfig::default()
+            .with_distance(3.0)
+            .with_num_threads(1);
+        let encode = |config: &EncodeConfig| encode_image(&pixels, w, h, config).unwrap();
+        assert_eq!(
+            encode(&config),
+            encode(&config.clone().with_modular_vertical_first(true)),
+        );
+        let config = config.with_lossy_modular(LossyModular::Force);
+        assert_ne!(
+            encode(&config),
+            encode(&config.clone().with_modular_vertical_first(true)),
+        );
+        let config = config.with_coding_transform(crate::CodingTransform::Rgb);
+        assert_eq!(
+            encode(&config),
+            encode(&config.clone().with_modular_vertical_first(true)),
+        );
     }
 
     #[test]

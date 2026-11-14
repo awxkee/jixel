@@ -38,6 +38,7 @@ fn usage() -> ! {
     eprintln!("         [--arbiter ssimulacra2|cvvdp]");
     eprintln!("         [--progressive-dc] (code the DC as a progressive DC frame)");
     eprintln!("         [--lossy-modular off|auto|force] (modular arm instead of VarDCT)");
+    eprintln!("         [--modular-vertical-first] (use with --lossy-modular force in XYB)");
     eprintln!("         [--coding xyb|ycbcr|rgb] (coding transform of lossy frames)");
     eprintln!("         [--no-ink-layer] (no ink or vector layer stacks)");
     eprintln!(
@@ -67,6 +68,7 @@ fn main() -> ExitCode {
     let mut alpha_distance: Option<f32> = None;
     let mut progressive_dc = false;
     let mut lossy_modular = jixel::LossyModular::Off;
+    let mut modular_vertical_first = false;
     let mut coding = jixel::CodingTransform::Xyb;
     let mut ink_layer: Option<bool> = None;
     let mut progressive_dc_levels: Option<u32> = None;
@@ -200,6 +202,10 @@ fn main() -> ExitCode {
                 };
                 i += 2;
             }
+            "--modular-vertical-first" => {
+                modular_vertical_first = true;
+                i += 1;
+            }
             "--lossy-modular" => {
                 let v = args.get(i + 1).unwrap_or_else(|| usage());
                 lossy_modular = match v.as_str() {
@@ -299,6 +305,7 @@ fn main() -> ExitCode {
         .with_patch_epf(patch_epf)
         .with_progressive_dc(progressive_dc)
         .with_lossy_modular(lossy_modular)
+        .with_modular_vertical_first(modular_vertical_first)
         .with_coding_transform(coding);
     let cfg = match ink_layer {
         Some(ink) => cfg.with_ink_layer(ink).with_vector_layers(ink),
