@@ -33,7 +33,8 @@ use super::chroma::configure_chroma;
 use super::quantization::DistanceParams;
 use super::variants::{
     GLYPH_BITS_MARGIN, GLYPH_SINGLETON_FREE_MAX_DISTANCE, GLYPH_SINGLETON_RACE_MAX_DISTANCE,
-    GlyphStage, LATTICE_BITS_MARGIN, PreparedVarDct, lattice_variants, prepare_vardct_variant,
+    GlyphStage, LATTICE_BITS_MARGIN, PreparedVarDct, UNPATCHED_BITS_MARGIN, lattice_variants,
+    prepare_vardct_variant,
 };
 #[cfg(feature = "splines")]
 use super::variants::{SplineStage, spline_quant_field};
@@ -187,8 +188,9 @@ pub(super) fn encode_frame_vardct(
     // patches races the winner: on photo-heavy composites (store and
     // marketing screenshots, phone mock-ups with tiny perspective text)
     // thousands of near-glyph references cost more than they take out of
-    // the residual. Patches code their pixels finer than the residual, so
-    // the unpatched frame must win by the same margin as dropping tiles.
+    // the residual. The unpatched frame wins on its estimate alone (see
+    // `UNPATCHED_BITS_MARGIN`): a plan that is not smaller is not sharper
+    // either.
     // Only plans that found something pay for the extra estimate. The base
     // frame under an ink layer keeps its patches: there the sampled estimate
     // prices the unpatched base far below its real size (an ink-stacked text
@@ -243,7 +245,7 @@ pub(super) fn encode_frame_vardct(
             Some(bits) => bits,
             None => best.estimate(ctx, scratch, distance, alpha, coeff_shifts)?,
         };
-        Ok(if bits * GLYPH_BITS_MARGIN < best_bits {
+        Ok(if bits * UNPATCHED_BITS_MARGIN < best_bits {
             arm.unwrap_or_else(|| PreparedVarDct::regular(original.expect("unpatched source")))
         } else {
             best
