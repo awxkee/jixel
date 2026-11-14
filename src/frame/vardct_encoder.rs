@@ -34,7 +34,9 @@ use super::ac_entropy::{
 };
 #[cfg(not(feature = "extraslow"))]
 use super::ac_groups::RefinedAcGroup;
-use super::ac_groups::{PendingAcGroup, ac_qf_threshold, paste_group, process_ac_group};
+use super::ac_groups::{
+    AcGroupCapture, PendingAcGroup, ac_qf_threshold, paste_group, process_ac_group,
+};
 #[cfg(feature = "splines")]
 use super::dc_groups::provisional_dc_group;
 use super::dc_groups::{assemble_source_dc, merge_quant_dc, setup_dc_group};
@@ -1061,7 +1063,11 @@ fn encode_frame_core_inner(
                     want_order_stats || use_dc_frame || want_recon,
                     qf_threshold,
                     // Without custom orders this pass is the final quantization.
-                    want_recon && !want_order_stats,
+                    if want_recon && !want_order_stats {
+                        AcGroupCapture::Pixels
+                    } else {
+                        AcGroupCapture::None
+                    },
                     None,
                 );
                 if let (Some(target), Some((image, _))) = (&target, capture) {
@@ -1232,7 +1238,7 @@ fn encode_frame_core_inner(
                         &[],
                         false,
                         qf_threshold,
-                        false,
+                        AcGroupCapture::None,
                         None,
                     )
                     .0
@@ -1392,7 +1398,11 @@ fn encode_frame_core_inner(
                         &order_alternatives,
                         false,
                         qf_threshold,
-                        want_recon,
+                        if want_recon {
+                            AcGroupCapture::Pixels
+                        } else {
+                            AcGroupCapture::None
+                        },
                         None,
                     );
                     if let (Some(target), Some((image, _))) = (&target, capture) {

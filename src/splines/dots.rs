@@ -31,7 +31,7 @@
 //!
 //! Candidates ride through the spline RD selection as one-point
 //! `QuantizedSpline`s (a one-point spline renders nothing in the format, so
-//! the shape is free as a marker): points[0] = centre pixel, dct[1][0] = Y
+//! the shape is free as a marker): points[0] = center pixel, dct[1][0] = Y
 //! level on a geometric lattice, dct[0][0] = X/Y ratio steps,
 //! dct[2][0] = (B-Y)/Y ratio steps, dct[3][0] = signed sigma lattice index
 //! (negative for dark dots). Selected

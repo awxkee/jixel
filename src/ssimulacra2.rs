@@ -133,21 +133,22 @@ impl Ssimulacra2State {
     }
 
     /// Refresh the linear RGB staging inside the clipped rectangle.
-    fn write_linear(&mut self, recon: &Image3F, r: Rect) -> Option<Rect> {
+    fn write_linear(&mut self, recon: &Image3F, (ox, oy): (usize, usize), r: Rect) -> Option<Rect> {
         let (w, h) = (self.width, self.height);
         let r = Rect::new(r.x0, r.y0, r.x1.min(w), r.y1.min(h));
         if r.x1 <= r.x0 || r.y1 <= r.y0 {
             return None;
         }
         let [lr, lg, lb] = &mut self.linear;
+        let xs = r.x0 - ox..r.x1 - ox;
         for y in r.y0..r.y1 {
             let span = y * w + r.x0..y * w + r.x1;
             crate::xyb::xyb_to_rgb_rows(
                 &crate::xyb::XybMatrix::SPEC,
                 [
-                    &recon.plane_row(0, y)[r.x0..r.x1],
-                    &recon.plane_row(1, y)[r.x0..r.x1],
-                    &recon.plane_row(2, y)[r.x0..r.x1],
+                    &recon.plane_row(0, y - oy)[xs.clone()],
+                    &recon.plane_row(1, y - oy)[xs.clone()],
+                    &recon.plane_row(2, y - oy)[xs.clone()],
                 ],
                 [&mut lr[span.clone()], &mut lg[span.clone()], &mut lb[span]],
             );
@@ -156,8 +157,9 @@ impl Ssimulacra2State {
     }
 
     /// Commit a reconstruction change without saving rollback data.
-    pub(crate) fn update(&mut self, recon: &Image3F, r: Rect) {
-        let Some(r) = self.write_linear(recon, r) else {
+    /// `origin` locates the supplied reconstruction in frame coordinates.
+    pub(crate) fn update_region(&mut self, recon: &Image3F, origin: (usize, usize), r: Rect) {
+        let Some(r) = self.write_linear(recon, origin, r) else {
             return;
         };
         let result = self
@@ -174,7 +176,17 @@ impl Ssimulacra2State {
         r: Rect,
         cp: &mut Ssimulacra2Checkpoint,
     ) {
-        let Some(r) = self.write_linear(recon, r) else {
+        self.update_region_checkpointed(recon, (0, 0), r, cp);
+    }
+
+    pub(crate) fn update_region_checkpointed(
+        &mut self,
+        recon: &Image3F,
+        origin: (usize, usize),
+        r: Rect,
+        cp: &mut Ssimulacra2Checkpoint,
+    ) {
+        let Some(r) = self.write_linear(recon, origin, r) else {
             return;
         };
         let result =
@@ -197,6 +209,18 @@ impl Ssimulacra2State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn crop(recon: &Image3F, r: Rect) -> Image3F {
+        let (x1, y1) = (r.x1.min(recon.xsize()), r.y1.min(recon.ysize()));
+        let mut out = Image3F::new(x1 - r.x0, y1 - r.y0);
+        for c in 0..3 {
+            for y in r.y0..y1 {
+                out.plane_row_mut(c, y - r.y0)
+                    .copy_from_slice(&recon.plane_row(c, y)[r.x0..x1]);
+            }
+        }
+        out
+    }
 
     fn textured(seed: u32, w: usize, h: usize) -> Image3F {
         let mut img = Image3F::new(w, h);
@@ -288,8 +312,8 @@ mod tests {
                     }
                 }
             }
-            committed.update(&recon, r);
-            checkpointed.update_checkpointed(&recon, r, &mut cp);
+            committed.update_region(&recon, (0, 0), r);
+            checkpointed.update_region_checkpointed(&crop(&recon, r), (r.x0, r.y0), r, &mut cp);
             let base = committed.deficit().to_bits();
             assert_eq!(base, checkpointed.deficit().to_bits());
             assert_eq!(committed.linear, checkpointed.linear);
@@ -299,7 +323,12 @@ mod tests {
             trial.plane_row_mut(1, 17)[23] += 0.003;
             let rect = Rect::new(23, 17, 24, 18);
             committed.update_checkpointed(&trial, rect, &mut trial_cp);
-            checkpointed.update_checkpointed(&trial, rect, &mut cp);
+            checkpointed.update_region_checkpointed(
+                &crop(&trial, rect),
+                (rect.x0, rect.y0),
+                rect,
+                &mut cp,
+            );
             assert_eq!(
                 committed.deficit().to_bits(),
                 checkpointed.deficit().to_bits()

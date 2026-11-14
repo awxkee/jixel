@@ -302,7 +302,6 @@ impl<'a> NativeModel<'a> {
         };
         let mut nzeros = [Image3B::new(32, 32)];
         let mut tokens = [Vec::new()];
-        let mut starts = Vec::new();
         let p = self.quantization;
         write_ac_group(
             self.ctx,
@@ -329,7 +328,7 @@ impl<'a> NativeModel<'a> {
             None,
             false,
             self.qf_threshold,
-            Some((&mut reconstruction, 0, &mut starts)),
+            Some((&mut reconstruction, 0, None)),
             None,
             &mut tokens,
         );

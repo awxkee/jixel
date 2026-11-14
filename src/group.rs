@@ -801,13 +801,13 @@ fn quantize_roundtrip_y_block(
     }
 }
 
-/// Luma reconstruction capture for the closed-loop quant field: the
+/// Reconstruction capture: the
 /// group-local plane, the pixel row offset of the current stripe in it, and
-/// the pass-0 token index at which each coded block starts.
+/// optional pass-0 token start indices for the closed-loop quant field.
 pub(crate) type ReconCapture<'a> = (
     &'a mut crate::image::Image3F,
     usize,
-    &'a mut Vec<(u16, u16, u32)>,
+    Option<&'a mut Vec<(u16, u16, u32)>>,
 );
 
 /// Per-block memo of one AC group for the closed-loop quant field: a block's
@@ -909,21 +909,48 @@ impl AcBlockCache {
         }
     }
 
+    /// The settled polish baseline prices pass 0. Keep its cache hits and
+    /// release the alternative-order arenas before assembling the frame.
+    #[cfg(feature = "extraslow")]
+    pub(crate) fn keep_primary_tokens(&mut self) {
+        let streams = self.tokens.len();
+        if streams <= 1 {
+            return;
+        }
+        self.tokens.truncate(1);
+        let channels = self.spans.len() / streams;
+        for i in 1..channels {
+            self.spans[i] = self.spans[i * streams];
+        }
+        self.spans.truncate(channels);
+    }
+
     #[cfg(feature = "extraslow")]
     /// Everything the memo holds for the cells of a group-local block region,
     /// so a trial layout there can be undone without re-encoding. Between the
     /// snapshot and its restore/discard, arenas must stay append-only.
     pub(crate) fn snapshot(&self, x: usize, y: usize, w: usize, h: usize) -> MemoSnapshot {
-        let mut snap = MemoSnapshot {
-            rect: (x, y, w, h),
-            ..Default::default()
-        };
         let streams = if self.keys[0].is_empty() {
             0
         } else {
             self.spans.len() / (self.keys[0].len() * 3)
         };
         let (pw, ph) = (self.recon.xsize(), self.recon.ysize());
+        let pixel_x = (x * 8).min(pw)..((x + w) * 8).min(pw);
+        let pixel_y = (y * 8).min(ph)..((y + h) * 8).min(ph);
+        let cells = w * h;
+        let mut snap = MemoSnapshot {
+            rect: (x, y, w, h),
+            streams,
+            keys: Vec::with_capacity(3 * cells),
+            quantized: Vec::with_capacity(3 * cells * 64),
+            dc: Vec::with_capacity(3 * cells),
+            dc_f: Vec::with_capacity(3 * cells),
+            spans: Vec::with_capacity(3 * cells * streams),
+            nz_shift: Vec::with_capacity(cells),
+            bits: Vec::with_capacity(cells),
+            recon: Vec::with_capacity(3 * pixel_x.len() * pixel_y.len()),
+        };
         for row in y..y + h {
             let cells = row * self.xsize_blocks + x..row * self.xsize_blocks + x + w;
             for c in 0..3 {
@@ -941,17 +968,14 @@ impl AcBlockCache {
             }
             snap.nz_shift
                 .extend_from_slice(&self.nz_shift[cells.clone()]);
-            snap.bits.extend_from_slice(&self.bits[cells.clone()]);
-            snap.cell_gen.extend_from_slice(&self.cell_gen[cells]);
+            snap.bits.extend_from_slice(&self.bits[cells]);
         }
         for c in 0..3 {
-            for py in (y * 8).min(ph)..((y + h) * 8).min(ph) {
-                snap.recon.extend_from_slice(
-                    &self.recon.plane_row(c, py)[(x * 8).min(pw)..((x + w) * 8).min(pw)],
-                );
+            for py in pixel_y.clone() {
+                snap.recon
+                    .extend_from_slice(&self.recon.plane_row(c, py)[pixel_x.clone()]);
             }
         }
-        snap.streams = streams;
         snap
     }
 
@@ -1065,7 +1089,6 @@ impl AcBlockCache {
 
 #[cfg(feature = "extraslow")]
 /// See [`AcBlockCache::snapshot`].
-#[derive(Default)]
 pub(crate) struct MemoSnapshot {
     rect: (usize, usize, usize, usize),
     streams: usize,
@@ -1076,20 +1099,50 @@ pub(crate) struct MemoSnapshot {
     spans: Vec<(u32, u32)>,
     nz_shift: Vec<[u8; 3]>,
     bits: Vec<[f32; 3]>,
-    cell_gen: Vec<u32>,
     recon: Vec<f32>,
 }
 
+#[derive(Default)]
 struct ReconScratch {
-    err: Box<[f32; MAX_BLOCK_COEFFICIENTS]>,
-    pix: Box<[f32; MAX_BLOCK_COEFFICIENTS]>,
+    err: Vec<f32>,
+    pix: Vec<f32>,
 }
 
-impl Default for ReconScratch {
-    fn default() -> Self {
-        Self {
-            err: heap_array(0.0),
-            pix: heap_array(0.0),
+impl ReconScratch {
+    fn block(&mut self, size: usize) -> (&mut [f32], &mut [f32]) {
+        if self.err.len() < size {
+            self.err.resize(size, 0.0);
+            self.pix.resize(size, 0.0);
+        }
+        (&mut self.err[..size], &mut self.pix[..size])
+    }
+}
+
+/// Add an inverse-transformed error over the visible portion of its footprint.
+#[inline]
+fn capture_reconstruction(
+    source: &crate::image::Plane<f32>,
+    target: &mut crate::image::Plane<f32>,
+    footprint: Footprint,
+    (x, y): (usize, usize),
+    error: &[f32],
+) {
+    let width = footprint
+        .width
+        .min(source.xsize().saturating_sub(footprint.x))
+        .min(target.xsize().saturating_sub(x));
+    let height = footprint
+        .height
+        .min(source.ysize().saturating_sub(footprint.y))
+        .min(target.ysize().saturating_sub(y));
+    if width == 0 {
+        return;
+    }
+    for (row, delta) in error.chunks_exact(footprint.width).take(height).enumerate() {
+        let src = &source.row(footprint.y + row)[footprint.x..footprint.x + width];
+        let dst = &mut target.row_mut(y + row)[x..x + width];
+        for ((out, &sample), &change) in dst.iter_mut().zip(src).zip(delta) {
+            *out = sample + change;
         }
     }
 }
@@ -1106,15 +1159,16 @@ pub(crate) struct AcGroupScratch {
     coeffs: HeapMatrix<f32, 3, MAX_BLOCK_COEFFICIENTS>,
     quantized: HeapMatrix<i32, 3, MAX_BLOCK_COEFFICIENTS>,
     /// Saved luma coefficients for RDOQ or reconstruction capture.
-    source_y: Option<Box<[f32; MAX_BLOCK_COEFFICIENTS]>>,
-    block: Box<[i32; MAX_BLOCK_COEFFICIENTS]>,
+    source_y: Option<Box<[f32]>>,
+    /// Materialized pass coefficients, needed only when the full block cannot be used.
+    block: Option<Box<[i32]>>,
     rdoq: Option<RdoqScratch>,
     /// Edge-replicated pixels of a footprint that crosses the image edge.
     gather: Box<[f32; MAX_BLOCK_COEFFICIENTS]>,
     /// Distinct source colors, reused across RDOQ blocks and groups.
     few_color_keys: Vec<u64>,
     /// Y coefficient error and its pixel-domain image for the recon capture.
-    recon: Option<ReconScratch>,
+    recon: Option<Box<ReconScratch>>,
     clip: Option<Box<crate::clip_continuation::ClipScratch>>,
 }
 
@@ -1138,7 +1192,7 @@ impl Default for AcGroupScratch {
             coeffs: HeapMatrix::new(0.0),
             quantized: HeapMatrix::new(0),
             source_y: None,
-            block: heap_array(0),
+            block: None,
             rdoq: None,
             gather: heap_array(0.0),
             few_color_keys: Vec::new(),
@@ -1227,9 +1281,8 @@ pub(crate) fn write_ac_group(
     let cfl_factor_x = crate::color_correlation::dc_cfl_factor_x(dc_step, ctx.cfl_base_x());
 
     // All the big per-block buffers live in the worker scratch: re-creating them
-    // per group cost ~130 KB of zeroing, and `pblock` was being zeroed once per
-    // block per pass. Every one is written over `..size` before it is read, so
-    // carrying values across groups is not observable.
+    // per group cost ~130 KB of zeroing. The pass buffer is written over
+    // `..size` before it is read, so it can also carry storage across groups.
     let AcGroupScratch {
         polisher,
         coeffs,
@@ -1259,7 +1312,7 @@ pub(crate) fn write_ac_group(
             if !dc_data.ac_strategy.is_first_block(global_bx, global_by) {
                 continue;
             }
-            if let Some((_, _, starts)) = recon_y.as_mut() {
+            if let Some((_, _, Some(starts))) = recon_y.as_mut() {
                 starts.push((global_bx as u16, global_by as u16, out[0].len() as u32));
             }
 
@@ -1321,12 +1374,11 @@ pub(crate) fn write_ac_group(
                     }
                     for j in 0..cov_y {
                         if !tokens_cached {
-                            for i in 0..cov_x {
-                                let slot = ((lby + j) * m.xsize_blocks + bx + i) * 64;
-                                let k = (j * cov_x + i) * 64;
-                                quantized[c][k..k + 64]
-                                    .copy_from_slice(&m.quantized[c][slot..slot + 64]);
-                            }
+                            let slot = ((lby + j) * m.xsize_blocks + bx) * 64;
+                            let len = cov_x * 64;
+                            let k = j * len;
+                            quantized[c][k..k + len]
+                                .copy_from_slice(&m.quantized[c][slot..slot + len]);
                         }
                         let src = &m.dc.plane_row(c, lby + j)[bx..bx + cov_x];
                         quant_dc.plane_row_mut(c, lby + j)[bx..bx + cov_x].copy_from_slice(src);
@@ -1548,7 +1600,9 @@ pub(crate) fn write_ac_group(
                 // indexing is didx = iy * cov_x + ix.
                 let mut dc_vals = [[0.0f32; 256]; 3];
                 for c in 0..3 {
-                    dc_from_coefficients(ctx, raw_strategy, &coeffs[c], &mut dc_vals[c]);
+                    if !hit[c] {
+                        dc_from_coefficients(ctx, raw_strategy, &coeffs[c], &mut dc_vals[c]);
+                    }
                 }
 
                 // Hit channels: the DC values the skipped transform would have given.
@@ -1597,12 +1651,13 @@ pub(crate) fn write_ac_group(
                 // 128-float 16×8 weights, DCT16X16 uses the 256-float 16×16 weights.
                 if let Some(m) = memo.as_deref().filter(|_| hit[1]) {
                     // The levels are skipped above when the tokens are cached too.
-                    for j in 0..cov_y {
-                        for i in 0..cov_x {
-                            let slot = ((lby + j) * m.xsize_blocks + bx + i) * 64;
-                            let k = (j * cov_x + i) * 64;
-                            quantized[1][k..k + 64]
-                                .copy_from_slice(&m.quantized[1][slot..slot + 64]);
+                    if tokens_cached {
+                        for j in 0..cov_y {
+                            let slot = ((lby + j) * m.xsize_blocks + bx) * 64;
+                            let len = cov_x * 64;
+                            let k = j * len;
+                            quantized[1][k..k + len]
+                                .copy_from_slice(&m.quantized[1][slot..slot + len]);
                         }
                     }
                     let inv_qac = 1.0 / (scale * quant_ac as f32);
@@ -1614,8 +1669,12 @@ pub(crate) fn write_ac_group(
                     }
                 } else {
                     if rdoq_prices.is_some() || recon_y.is_some() {
-                        let source_y = source_y.get_or_insert_with(|| heap_array(0.0));
-                        source_y[..size].copy_from_slice(&coeffs[1][..size]);
+                        match source_y {
+                            Some(saved) if saved.len() >= size => {
+                                saved[..size].copy_from_slice(&coeffs[1][..size]);
+                            }
+                            _ => *source_y = Some(coeffs[1][..size].into()),
+                        }
                     }
                     quantize_roundtrip_y_block(
                         ctx,
@@ -1630,10 +1689,6 @@ pub(crate) fn write_ac_group(
                         &mut quantized[1][..size],
                     );
                     if let Some(prices) = rdoq_prices {
-                        let RdoqScratch {
-                            choices: rdoq_choices,
-                            costs: rdoq_costs,
-                        } = rdoq.get_or_insert_with(RdoqScratch::default);
                         let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
                         let nzero_map = &num_nzeros[0];
                         let row_top = (nz_by != 0).then(|| nzero_map.plane_row(1, nz_by - 1));
@@ -1664,8 +1719,7 @@ pub(crate) fn write_ac_group(
                                 / visible,
                             restore_penalty,
                             RdoqSearch::of(ctx.speed.effort()),
-                            rdoq_choices,
-                            rdoq_costs,
+                            rdoq.get_or_insert_with(RdoqScratch::default),
                         );
                         let inv_qac = 1.0 / (scale * quant_ac as f32);
                         for (out, (&q, &dq)) in coeffs[1][..size]
@@ -1683,13 +1737,10 @@ pub(crate) fn write_ac_group(
                 if !hit[1]
                     && let Some((recon, y_off, _)) = recon_y.as_mut()
                 {
-                    let ReconScratch {
-                        err: recon_err,
-                        pix: recon_pix,
-                    } = recon_scratch.get_or_insert_with(ReconScratch::default);
+                    let (recon_err, recon_pix) =
+                        recon_scratch.get_or_insert_with(Box::default).block(size);
                     let source_y = source_y.as_ref().expect("luma saved for reconstruction");
-                    let y_off = *y_off;
-                    for ((e, &q), &src) in recon_err[..size]
+                    for ((e, &q), &src) in recon_err
                         .iter_mut()
                         .zip(&coeffs[1][..size])
                         .zip(&source_y[..size])
@@ -1703,28 +1754,16 @@ pub(crate) fn write_ac_group(
                     crate::inflated_cost::reconstruct_error(
                         ctx.idct,
                         raw_strategy,
-                        &recon_err[..size],
-                        &mut recon_pix[..size],
+                        recon_err,
+                        recon_pix,
                     );
-                    let (pw, ph) = crate::inflated_cost::strategy_pixel_dims(raw_strategy);
-                    let (px0, py0) = (opsin_origin.0 + bx * 8, opsin_origin.1 + by * 8);
-                    let plane = opsin.plane(1);
-                    let recon = recon.plane_mut(1);
-                    for y in 0..ph {
-                        let (sy, ly) = (py0 + y, y_off + by * 8 + y);
-                        if sy >= plane.ysize() || ly >= recon.ysize() {
-                            break;
-                        }
-                        let src_row = plane.row(sy);
-                        let dst_row = recon.row_mut(ly);
-                        for x in 0..pw {
-                            let (sx, lx) = (px0 + x, bx * 8 + x);
-                            if sx >= src_row.len() || lx >= dst_row.len() {
-                                break;
-                            }
-                            dst_row[lx] = src_row[sx] + recon_pix[y * pw + x];
-                        }
-                    }
+                    capture_reconstruction(
+                        opsin.plane(1),
+                        recon.plane_mut(1),
+                        footprint,
+                        (bx * 8, *y_off + by * 8),
+                        recon_pix,
+                    );
                 }
 
                 // ---- Per-tile CfL factors ----
@@ -1934,10 +1973,6 @@ pub(crate) fn write_ac_group(
                     // transform's calibrated weights and the distance-scheduled X/B
                     // multiplier (`chroma_rdoq_weight`).
                     if let Some(prices) = rdoq_prices {
-                        let RdoqScratch {
-                            choices: rdoq_choices,
-                            costs: rdoq_costs,
-                        } = rdoq.get_or_insert_with(RdoqScratch::default);
                         let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
                         let nzero_map = &num_nzeros[0];
                         let row_top = (nz_by != 0).then(|| nzero_map.plane_row(0, nz_by - 1));
@@ -1968,8 +2003,7 @@ pub(crate) fn write_ac_group(
                                 / visible,
                             restore_penalty,
                             RdoqSearch::of(ctx.speed.effort()),
-                            rdoq_choices,
-                            rdoq_costs,
+                            rdoq.get_or_insert_with(RdoqScratch::default),
                         );
                     }
                 }
@@ -2040,10 +2074,6 @@ pub(crate) fn write_ac_group(
                         &mut quantized[2][..size],
                     );
                     if let Some(prices) = rdoq_prices {
-                        let RdoqScratch {
-                            choices: rdoq_choices,
-                            costs: rdoq_costs,
-                        } = rdoq.get_or_insert_with(RdoqScratch::default);
                         let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
                         let nzero_map = &num_nzeros[0];
                         let row_top = (nz_by != 0).then(|| nzero_map.plane_row(2, nz_by - 1));
@@ -2074,8 +2104,7 @@ pub(crate) fn write_ac_group(
                                 / visible,
                             restore_penalty,
                             RdoqSearch::of(ctx.speed.effort()),
-                            rdoq_choices,
-                            rdoq_costs,
+                            rdoq.get_or_insert_with(RdoqScratch::default),
                         );
                     }
                 }
@@ -2112,10 +2141,8 @@ pub(crate) fn write_ac_group(
                 // CfL was applied against the dequantized Y, so the decoder's chroma
                 // error is the residual's own quantization error.
                 if let Some((recon, y_off, _)) = recon_y.as_mut() {
-                    let ReconScratch {
-                        err: recon_err,
-                        pix: recon_pix,
-                    } = recon_scratch.get_or_insert_with(ReconScratch::default);
+                    let (recon_err, recon_pix) =
+                        recon_scratch.get_or_insert_with(Box::default).block(size);
                     let y_off = *y_off;
                     let q_x = quantize_ac_q_scaled(quant_ac, scale, x_qm_mul);
                     let q_b = quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul());
@@ -2138,28 +2165,16 @@ pub(crate) fn write_ac_group(
                         crate::inflated_cost::reconstruct_error(
                             ctx.idct,
                             raw_strategy,
-                            &recon_err[..size],
-                            &mut recon_pix[..size],
+                            recon_err,
+                            recon_pix,
                         );
-                        let (pw, ph) = crate::inflated_cost::strategy_pixel_dims(raw_strategy);
-                        let (px0, py0) = (opsin_origin.0 + bx * 8, opsin_origin.1 + by * 8);
-                        let plane = opsin.plane(c);
-                        let dst = recon.plane_mut(c);
-                        for y in 0..ph {
-                            let (sy, ly) = (py0 + y, y_off + by * 8 + y);
-                            if sy >= plane.ysize() || ly >= dst.ysize() {
-                                break;
-                            }
-                            let src_row = plane.row(sy);
-                            let dst_row = dst.row_mut(ly);
-                            for x in 0..pw {
-                                let (sx, lx) = (px0 + x, bx * 8 + x);
-                                if sx >= src_row.len() || lx >= dst_row.len() {
-                                    break;
-                                }
-                                dst_row[lx] = src_row[sx] + recon_pix[y * pw + x];
-                            }
-                        }
+                        capture_reconstruction(
+                            opsin.plane(c),
+                            recon.plane_mut(c),
+                            footprint,
+                            (bx * 8, y_off + by * 8),
+                            recon_pix,
+                        );
                     }
                 }
                 if let Some(m) = memo.as_deref_mut() {
@@ -2177,12 +2192,11 @@ pub(crate) fn write_ac_group(
                             let row = (lby + j) * m.xsize_blocks;
                             m.dc_f[c][row + bx..row + bx + cov_x]
                                 .copy_from_slice(&dc_vals[c][j * cov_x..(j + 1) * cov_x]);
-                            for i in 0..cov_x {
-                                let slot = (row + bx + i) * 64;
-                                let k = (j * cov_x + i) * 64;
-                                m.quantized[c][slot..slot + 64]
-                                    .copy_from_slice(&quantized[c][k..k + 64]);
-                            }
+                            let slot = (row + bx) * 64;
+                            let len = cov_x * 64;
+                            let k = j * len;
+                            m.quantized[c][slot..slot + len]
+                                .copy_from_slice(&quantized[c][k..k + len]);
                             let src = &quant_dc.plane_row(c, lby + j)[bx..bx + cov_x];
                             m.dc.plane_row_mut(c, lby + j)[bx..bx + cov_x].copy_from_slice(src);
                         }
@@ -2347,6 +2361,10 @@ pub(crate) fn write_ac_group(
                     let block = if pass == 0 && coeff_shifts[0] == 0 {
                         full_block
                     } else {
+                        if pblock.as_ref().is_none_or(|block| block.len() < size) {
+                            *pblock = Some(vec![0; size].into_boxed_slice());
+                        }
+                        let pblock = pblock.as_deref_mut().expect("pass buffer");
                         for k in 0..size {
                             pblock[k] = pass_coefficient(full_block[k], coeff_shifts, pass);
                         }
@@ -2521,6 +2539,33 @@ fn write_token_into(t: Token, out: &mut Vec<Token>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capture_clips_source_and_target_at_independent_origins() {
+        use crate::image::Plane;
+        use crate::inflated_cost::Footprint;
+
+        let mut source = Plane::<f32>::new(11, 10);
+        for (i, value) in source.as_mut_slice().iter_mut().enumerate() {
+            *value = (i as f32 - 31.0) / 7.0;
+        }
+        let mut target = Plane::new_fill(12, 11, -0.0f32);
+        let footprint = Footprint::new(16, 16, 8, 8, 8, 8);
+        let error: Vec<_> = (0..64).map(|i| i as f32 / -11.0).collect();
+        super::capture_reconstruction(&source, &mut target, footprint, (10, 5), &error);
+        super::capture_reconstruction(&source, &mut target, footprint, (13, 5), &error);
+
+        for y in 0..11 {
+            for x in 0..12 {
+                let expected = if (5..7).contains(&y) && x >= 10 {
+                    source.row(8 + y - 5)[8 + x - 10] + error[(y - 5) * 8 + x - 10]
+                } else {
+                    -0.0
+                };
+                assert_eq!(target.row(y)[x].to_bits(), expected.to_bits());
+            }
+        }
+    }
+
     /// The quotient tables must reproduce the division bit for bit.
     #[test]
     fn dequant_bias_tables_match_the_division() {
@@ -2615,6 +2660,26 @@ mod tests {
         assert_eq!(&restored[9..18], &before[9..18]);
         assert_eq!(&restored[18..27], &changed[18..27]);
 
+        let mut primary = AcBlockCache::new(2, 2, 16, 16);
+        primary.tokens.clone_from(&memo.tokens);
+        primary.spans.clone_from(&memo.spans);
+        primary.keep_primary_tokens();
+        primary.compact_tokens();
+        assert_eq!(primary.tokens.len(), 1);
+        assert_eq!(primary.spans.len(), 12);
+        for ((start, len), expected) in primary
+            .spans
+            .iter()
+            .copied()
+            .zip(restored.iter().step_by(3))
+        {
+            let actual: Vec<_> = primary.tokens[0][start as usize..(start + len) as usize]
+                .iter()
+                .map(|t| (t.context, t.value))
+                .collect();
+            assert_eq!(&actual, expected);
+        }
+
         // An entirely dead stream releases its old arena too.
         memo.spans.fill((0, 0));
         for arena in &mut memo.tokens {
@@ -2685,7 +2750,7 @@ mod tests {
                 None,
                 false,
                 8,
-                capture.then_some((&mut recon, 0, &mut starts)),
+                capture.then_some((&mut recon, 0, Some(&mut starts))),
                 None,
                 &mut tokens,
             );
@@ -2711,10 +2776,12 @@ mod tests {
         let pointers = |scratch: &AcGroupScratch| {
             (
                 scratch.source_y.as_ref().map(|v| v.as_ptr()),
-                scratch
-                    .rdoq
-                    .as_ref()
-                    .map(|v| (v.choices.as_ptr(), v.costs[0].as_ptr())),
+                scratch.rdoq.as_ref().map(|v| {
+                    (
+                        v.choices.as_ptr(),
+                        v.costs.as_ref().map(|costs| costs[0].as_ptr()),
+                    )
+                }),
                 scratch
                     .recon
                     .as_ref()
@@ -2738,6 +2805,10 @@ mod tests {
             for shifts in [&[0u32][..], &[2, 0]] {
                 run(&ctx, &mut scratch, false, false, shifts);
                 assert_eq!(pointers(&scratch), (None, None, None));
+                assert_eq!(
+                    scratch.block.as_deref().map(<[i32]>::len),
+                    (shifts.len() > 1).then_some(64)
+                );
             }
         }
         let ctx = EncodingContext::new(
@@ -2751,7 +2822,7 @@ mod tests {
             let mut scratch = AcGroupScratch::default();
             for shifts in [&[0u32][..], &[2, 0]] {
                 let expected = run(&ctx, &mut scratch, rdoq, capture, shifts);
-                assert!(scratch.source_y.is_some());
+                assert_eq!(scratch.source_y.as_deref().map(<[f32]>::len), Some(64));
                 assert_eq!(scratch.rdoq.is_some(), rdoq);
                 assert_eq!(scratch.recon.is_some(), capture);
                 let storage = pointers(&scratch);
@@ -2849,7 +2920,7 @@ mod tests {
                 None,
                 false,
                 8,
-                Some((&mut recon, 0, &mut starts)),
+                Some((&mut recon, 0, Some(&mut starts))),
                 memo.as_deref_mut(),
                 &mut tokens,
             );

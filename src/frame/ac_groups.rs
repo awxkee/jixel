@@ -54,8 +54,8 @@ pub(super) fn paste_group(target: &mut Image3F, dim: &ImageDim, group_idx: usize
 }
 
 /// `process_ac_group` output: tokens, the group's quantized DC, the unrounded
-/// source DC and order statistics when collected, and the luma reconstruction
-/// capture (plane + per-block token starts) when requested.
+/// source DC and order statistics when collected, and the reconstruction
+/// capture with per-block token starts in loop mode.
 type ProcessedAcGroup = (
     PendingAcGroup,
     Image3S,
@@ -78,6 +78,14 @@ pub(super) type RefinedAcGroup = (usize, usize, usize, PendingAcGroup, Image3S);
 pub(super) struct PendingAcGroup {
     pub(super) group_idx: usize,
     pub(super) tokens: Vec<AcTokens>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum AcGroupCapture {
+    None,
+    Pixels,
+    #[cfg(feature = "extraslow")]
+    Loop,
 }
 
 /// Median raw quant-field value across the image (blocks weighted equally).
@@ -124,7 +132,7 @@ pub(super) fn process_ac_group(
     alternative_orders: &[crate::coeff_order::CoeffOrders],
     collect_order_stats: bool,
     qf_threshold: u32,
-    capture_recon: bool,
+    capture: AcGroupCapture,
     block_memo: Option<&mut Option<crate::group::AcBlockCache>>,
 ) -> ProcessedAcGroup {
     scratch.finish_strategy_search();
@@ -140,8 +148,13 @@ pub(super) fn process_ac_group(
     let qorigin_x = gx * K_GROUP_DIM_IN_BLOCKS;
     let qorigin_y = gy * K_GROUP_DIM_IN_BLOCKS;
 
+    let capture_recon = !matches!(capture, AcGroupCapture::None);
+    #[cfg(feature = "extraslow")]
+    let capture_loop = matches!(capture, AcGroupCapture::Loop);
+    #[cfg(not(feature = "extraslow"))]
+    let capture_loop = false;
     let mut local_quant_dc = Image3S::new(gwb, ghb);
-    let mut source_dc = (collect_order_stats || capture_recon).then(|| crate::group::SourceDc {
+    let mut source_dc = (collect_order_stats || capture_loop).then(|| crate::group::SourceDc {
         y: crate::image::Plane::new(gwb, ghb),
         b: crate::image::Plane::new(gwb, ghb),
         x: crate::image::Plane::new(gwb, ghb),
@@ -215,7 +228,7 @@ pub(super) fn process_ac_group(
             qf_threshold,
             recon
                 .as_mut()
-                .map(|(plane, starts)| (plane, ty * K_TILE_DIM, starts)),
+                .map(|(plane, starts)| (plane, ty * K_TILE_DIM, capture_loop.then_some(starts))),
             memo.as_deref_mut(),
             &mut tokens,
         );

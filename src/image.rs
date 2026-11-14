@@ -69,7 +69,7 @@ impl<T: Copy + Default> Plane<T> {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "extraslow"))]
     fn resize(&mut self, xsize: usize, ysize: usize) {
         self.data.resize(xsize * ysize, T::default());
         self.xsize = xsize;
@@ -172,7 +172,7 @@ impl<T: Copy + Default> Image3<T> {
     }
 
     /// Reuse pixel storage for a new image that the caller will overwrite.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "extraslow"))]
     pub(crate) fn resize(&mut self, xsize: usize, ysize: usize) {
         for plane in &mut self.planes {
             plane.resize(xsize, ysize);
