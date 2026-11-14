@@ -579,6 +579,125 @@ impl DcTreeChoice {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ModularTreeNode {
+    /// PROPERTY and SPLITVAL token values; `prop > val` routes to `gt`.
+    Split {
+        prop: u32,
+        val: u32,
+        gt: usize,
+        le: usize,
+    },
+    /// PREDICTOR, OFFSET, MULTIPLIER_LOG and MULTIPLIER_BITS token values.
+    Leaf([u32; 4]),
+}
+
+/// Decode a BFS tree token stream into nodes (children in BFS order).
+pub(super) fn parse_tree(tokens: &[Token]) -> Vec<ModularTreeNode> {
+    let mut nodes = Vec::new();
+    let mut declared = 1usize;
+    let mut i = 0usize;
+    while nodes.len() < declared {
+        let prop = tokens[i].value;
+        if prop == 0 {
+            let leaf = std::array::from_fn(|k| tokens[i + 1 + k].value);
+            nodes.push(ModularTreeNode::Leaf(leaf));
+            i += 5;
+        } else {
+            nodes.push(ModularTreeNode::Split {
+                prop,
+                val: tokens[i + 1].value,
+                gt: declared,
+                le: declared + 1,
+            });
+            declared += 2;
+            i += 2;
+        }
+    }
+    debug_assert_eq!(i, tokens.len());
+    nodes
+}
+
+pub(crate) struct CompactedTree {
+    pub(crate) tokens: Vec<Token>,
+    pub(crate) context_map: Vec<u8>,
+    pub(crate) leaf_remap: Vec<u32>,
+}
+
+/// Remove splits whose branches reduce to the same predictor, offset,
+/// multiplier and histogram. Remap the leaf IDs in bitstream order.
+pub(super) fn compact_tree(tokens: &[Token], context_map: &[u8]) -> Option<CompactedTree> {
+    use ModularTreeNode::{Leaf, Split};
+
+    let nodes = parse_tree(tokens);
+    let mut leaves: Vec<Option<([u32; 4], u8)>> = vec![None; nodes.len()];
+    let mut context = 0;
+    for (i, node) in nodes.iter().enumerate() {
+        if let Leaf(value) = *node {
+            leaves[i] = Some((value, context_map[context]));
+            context += 1;
+        }
+    }
+    debug_assert_eq!(context, context_map.len());
+
+    let mut collapsed = false;
+    for i in (0..nodes.len()).rev() {
+        if let Split { gt, le, .. } = nodes[i]
+            && leaves[gt].is_some()
+            && leaves[le] == leaves[gt]
+        {
+            leaves[i] = leaves[gt];
+            collapsed = true;
+        }
+    }
+    // A one-leaf tree's pixel code uses an implicit context map.
+    if !collapsed || leaves[0].is_some() {
+        return None;
+    }
+
+    let mut queue = std::collections::VecDeque::from([0]);
+    let mut remapped_nodes = vec![0u32; nodes.len()];
+    let mut new_tokens = Vec::with_capacity(tokens.len());
+    let mut new_map = Vec::with_capacity(context_map.len());
+    while let Some(i) = queue.pop_front() {
+        if let Some((value, cluster)) = leaves[i] {
+            remapped_nodes[i] = new_map.len() as u32;
+            new_map.push(cluster);
+            new_tokens.push(Token::new(1, 0));
+            new_tokens.extend(
+                value
+                    .into_iter()
+                    .enumerate()
+                    .map(|(k, v)| Token::new(2 + k as u32, v)),
+            );
+        } else if let Split { prop, val, gt, le } = nodes[i] {
+            new_tokens.push(Token::new(1, prop));
+            new_tokens.push(Token::new(0, val));
+            queue.extend([gt, le]);
+        }
+    }
+    // A removed subtree's original leaves inherit its replacement leaf ID.
+    // Each node's parent precedes it in the original BFS numbering.
+    for i in 0..nodes.len() {
+        if let Split { gt, le, .. } = nodes[i]
+            && leaves[i].is_some()
+        {
+            remapped_nodes[gt] = remapped_nodes[i];
+            remapped_nodes[le] = remapped_nodes[i];
+        }
+    }
+    let leaf_remap = nodes
+        .into_iter()
+        .zip(remapped_nodes)
+        .filter_map(|(node, id)| matches!(node, Leaf(_)).then_some(id))
+        .collect();
+    Some(CompactedTree {
+        tokens: new_tokens,
+        context_map: new_map,
+        leaf_remap,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

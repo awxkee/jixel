@@ -2305,8 +2305,6 @@ fn encode_frame_core_inner(
                 )
             },
         );
-    let dc_code = dc_code_owned.as_ref();
-
     // Write DC global with adaptive DC code.
     if let VarDctFrameKind::Patched(references, _, dictionary) = frame_kind {
         if let Some(dictionary) = dictionary.filter(|_| alpha.is_none()) {
@@ -2329,16 +2327,25 @@ fn encode_frame_core_inner(
     }
     write_dc_global(
         &distp,
-        dim.num_dc_groups,
         &ac_plan,
-        &dc_tree,
-        &dc_code,
         ytox_dc,
         ytob_dc,
         ctx.cfl_frame(),
         scratch,
         &mut sections[0],
     );
+
+    super::dc_entropy::write_dc_tree_and_code(
+        &dc_tree,
+        &mut dc_code_owned,
+        dc_tokens_per_group
+            .iter_mut()
+            .chain(&mut meta_tokens_per_group),
+        dim.num_dc_groups,
+        scratch,
+        &mut sections[0],
+    );
+    let dc_code = dc_code_owned.as_ref();
 
     // Each DC group is an independent entropy stream. Encode the
     // streams in parallel, then place their writers back in raster order.

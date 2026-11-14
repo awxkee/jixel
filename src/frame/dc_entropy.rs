@@ -747,6 +747,54 @@ pub(crate) fn prepare_dc_entropy(
     }
 }
 
+/// Serialize the final global tree and its pixel code. Compare the actual
+/// headers because collapsing a split can reorder the tree and map tokens.
+pub(crate) fn write_dc_tree_and_code<'a>(
+    tree: &DcTreeChoice,
+    code: &mut OwnedEntropyCode,
+    streams: impl Iterator<Item = &'a mut Vec<Token>>,
+    num_dc_groups: usize,
+    scratch: &mut CoderScratch,
+    writer: &mut BitWriter,
+) {
+    let tokens = tree.tokens(num_dc_groups);
+    let candidate = if code.orig_context_map.is_none() {
+        super::dc_tokens::compact_tree(&tokens, &code.context_map)
+    } else {
+        None
+    };
+    let mut write_header = |tokens: &[Token], code: &EntropyCode, w: &mut BitWriter| {
+        write_tree_tokens(tokens, &mut scratch.huffman_pool, w);
+        w.write(1, 0); // no LZ77 for the pixel histograms
+        write_entropy_code(code, &mut scratch.huffman_pool, w);
+    };
+    let Some(candidate) = candidate else {
+        write_header(&tokens, &code.as_ref(), writer);
+        return;
+    };
+    let mut original_header = BitWriter::new();
+    let mut compacted_header = BitWriter::new();
+    let original_code = code.as_ref();
+    write_header(&tokens, &original_code, &mut original_header);
+    let mut compacted_code = original_code;
+    compacted_code.context_map = &candidate.context_map;
+    compacted_code.num_contexts = candidate.context_map.len();
+    write_header(&candidate.tokens, &compacted_code, &mut compacted_header);
+    if compacted_header.bits_written() >= original_header.bits_written() {
+        writer.append_bits(&original_header);
+        return;
+    }
+
+    // Each old leaf keeps its operation and entropy cluster. Previously
+    // serialized joint extra-channel streams therefore still use the same bits.
+    for token in streams.flatten() {
+        token.context = candidate.leaf_remap[token.context as usize];
+    }
+    code.orig_num_contexts = candidate.context_map.len();
+    code.context_map = candidate.context_map;
+    writer.append_bits(&compacted_header);
+}
+
 /// DC-side sample budget of the MA-learned DC arm; larger DC images are
 /// sampled with an odd stride.
 const MA_DC_TARGET_SAMPLES: usize = 1 << 19;

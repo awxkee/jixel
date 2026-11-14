@@ -29,7 +29,6 @@
 
 //! VarDCT frame headers, global sections and quantization matrices.
 
-use super::dc_tokens::{DcTreeChoice, write_context_tree, write_tree_tokens};
 use super::quantization::DistanceParams;
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
@@ -435,10 +434,7 @@ pub(super) fn write_block_ctx_map(
 
 pub(super) fn write_dc_global(
     distp: &DistanceParams,
-    num_dc_groups: usize,
     ac_plan: &crate::ac_context::AcCtxPlan,
-    dc_tree: &DcTreeChoice,
-    dc_code: &EntropyCode,
     ytox_dc: i32,
     ytob_dc: i32,
     cfl: crate::color_correlation::CflFrame,
@@ -479,26 +475,6 @@ pub(super) fn write_dc_global(
             w.write(8, (ytob_dc + 128) as u64); // ytob_dc, offset by 128
         }
     }
-
-    // Global tree.
-    // write_context_tree emits "have_tree=1 + Histograms::decode (tree's own entropy code)
-    // + tree tokens". The TREE'S PIXEL HISTOGRAMS are then written as the next two
-    // bits + entropy code (DC entropy code, since it's the global tree used for DC).
-    match dc_tree {
-        DcTreeChoice::Static(grad) => {
-            write_context_tree(num_dc_groups, grad, &mut scratch.huffman_pool, w);
-        }
-        DcTreeChoice::Learned(tokens) => {
-            write_tree_tokens(tokens, &mut scratch.huffman_pool, w);
-        }
-    }
-    w.write(1, 0); // no lz77 (for the global tree's pixel histograms = dc_code)
-
-    // Then the static DC entropy code: this is the global tree's pixel histograms.
-    write_entropy_code(dc_code, &mut scratch.huffman_pool, w);
-
-    // The extra channel's FullModularImage follows this header. The caller
-    // appends it after choosing its representation using final section sizes.
 }
 
 /// Slots whose transform actually appears in the frame: the nine
