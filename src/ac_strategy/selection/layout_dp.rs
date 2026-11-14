@@ -735,7 +735,7 @@ fn lower_bound(profile: [u8; SIDE], width: usize, height: usize, s: &PlannerScra
     let mut levels = guard;
     let mask = guard >> ((SIDE - width) * 8);
     let mut rows = 0.0;
-    for row in s.rows.chunks_exact(LINE_INTERVALS).take(height) {
+    for row in s.rows.as_chunks::<LINE_INTERVALS>().0.iter().take(height) {
         let open = levels.wrapping_sub(lanes) & mask;
         // Gather each lane's flag into its column bit in the low byte.
         let mut open = ((open >> 7).wrapping_mul(0x0102_0408_1020_4080) >> 56) as usize;

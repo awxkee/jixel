@@ -38,6 +38,7 @@
 //! dots become lattice templates in a modular reference frame, placed with
 //! kAdd patch entries.
 
+use super::dot_morphology::{ColumnExtremaFn, R as OPEN_RADIUS};
 use super::fit::Candidate;
 use super::{
     BlobWeightRow, CHANNEL_WEIGHT, LN_RENDER_CUTOFF, Point, QUANT_ADJUST, QuantizedSpline,
@@ -51,7 +52,6 @@ use crate::thread_pool::ThreadPool;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-const OPEN_RADIUS: usize = 3;
 const RING: isize = 4;
 const FIT_AREA: usize = ((2 * RING + 1) * (2 * RING + 1)) as usize;
 const BORDER: usize = 5;
@@ -71,36 +71,10 @@ pub(crate) type TemplateKey = (i32, i32, i32, i32);
 
 const BAND: usize = 64;
 
-/// Running min (`max == false`) or max over `2 * OPEN_RADIUS + 1` samples of
-/// `src`, clipped at the row ends: two-sample windows, then four-sample
-/// windows, then the overlapping pair of four-sample windows.
-fn row_extrema(src: &[f32], out: &mut [f32], pad: &mut Vec<f32>, max: bool) {
-    const R: usize = OPEN_RADIUS;
-    let fill = if max {
-        f32::NEG_INFINITY
-    } else {
-        f32::INFINITY
-    };
-    let pick = |a: f32, b: f32| if max { a.max(b) } else { a.min(b) };
-    let w = src.len();
-    pad.clear();
-    pad.resize(R, fill);
-    pad.extend_from_slice(src);
-    pad.resize(w + 2 * R + 1, fill);
-    for j in 0..w + 2 * R {
-        pad[j] = pick(pad[j], pad[j + 1]);
-    }
-    for j in 0..w + R + 1 {
-        pad[j] = pick(pad[j], pad[j + 2]);
-    }
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = pick(pad[i], pad[i + R]);
-    }
-}
-
 /// Elementwise min or max of the clipped `2 * OPEN_RADIUS + 1` rows around
 /// each row of `out_rows`. `rows` holds image rows from `first` on.
 fn column_extrema(
+    kernel: ColumnExtremaFn,
     rows: &[f32],
     first: usize,
     h: usize,
@@ -109,25 +83,14 @@ fn column_extrema(
     out: &mut Vec<f32>,
     max: bool,
 ) {
-    out.clear();
-    for k in out_rows {
-        let lo = k.saturating_sub(OPEN_RADIUS);
-        let hi = (k + OPEN_RADIUS).min(h - 1);
-        let start = out.len();
-        out.extend_from_slice(&rows[(lo - first) * w..][..w]);
-        let dst = &mut out[start..];
-        for r in lo + 1..=hi {
-            let src = &rows[(r - first) * w..][..w];
-            if max {
-                for (d, &s) in dst.iter_mut().zip(src) {
-                    *d = d.max(s);
-                }
-            } else {
-                for (d, &s) in dst.iter_mut().zip(src) {
-                    *d = d.min(s);
-                }
-            }
-        }
+    out.resize(out_rows.len() * w, 0.0);
+    if w == 0 {
+        return;
+    }
+    for (k, dst) in out_rows.zip(out.chunks_exact_mut(w)) {
+        let lo = k.saturating_sub(OPEN_RADIUS) - first;
+        let hi = (k + OPEN_RADIUS + 1).min(h) - first;
+        kernel(&rows[lo * w..hi * w], dst, max);
     }
 }
 
@@ -137,6 +100,7 @@ fn column_extrema(
 /// its own top-hat rows, and closing(Y) = -opening(-Y) lets both polarities
 /// share the opening, so no image-sized buffer is formed.
 fn top_hat_peaks(
+    kernels: &SplinesContext,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     xyb: &Image3F,
@@ -151,7 +115,6 @@ fn top_hat_peaks(
         let (t0, t1) = (ya - 1, yb + 1);
         let (e0, e1) = (t0.saturating_sub(r), (t1 + r).min(h));
         let (i0, i1) = (t0.saturating_sub(2 * r), (t1 + 2 * r).min(h));
-        let mut pad = Vec::with_capacity(w + 2 * r + 1);
         let mut line = vec![0f32; w];
         let mut eroded_rows = Vec::with_capacity((i1 - i0) * w);
         let mut eroded = Vec::with_capacity((e1 - e0) * w);
@@ -166,15 +129,33 @@ fn top_hat_peaks(
                 }
                 let start = eroded_rows.len();
                 eroded_rows.resize(start + w, 0.0);
-                row_extrema(&line, &mut eroded_rows[start..], &mut pad, false);
+                (kernels.dot_row_extrema)(&line, &mut eroded_rows[start..], false);
             }
-            column_extrema(&eroded_rows, i0, h, w, e0..e1, &mut eroded, false);
+            column_extrema(
+                kernels.dot_column_extrema,
+                &eroded_rows,
+                i0,
+                h,
+                w,
+                e0..e1,
+                &mut eroded,
+                false,
+            );
             dilated_rows.clear();
             dilated_rows.resize((e1 - e0) * w, 0.0);
             for (src, dst) in eroded.chunks_exact(w).zip(dilated_rows.chunks_exact_mut(w)) {
-                row_extrema(src, dst, &mut pad, true);
+                (kernels.dot_row_extrema)(src, dst, true);
             }
-            column_extrema(&dilated_rows, e0, h, w, t0..t1, th, true);
+            column_extrema(
+                kernels.dot_column_extrema,
+                &dilated_rows,
+                e0,
+                h,
+                w,
+                t0..t1,
+                th,
+                true,
+            );
             for (y, row) in (t0..t1).zip(th.chunks_exact_mut(w)) {
                 for (o, &v) in row.iter_mut().zip(xyb.plane_row(1, y)) {
                     *o = (sign * v - *o).max(0.0);
@@ -402,7 +383,7 @@ pub(super) fn dot_candidates(
     if w <= 2 * BORDER || h <= 2 * BORDER {
         return Vec::new();
     }
-    let peaks = top_hat_peaks(pool, scratch, xyb);
+    let peaks = top_hat_peaks(kernels, pool, scratch, xyb);
     // Fit in raster order, which keeps each chunk's ring reads local, then
     // put candidates strongest contrast first, ties in raster order.
     let mut fitted: Vec<(usize, Candidate, Vec<f32>)> = pool
@@ -937,6 +918,7 @@ pub(super) fn build_dot_patches_with_templates<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::splines::dot_morphology::{column_scalar, row_scalar};
 
     #[test]
     fn dark_spots_fit_on_sloped_backgrounds_but_reject_texture() {
@@ -1050,22 +1032,100 @@ mod tests {
         }
     }
 
+    const SIGNALING_NAN: f32 = f32::from_bits(0x7f80_0001);
+
+    fn extrema_sample(i: usize) -> f32 {
+        match i % 19 {
+            0 | 4 => SIGNALING_NAN,
+            1 | 7 => f32::NAN,
+            2 => f32::INFINITY,
+            3 => f32::NEG_INFINITY,
+            5 => -0.0,
+            6 => 0.0,
+            _ => (i * 73 % 97) as f32 - 48.0,
+        }
+    }
+
     #[test]
-    fn row_extrema_match_scalar_windows_at_borders() {
-        for w in [1, 2, 3, 7, 9, 67] {
-            let src: Vec<f32> = (0..w).map(|i| (i * 73 % 97) as f32).collect();
-            let mut out = vec![0f32; w];
-            let mut pad = Vec::new();
+    fn row_extrema_match_scalar_windows_at_borders_and_tails() {
+        let selected = SplinesContext::get().dot_row_extrema;
+        for w in (0..=40).chain([63, 64, 65, 95, 96, 97]) {
+            let finite: Vec<_> = (0..w).map(|i| (i * 73 % 97) as f32 - 48.0).collect();
+            let mixed: Vec<_> = (0..w).map(extrema_sample).collect();
+            let nan: Vec<_> = (0..w)
+                .map(|i| if i % 2 == 0 { SIGNALING_NAN } else { f32::NAN })
+                .collect();
             for max in [false, true] {
-                row_extrema(&src, &mut out, &mut pad, max);
-                for (x, &o) in out.iter().enumerate() {
-                    let window = &src[x.saturating_sub(OPEN_RADIUS)..=(x + OPEN_RADIUS).min(w - 1)];
-                    let expected = window
-                        .iter()
-                        .copied()
-                        .reduce(|a, b| if max { a.max(b) } else { a.min(b) })
-                        .unwrap();
-                    assert_eq!(o, expected, "w={w} x={x} max={max}");
+                let pick = if max { f32::max } else { f32::min };
+                let fill = if max {
+                    f32::NEG_INFINITY
+                } else {
+                    f32::INFINITY
+                };
+                for (case, src) in [finite.as_slice(), &mixed, &nan].into_iter().enumerate() {
+                    for (kernel, f) in [row_scalar, selected].into_iter().enumerate() {
+                        let mut out = vec![f32::NAN; w];
+                        f(src, &mut out, max);
+                        for (x, &actual) in out.iter().enumerate() {
+                            let from = x.saturating_sub(OPEN_RADIUS);
+                            let to = (x + OPEN_RADIUS + 1).min(w);
+                            let expected = src[from..to].iter().copied().reduce(pick).unwrap();
+                            let expected = if x < OPEN_RADIUS || x + OPEN_RADIUS >= w {
+                                pick(fill, expected)
+                            } else {
+                                expected
+                            };
+                            assert!(
+                                actual == expected || (actual.is_nan() && expected.is_nan()),
+                                "w={w} x={x} max={max} case={case} kernel={kernel}: {actual} != {expected}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn column_extrema_match_scalar_windows_in_clipped_bands() {
+        let selected = SplinesContext::get().dot_column_extrema;
+        for w in (1..=33).chain([63, 64, 65, 127, 128, 129]) {
+            for h in [1, 2, 3, 6, 7, 8, 9, 17] {
+                let rows: Vec<_> = (0..w * h)
+                    .map(|i| {
+                        let (y, x) = (i / w, i % w);
+                        match x % 17 {
+                            0 => SIGNALING_NAN,
+                            1 => (x * 73 + y * 37) as f32,
+                            _ => extrema_sample(x + y * 73),
+                        }
+                    })
+                    .collect();
+                let bands = [0..h, h.saturating_sub(2)..h, h / 2..(h / 2 + 1)];
+                for band in bands {
+                    let first = band.start.saturating_sub(OPEN_RADIUS);
+                    let last = (band.end + OPEN_RADIUS).min(h);
+                    let src = &rows[first * w..last * w];
+                    for max in [false, true] {
+                        let pick = if max { f32::max } else { f32::min };
+                        for (kernel, f) in [column_scalar, selected].into_iter().enumerate() {
+                            let mut out = vec![f32::NAN; (h + 1) * w];
+                            column_extrema(f, src, first, h, w, band.clone(), &mut out, max);
+                            assert_eq!(out.len(), band.len() * w);
+                            for (i, &actual) in out.iter().enumerate() {
+                                let (y, x) = (band.start + i / w, i % w);
+                                let expected = (y.saturating_sub(OPEN_RADIUS)
+                                    ..(y + OPEN_RADIUS + 1).min(h))
+                                    .map(|r| rows[r * w + x])
+                                    .reduce(pick)
+                                    .unwrap();
+                                assert!(
+                                    actual == expected || (actual.is_nan() && expected.is_nan()),
+                                    "w={w} h={h} x={x} y={y} max={max} band={band:?} kernel={kernel}: {actual} != {expected}"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1146,6 +1206,7 @@ mod tests {
             assert!(expected.iter().any(|p| p.0 > 0.0) && expected.iter().any(|p| p.0 < 0.0));
             for threads in [1, 3] {
                 let peaks = top_hat_peaks(
+                    SplinesContext::get(),
                     &ThreadPool::new(threads),
                     &mut CoderScratch::default(),
                     &image,

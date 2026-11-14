@@ -37,6 +37,7 @@
 //! the DCT quantizer or the smoothing filters.
 
 mod detect;
+mod dot_morphology;
 pub(crate) mod dots;
 mod edge_detect;
 mod edge_fit;
@@ -101,6 +102,8 @@ pub(crate) struct SplinesContext {
     render_tile: render::RenderTileFn,
     continuous_idct: transform::ContinuousIdctFn,
     dot_contrast: dots::DotContrastFn,
+    dot_row_extrema: dot_morphology::RowExtremaFn,
+    dot_column_extrema: dot_morphology::ColumnExtremaFn,
     /// Fitting and dot templates use a fused erf polynomial on SIMD targets.
     blob_weight_row: fn(BlobWeightRow, i32, &mut [f32]),
     add_scaled_fma_f32: AddScaledFn,
@@ -129,6 +132,8 @@ impl SplinesContext {
             render_tile: render::Sample::scalar_tile,
             continuous_idct: transform::continuous_idct_scalar,
             dot_contrast: dots::dot_contrast_scalar,
+            dot_row_extrema: dot_morphology::row_scalar,
+            dot_column_extrema: dot_morphology::column_scalar,
             blob_weight_row: BlobWeightRow::fill_scalar,
             add_scaled_fma_f32: selected_add_scaled_fn(),
             filter_vertical_row: filter::vertical_row_scalar,
@@ -159,6 +164,12 @@ impl SplinesContext {
             continuous_idct: |dct, t| unsafe { neon::continuous_idct_neon(dct, t) },
             dot_contrast: |src, stride, dst, side, bg, slope| unsafe {
                 neon::dot_contrast_neon(src, stride, dst, side, bg, slope)
+            },
+            #[cfg(feature = "neon")]
+            dot_row_extrema: |src, dst, max| unsafe { dot_morphology::neon::row(src, dst, max) },
+            #[cfg(feature = "neon")]
+            dot_column_extrema: |src, dst, max| unsafe {
+                dot_morphology::neon::column(src, dst, max)
             },
             blob_weight_row: |row, x, out| unsafe { neon::blob_weight_row_neon(row, x, out) },
             add_scaled_fma_f32: |dst, src, scale| unsafe {
@@ -199,6 +210,10 @@ impl SplinesContext {
                 render_tile: |sample, tx, ty, bounds, pixels, sign| unsafe {
                     crate::sse::spline_render_tile_sse2(sample, tx, ty, bounds, pixels, sign)
                 },
+                dot_row_extrema: |src, dst, max| unsafe { dot_morphology::sse::row(src, dst, max) },
+                dot_column_extrema: |src, dst, max| unsafe {
+                    dot_morphology::sse::column(src, dst, max)
+                },
                 ..kernels
             }
         } else {
@@ -222,6 +237,10 @@ impl SplinesContext {
                 },
                 dot_contrast: |src, stride, dst, side, bg, slope| unsafe {
                     crate::avx::dot_contrast_avx2(src, stride, dst, side, bg, slope)
+                },
+                dot_row_extrema: |src, dst, max| unsafe { dot_morphology::avx::row(src, dst, max) },
+                dot_column_extrema: |src, dst, max| unsafe {
+                    dot_morphology::avx::column(src, dst, max)
                 },
                 ..kernels
             }
@@ -274,6 +293,8 @@ impl SplinesContext {
         let kernels = Self {
             continuous_idct: crate::wasm::continuous_idct_wasm,
             render_tile: crate::wasm::spline_render_tile_wasm,
+            dot_row_extrema: dot_morphology::wasm::row,
+            dot_column_extrema: dot_morphology::wasm::column,
             ..kernels
         };
         kernels

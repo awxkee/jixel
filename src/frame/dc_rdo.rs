@@ -442,10 +442,11 @@ fn trace_row(
         .min_by(|(_, a), (_, b)| a.cost.total_cmp(&b.cost))
         .unwrap()
         .0;
-    for x in (0..w).rev() {
-        let step = history[starts[x] + best];
-        levels[x] = step.level;
-        path[x] = starts[x] + best;
+    for ((level, path_index), &start) in levels[..w].iter_mut().zip(path).zip(starts).rev() {
+        let index = start + best;
+        let step = &history[index];
+        *level = step.level;
+        *path_index = index;
         best = usize::from(step.back);
     }
 }
