@@ -2184,55 +2184,70 @@ pub(super) fn run_quant_field_loop(
             out.cv_lambda = cv_lambda;
         }
         drop(e);
-        // Each fixed chunk builds both metric states from the same frame
-        // baseline so scheduling cannot affect decisions. The chunk count
-        // is bounded by the states' memory.
-        const POLISH_STATE_BYTES_PER_PIXEL: usize = 256;
-        const POLISH_MEMORY_BUDGET: usize = 1 << 30;
-        const POLISH_MAX_CHUNKS: usize = 8;
-        let chunks = (POLISH_MEMORY_BUDGET / (POLISH_STATE_BYTES_PER_PIXEL * w * h).max(1))
-            .clamp(1, POLISH_MAX_CHUNKS)
-            .min(all_tasks.len())
-            .max(1);
-        let per_chunk = all_tasks.len().div_ceil(chunks).max(1);
+        // Every AC group is polished on its own crop of the frame, from the
+        // same baseline: the judges' cost and memory do not grow with the
+        // frame, every worker has groups to take, and scheduling cannot
+        // affect decisions.
+        const POLISH_MARGIN: usize = 64;
         crate::coef_polish::POLISH_EPOCH.fetch_add(1, Ordering::Relaxed);
         let area_budget = crate::ac_strategy::content_selection_enabled(ctx, distp.distance);
-        let recon = Arc::new(recon);
-        let build = || -> Box<crate::coef_polish::CoefPolisher> {
-            let state = reference.state(&recon);
-            let cv = cv_inputs.as_ref().and_then(|(reference, dc)| {
-                let mut judge =
-                    crate::cvvdp_arbiter::CvvdpArbiter::new_shared(opsin, Arc::clone(reference))?;
-                judge.reset(&recon, dc);
-                Some(crate::coef_polish::CvJudge::new(
-                    judge,
-                    Arc::clone(dc),
-                    cv_lambda,
-                ))
-            });
+        let build = |gx: usize, gy: usize| -> Option<Box<crate::coef_polish::CoefPolisher>> {
+            let margin = POLISH_MARGIN;
+            let x0 = (gx * K_GROUP_DIM).saturating_sub(margin);
+            let y0 = (gy * K_GROUP_DIM).saturating_sub(margin);
+            let x1 = ((gx + 1) * K_GROUP_DIM + margin).min(w);
+            let y1 = ((gy + 1) * K_GROUP_DIM + margin).min(h);
+            let source = super::dc_polish::crop(opsin, x0, y0, x1, y1);
+            let baseline = Arc::new(super::dc_polish::crop(&recon, x0, y0, x1, y1));
+            let state = crate::ssimulacra2::Ssimulacra2Reference::new(&source)?.state(&baseline);
+            // Both deficits are means over the judged pixels: a change
+            // weighs more in the crop than in the frame the exchange rates
+            // were measured on.
+            let share = (w * h) as f32 / ((x1 - x0) * (y1 - y0)) as f32;
+            let cv = match &cv_inputs {
+                Some((_, dc)) => {
+                    let dc = Arc::new(super::dc_polish::crop(
+                        dc,
+                        x0 / 8,
+                        y0 / 8,
+                        x1.div_ceil(8),
+                        y1.div_ceil(8),
+                    ));
+                    let mut judge = crate::cvvdp_arbiter::CvvdpArbiter::new(&source)?;
+                    judge.reset(&baseline, &dc);
+                    Some(crate::coef_polish::CvJudge::new(
+                        judge,
+                        dc,
+                        cv_lambda * share,
+                    ))
+                }
+                None => None,
+            };
             let mut polisher = crate::coef_polish::CoefPolisher::new(
-                Arc::clone(&recon),
+                baseline,
                 state,
-                lambda_bits,
+                lambda_bits * share,
                 cv,
                 ctx.add_scaled,
             );
+            polisher.set_origin((x0, y0));
             polisher.set_area_budget(area_budget);
-            Box::new(polisher)
+            Some(Box::new(polisher))
         };
         // Publish each finished capture immediately. Only the active workers
         // hold group images alongside the optional frame output.
         let output_recon = want_recon.then(|| Mutex::new(None));
-        let tasks: Vec<_> = all_tasks.chunks(per_chunk).collect();
         let work = ctx
             .thread_pool
-            .steal_map(scratch, tasks.len(), |ci, scratch| {
-                scratch.ac_group.polisher = Some(build());
-                let tasks = tasks[ci];
-                let mut polished = Vec::with_capacity(tasks.len());
-                for &t in tasks {
+            .steal_map(scratch, all_tasks.len(), |ti, scratch| {
+                let mut polished = Vec::with_capacity(1);
+                {
+                    let t = all_tasks[ti];
                     let (dc_idx, gx, gy) = ac_tasks[t];
                     let (dc_gx, dc_gy) = group_coords[dc_idx];
+                    let groups_per_dc = K_DC_GROUP_DIM / K_GROUP_DIM;
+                    scratch.ac_group.polisher =
+                        build(dc_gx * groups_per_dc + gx, dc_gy * groups_per_dc + gy);
                     let (p, local, _, _, capture) = process_ac_group(
                         ctx,
                         scratch,

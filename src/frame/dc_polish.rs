@@ -299,7 +299,7 @@ struct Frame<'a> {
 }
 
 /// The rows `y0..y1` and columns `x0..x1` of `image`.
-fn crop(image: &Image3F, x0: usize, y0: usize, x1: usize, y1: usize) -> Image3F {
+pub(super) fn crop(image: &Image3F, x0: usize, y0: usize, x1: usize, y1: usize) -> Image3F {
     let mut out = Image3F::new(x1 - x0, y1 - y0);
     for c in 0..3 {
         for y in y0..y1 {

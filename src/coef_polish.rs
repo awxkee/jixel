@@ -74,6 +74,8 @@ const EXTRA_TRIES: usize = 4;
 const MAX_POSITIONS: usize = 256;
 /// Distortion-ranked proposals priced per channel.
 const PRICE_CAP: usize = PER_CHANNEL * 6;
+/// SSIMULACRA2 objective below which a move improves the frame.
+const SS2_ACCEPT: f32 = -1e-6;
 
 /// Pass counter: a polisher left in a worker's scratch from an earlier pass
 /// is inert and gets rebuilt (see `CoefPolisher::is_current`).
@@ -104,6 +106,9 @@ impl CvJudge {
 }
 
 pub(crate) struct CoefPolisher {
+    /// Frame position of the baseline's first pixel: the judges may follow
+    /// a crop of the frame.
+    origin: (usize, usize),
     baseline: Arc<Image3F>,
     /// Mutable XYB trial pixels of the current block. Earlier commits remain
     /// in the metric states and in the output capture.
@@ -125,6 +130,14 @@ pub(crate) struct CoefPolisher {
     count_nonzero: CountNonzeroFn,
     add_scaled: AddScaledFn,
     area_budget: bool,
+    /// A judge's accepted update left in its state for the commit that
+    /// follows, with the block pixels it scored. The commit rebuilds the
+    /// pixels through one more subtraction and addition of the delta; where
+    /// that reproduces these bits the state already is the committed one.
+    kept_ss2: Option<Vec<f32>>,
+    kept_cv: Option<(f32, Vec<f32>)>,
+    /// Retired pixel snapshots.
+    spare: Vec<Vec<f32>>,
 }
 
 /// One channel of the block being polished.
@@ -574,6 +587,7 @@ impl CoefPolisher {
     ) -> Self {
         let base_d = state.deficit();
         Self {
+            origin: (0, 0),
             baseline,
             recon: Image3F::new(0, 0),
             state,
@@ -590,11 +604,18 @@ impl CoefPolisher {
             count_nonzero: select_count_nonzero_fn(),
             add_scaled,
             area_budget: false,
+            kept_ss2: None,
+            kept_cv: None,
+            spare: Vec::new(),
         }
     }
 
     /// Keep refinement work proportional to covered area when content-adaptive
     /// selection chooses a denser layout. Both exact judges remain active.
+    pub(crate) fn set_origin(&mut self, origin: (usize, usize)) {
+        self.origin = origin;
+    }
+
     pub(crate) fn set_area_budget(&mut self, enabled: bool) {
         self.area_budget = enabled;
     }
@@ -605,11 +626,12 @@ impl CoefPolisher {
     }
 
     fn rect(&self, b: &PolishBlock) -> Rect {
+        let (x0, y0) = (b.px0 - self.origin.0, b.py0 - self.origin.1);
         Rect::new(
-            b.px0,
-            b.py0,
-            (b.px0 + b.pw).min(self.baseline.xsize()),
-            (b.py0 + b.ph).min(self.baseline.ysize()),
+            x0,
+            y0,
+            (x0 + b.pw).min(self.baseline.xsize()),
+            (y0 + b.ph).min(self.baseline.ysize()),
         )
     }
 
@@ -677,13 +699,38 @@ impl CoefPolisher {
         );
     }
 
-    /// SSIMULACRA2 objective change of `m` alone.
+    /// The block pixels, plane after plane.
+    fn snapshot(&mut self) -> Vec<f32> {
+        let mut pixels = self.spare.pop().unwrap_or_default();
+        pixels.clear();
+        for c in 0..3 {
+            pixels.extend_from_slice(self.recon.plane(c).as_slice());
+        }
+        pixels
+    }
+
+    /// Whether the block pixels carry exactly the bits of `snapshot`.
+    fn matches(&self, snapshot: &[f32]) -> bool {
+        let n = self.recon.plane(0).as_slice().len();
+        (0..3).all(|c| {
+            self.recon
+                .plane(c)
+                .as_slice()
+                .iter()
+                .zip(&snapshot[c * n..(c + 1) * n])
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        })
+    }
+
+    /// SSIMULACRA2 objective change of `m` alone. With `keep`, an improving
+    /// update stays in the state until `commit` or `discard_ss2`.
     fn judge_ss2(
         &mut self,
         ctx: &EncodingContext,
         b: &PolishBlock,
         rect: Rect,
         m: &PolishMove,
+        keep: bool,
     ) -> f32 {
         self.plane_deltas(ctx, b, m);
         self.apply_plane_deltas(b, 1.0);
@@ -693,9 +740,22 @@ impl CoefPolisher {
         } = self;
         state.update_region_checkpointed(recon, (rect.x0, rect.y0), rect, cp);
         let j = state.deficit() - base_d + lambda * m.dbits;
-        state.rollback(cp);
+        if keep && j < SS2_ACCEPT {
+            let pixels = self.snapshot();
+            self.kept_ss2 = Some(pixels);
+        } else {
+            self.state.rollback(&self.cp);
+        }
         self.apply_plane_deltas(b, -1.0);
         j
+    }
+
+    /// Undo an update `judge_ss2_keeping` left behind.
+    fn discard_ss2(&mut self) {
+        if let Some(pixels) = self.kept_ss2.take() {
+            self.state.rollback(&self.cp);
+            self.spare.push(pixels);
+        }
     }
 
     /// ColorVideoVDP objective change of `m` alone (`None` without a judge).
@@ -719,8 +779,14 @@ impl CoefPolisher {
             rect,
             &mut cv.cp,
         );
-        cv.judge.rollback(&cv.cp);
         let j = d - cv.base + cv.lambda_bits * m.dbits;
+        // Every caller commits a move this judge does not refuse.
+        if j >= 0.0 {
+            cv.judge.rollback(&cv.cp);
+        } else {
+            let pixels = self.snapshot();
+            self.kept_cv = Some((d, pixels));
+        }
         self.apply_plane_deltas(b, -1.0);
         Some(j)
     }
@@ -742,11 +808,43 @@ impl CoefPolisher {
         }
     }
 
+    /// `accept_rect` for a commit: a judge's kept update stands where the
+    /// committed pixels are the ones it scored.
+    fn accept_judged(&mut self, rect: Rect) {
+        let origin = (rect.x0, rect.y0);
+        let kept = self.kept_ss2.take();
+        if !kept.as_ref().is_some_and(|pixels| self.matches(pixels)) {
+            if kept.is_some() {
+                self.state.rollback(&self.cp);
+            }
+            self.state.update_region(&self.recon, origin, rect);
+        }
+        self.spare.extend(kept);
+        self.base_d = self.state.deficit();
+        let kept = self.kept_cv.take();
+        let reuse = kept
+            .as_ref()
+            .is_some_and(|(_, pixels)| self.matches(pixels));
+        if let Some(cv) = &mut self.cv {
+            cv.base = match &kept {
+                Some((distortion, _)) if reuse => *distortion,
+                _ => {
+                    if kept.is_some() {
+                        cv.judge.rollback(&cv.cp);
+                    }
+                    cv.judge.update_region(&self.recon, origin, &cv.dc, rect)
+                }
+            };
+        }
+        self.spare.extend(kept.map(|(_, pixels)| pixels));
+    }
+
     /// A layout visits each transform once. Its pixels start at the shared
     /// frame baseline, unless earlier moves changed its quantizer contexts.
     fn start_block(&mut self, rect: Rect, capture: (&Image3F, usize, usize)) {
         let (plane, lx0, ly0) = capture;
         let (width, height) = (rect.x1 - rect.x0, rect.y1 - rect.y0);
+        debug_assert!(self.kept_ss2.is_none() && self.kept_cv.is_none());
         self.recon.resize(width, height);
         self.may_have_negative_zero = [true; 3];
         let mut changed = false;
@@ -901,13 +999,22 @@ impl CoefPolisher {
             // ---- Judge: SSIMULACRA2 ranks, ColorVideoVDP checks the best few ----
             let mut scored = [(0.0f32, 0usize); PER_CHANNEL * 3];
             let mut nscored = 0;
+            // The last judged move keeps its update: it is the committed
+            // one whenever it turns out to be the best.
+            let mut left: usize = npriced.iter().sum();
+            let mut kept_move = None;
             for c in [1usize, 0, 2] {
                 let start = c * PER_CHANNEL;
-                for (i, m) in singles[start..start + npriced[c]].iter().enumerate() {
-                    let j = self.judge_ss2(ctx, b, rect, m);
-                    if j < -1e-6 {
+                for i in 0..npriced[c] {
+                    let m = singles[start + i];
+                    left -= 1;
+                    let j = self.judge_ss2(ctx, b, rect, &m, left == 0);
+                    if j < SS2_ACCEPT {
                         scored[nscored] = (j, start + i);
                         nscored += 1;
+                        if left == 0 {
+                            kept_move = Some(start + i);
+                        }
                     }
                 }
             }
@@ -926,6 +1033,9 @@ impl CoefPolisher {
             }
 
             // ---- Accept ----
+            if best.map(|(_, i)| i) != kept_move {
+                self.discard_ss2();
+            }
             let Some((m, best_i)) = best else { break };
             // The final judge_cv call prepared this move, even without a judge.
             reprice[m.c] = true;
@@ -1005,12 +1115,13 @@ impl CoefPolisher {
                     }
                 }
                 tries += 1;
-                if self.judge_ss2(ctx, b, rect, &m) >= -1e-6 {
+                if self.judge_ss2(ctx, b, rect, &m, true) >= SS2_ACCEPT {
                     continue;
                 }
                 if let Some(j_cv) = self.judge_cv(ctx, b, rect, &m)
                     && j_cv >= 0.0
                 {
+                    self.discard_ss2();
                     continue;
                 }
                 touched[ntouched] = (m.c, m.idx);
@@ -1036,7 +1147,7 @@ impl CoefPolisher {
         base_bits: &mut [f32; 3],
     ) {
         self.apply_plane_deltas(b, 1.0);
-        self.accept_rect(rect);
+        self.accept_judged(rect);
         // Keep the capture plane consistent with the frame reconstruction.
         for c in 0..3 {
             for y in 0..self.recon.ysize() {
