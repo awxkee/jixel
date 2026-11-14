@@ -80,6 +80,7 @@ pub(super) fn run_quant_field_loop(
     qf_threshold: u32,
     prices: &crate::entropy::FrozenTokenPrices,
     want_recon: bool,
+    dc_polish: Option<&mut super::dc_polish::Handoff>,
     reselect: Option<Reselect<'_>>,
 ) -> Option<(Vec<RefinedAcGroup>, DistanceParams, Option<Image3F>)> {
     /// Marginals and slope come from plain quantization; the ratio of deficit
@@ -2178,6 +2179,10 @@ pub(super) fn run_quant_field_loop(
             .map(|(reference, means)| (reference, Arc::new(legacy_dc(&e, &distp_out, &means))));
         let cv_lambda = polish_cv_slope * 100.0 / bits0;
         let lambda_bits = race_slope * 100.0 / bits0;
+        if let Some(out) = dc_polish {
+            out.lambda_bits = lambda_bits;
+            out.cv_lambda = cv_lambda;
+        }
         drop(e);
         // Each fixed chunk builds both metric states from the same frame
         // baseline so scheduling cannot affect decisions. The chunk count
@@ -2205,8 +2210,13 @@ pub(super) fn run_quant_field_loop(
                     cv_lambda,
                 ))
             });
-            let mut polisher =
-                crate::coef_polish::CoefPolisher::new(Arc::clone(&recon), state, lambda_bits, cv);
+            let mut polisher = crate::coef_polish::CoefPolisher::new(
+                Arc::clone(&recon),
+                state,
+                lambda_bits,
+                cv,
+                ctx.add_scaled,
+            );
             polisher.set_area_budget(area_budget);
             Box::new(polisher)
         };

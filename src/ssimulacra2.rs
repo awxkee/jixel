@@ -132,6 +132,13 @@ impl Ssimulacra2State {
         (100.0 - self.state.score()) as f32
     }
 
+    #[cfg(feature = "extraslow")]
+    /// `deficit` without the narrowing: single DC moves change it by less
+    /// than an f32 step.
+    pub(crate) fn deficit64(&self) -> f64 {
+        100.0 - self.state.score()
+    }
+
     /// Refresh the linear RGB staging inside the clipped rectangle.
     fn write_linear(&mut self, recon: &Image3F, (ox, oy): (usize, usize), r: Rect) -> Option<Rect> {
         let (w, h) = (self.width, self.height);

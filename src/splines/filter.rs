@@ -155,7 +155,7 @@ impl FilterPlan {
         }
         let bands = (ctx.thread_pool.num_threads() * 4).min(h);
         let rows_per = h.div_ceil(bands);
-        let add_scaled = ctx.spline_kernels.add_scaled_f32;
+        let add_scaled = ctx.add_scaled;
         let mut parts: Vec<_> = dst.chunks_mut(rows_per * w).collect();
         ctx.thread_pool
             .steal_for_each_mut(scratch, &mut parts, |b, rows, _| {

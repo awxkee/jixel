@@ -140,7 +140,7 @@ pub(super) fn skip_dc_smoothing(
 }
 
 /// Value-domain DC step per channel.
-fn dc_value_steps(distp: &DistanceParams) -> [f32; 3] {
+pub(crate) fn dc_value_steps(distp: &DistanceParams) -> [f32; 3] {
     std::array::from_fn(|c| {
         distp.dc_step[c] / (crate::quant_weights::INV_DC_QUANT[c] * distp.scale_dc)
     })
@@ -148,7 +148,7 @@ fn dc_value_steps(distp: &DistanceParams) -> [f32; 3] {
 
 /// The decoder's dequantized DC (chroma-from-luma applied) of the whole
 /// frame, one value per 8x8 block, before adaptive smoothing.
-fn dequantized_dc(
+pub(crate) fn dequantized_dc(
     dim: &ImageDim,
     dc_datas: &[DcGroupData],
     group_coords: &[(usize, usize)],
@@ -227,6 +227,40 @@ pub(super) fn decoded_dc(
         }
     }
     Ok(out)
+}
+
+#[cfg(feature = "extraslow")]
+/// One cell of [`decoded_dc`] from the dequantized frame `recon`.
+pub(crate) fn decoded_cell(
+    recon: &Image3F,
+    x: usize,
+    y: usize,
+    steps: [f32; 3],
+    skip_smoothing: bool,
+) -> [f32; 3] {
+    let raw: [f32; 3] = std::array::from_fn(|c| recon.plane_row(c, y)[x]);
+    if skip_smoothing
+        || recon.xsize() <= 2
+        || recon.ysize() <= 2
+        || x == 0
+        || y == 0
+        || x + 1 >= recon.xsize()
+        || y + 1 >= recon.ysize()
+    {
+        return raw;
+    }
+    let smoothed: [f32; 3] = std::array::from_fn(|c| {
+        let rows: [&[f32; 3]; 3] = std::array::from_fn(|dy| {
+            recon.plane_row(c, y + dy - 1)[x - 1..x + 2]
+                .try_into()
+                .unwrap()
+        });
+        smooth(rows[0], rows[1], rows[2])
+    });
+    let gap = (0..3).fold(0.5f32, |v, c| {
+        v.max((raw[c] - smoothed[c]).abs() / steps[c])
+    });
+    std::array::from_fn(|c| raw[c] + (smoothed[c] - raw[c]) * (3.0 - 4.0 * gap).max(0.0))
 }
 
 #[inline]

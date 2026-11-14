@@ -1219,7 +1219,7 @@ fn bench_jixel(
         .with_edge_splines(layers)
         .with_lossy_modular(lossy_modular)
         .with_coding_transform(CodingTransform::Xyb)
-        .with_grain(Grain::Auto);
+        .with_grain(Grain::Off);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;
     let jxl = tmp.join(format!("{stem}_jixel_{lossy_modular:?}_{d}.jxl"));

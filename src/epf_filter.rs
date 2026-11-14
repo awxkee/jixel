@@ -519,6 +519,41 @@ pub(crate) fn add_dc_error(
         });
 }
 
+/// Per raw strategy: the pixel image (row-major, the transform's pixel
+/// width) of a unit change of each DC cell (`iy * cov_x + ix`) of one
+/// transform, through its lowest frequencies.
+#[cfg(feature = "extraslow")]
+pub(crate) fn dc_cell_images(ctx: &EncodingContext, raw: u8) -> &'static [f32] {
+    static TABLES: [OnceLock<Vec<f32>>; crate::dc_group_data::NUM_STRATEGIES] =
+        [const { OnceLock::new() }; crate::dc_group_data::NUM_STRATEGIES];
+    TABLES[raw as usize].get_or_init(|| {
+        let (pw, ph) = crate::inflated_cost::strategy_pixel_dims(raw);
+        let pixels = pw * ph;
+        if raw == STRATEGY_DCT {
+            return vec![1.0; pixels];
+        }
+        let kernels = kernels::selected();
+        let (cov_x, cov_y) = (
+            AcStrategyImage::covered_blocks_x_of(raw),
+            AcStrategyImage::covered_blocks_y_of(raw),
+        );
+        let cx = cov_x.max(cov_y);
+        let n = cov_x * cov_y;
+        let inv = llf_from_dc(ctx, raw);
+        let mut images = vec![0.0f32; n * pixels];
+        let mut coeffs = vec![0.0f32; pixels];
+        let mut delta = vec![0.0f32; n];
+        for (slot, image) in images.chunks_exact_mut(pixels).enumerate() {
+            delta[slot] = 1.0;
+            coeffs.fill(0.0);
+            (kernels.project)(inv, &delta, cx, &mut coeffs);
+            crate::inflated_cost::reconstruct_error(ctx.idct, raw, &coeffs, image);
+            delta[slot] = 0.0;
+        }
+        images
+    })
+}
+
 fn grow(buffer: &mut Vec<f32>, len: usize) {
     if buffer.len() < len {
         buffer.resize(len, 0.0);

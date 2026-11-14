@@ -36,6 +36,8 @@ mod chroma;
 mod dc_entropy;
 pub(crate) use dc_entropy::{MaDcBudget, dc_wp_proxy_bits, learn_ma_dc_arm};
 mod dc_groups;
+#[cfg(feature = "extraslow")]
+mod dc_polish;
 mod dc_rdo;
 mod dc_smoothing;
 mod dc_tokens;

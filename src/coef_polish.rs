@@ -52,7 +52,7 @@ use crate::encoding_context::EncodingContext;
 use crate::entropy::{FrozenTokenPrices, Token, pack_signed};
 use crate::group::{DequantBias, SMALL_LEVELS};
 use crate::image::Image3F;
-use crate::simd::scaled_add::{AddScaledFn, selected_add_scaled_fn};
+use crate::simd::scaled_add::AddScaledFn;
 use crate::ssimulacra2::{Rect, Ssimulacra2Checkpoint, Ssimulacra2State};
 use std::sync::Arc;
 
@@ -570,6 +570,7 @@ impl CoefPolisher {
         state: Ssimulacra2State,
         lambda_bits: f32,
         cv: Option<CvJudge>,
+        add_scaled: AddScaledFn,
     ) -> Self {
         let base_d = state.deficit();
         Self {
@@ -587,7 +588,7 @@ impl CoefPolisher {
             prepared_delta: None,
             options: Vec::new(),
             count_nonzero: select_count_nonzero_fn(),
-            add_scaled: selected_add_scaled_fn(),
+            add_scaled,
             area_budget: false,
         }
     }
@@ -1405,7 +1406,13 @@ mod tests {
         };
         let recon = Arc::new(recon);
         for c in 0..3 {
-            let mut p = CoefPolisher::new(Arc::clone(&recon), reference.state(&recon), 1.0, None);
+            let mut p = CoefPolisher::new(
+                Arc::clone(&recon),
+                reference.state(&recon),
+                1.0,
+                None,
+                ctx.add_scaled,
+            );
             let rect = p.rect(&block);
             p.start_block(rect, (&recon, rect.x0, rect.y0));
             let selected = PolishMove {
@@ -1455,6 +1462,7 @@ mod tests {
 
     #[test]
     fn shared_pixel_delta_preserves_forward_and_rollback_bits() {
+        let ctx = EncodingContext::default();
         let mut baseline = Image3F::new(8, 8);
         let samples = [0.0, -0.0, f32::from_bits(1), -f32::from_bits(1), -0.3, 0.6];
         for c in 0..3 {
@@ -1464,7 +1472,13 @@ mod tests {
         }
         let baseline = Arc::new(baseline);
         let reference = crate::ssimulacra2::Ssimulacra2Reference::new(&baseline).unwrap();
-        let mut p = CoefPolisher::new(Arc::clone(&baseline), reference.state(&baseline), 1.0, None);
+        let mut p = CoefPolisher::new(
+            Arc::clone(&baseline),
+            reference.state(&baseline),
+            1.0,
+            None,
+            ctx.add_scaled,
+        );
         let channel = || PolishChannel {
             source: &[],
             inv_qm: &[],

@@ -103,7 +103,6 @@ pub(crate) struct SplinesContext {
     dot_contrast: dots::DotContrastFn,
     /// Fitting and dot templates use a fused erf polynomial on SIMD targets.
     blob_weight_row: fn(BlobWeightRow, i32, &mut [f32]),
-    add_scaled_f32: AddScaledFn,
     add_scaled_fma_f32: AddScaledFn,
     filter_vertical_row: filter::FilterVerticalRowFn,
     fit_add_scaled: fn(&mut [f64], &[f64], f64),
@@ -123,7 +122,6 @@ impl SplinesContext {
     }
 
     fn resolve() -> Self {
-        let add_scaled_f32 = selected_add_scaled_fn();
         let kernels = Self {
             ridge_row: detect::ridge_row_scalar,
             segment_distance: geometry::segment_distance_scalar,
@@ -132,8 +130,7 @@ impl SplinesContext {
             continuous_idct: transform::continuous_idct_scalar,
             dot_contrast: dots::dot_contrast_scalar,
             blob_weight_row: BlobWeightRow::fill_scalar,
-            add_scaled_f32,
-            add_scaled_fma_f32: add_scaled_f32,
+            add_scaled_fma_f32: selected_add_scaled_fn(),
             filter_vertical_row: filter::vertical_row_scalar,
             fit_add_scaled: fit::add_scaled_scalar,
             fit_accumulate: fit::accumulate_fit_scalar,
@@ -921,6 +918,7 @@ mod tests {
 
     #[test]
     fn f32_scaled_add_kernels_cover_unaligned_rows_and_tails() {
+        let ctx = EncodingContext::default();
         let kernels = SplinesContext::get();
         #[cfg(not(all(target_arch = "x86_64", feature = "avx")))]
         let fused = cfg!(target_arch = "aarch64");
@@ -931,10 +929,7 @@ mod tests {
         let src: [f32; 67] = std::array::from_fn(|i| (i as f32 - 17.0) * 0.071);
         let dst: [f32; 66] = std::array::from_fn(|i| (i as f32 - 23.0) * 0.083);
         for len in 0..=64 {
-            for (add, fused) in [
-                (kernels.add_scaled_f32, false),
-                (kernels.add_scaled_fma_f32, fused),
-            ] {
+            for (add, fused) in [(ctx.add_scaled, false), (kernels.add_scaled_fma_f32, fused)] {
                 let mut actual = dst;
                 let mut expected = dst;
                 add(&mut actual[1..1 + len], &src[2..], scale);
