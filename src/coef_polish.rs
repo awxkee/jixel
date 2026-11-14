@@ -47,12 +47,14 @@
 
 use crate::ac_context::{zero_density_context, zero_density_context_8x8};
 use crate::cvvdp_arbiter::{CvvdpArbiter, CvvdpCheckpoint};
+use crate::dc_group_data::{STRATEGY_AFV0, STRATEGY_AFV3, STRATEGY_DCT4X4, STRATEGY_DCT8X4};
 use crate::encoding_context::EncodingContext;
 use crate::entropy::{FrozenTokenPrices, Token, pack_signed};
-use crate::group::DequantBias;
+use crate::group::{DequantBias, SMALL_LEVELS};
 use crate::image::Image3F;
-use crate::simd::scaled_add::{AddScaledFn, selected_add_scaled_fn};
+use crate::simd::scaled_add::AddScaledFn;
 use crate::ssimulacra2::{Rect, Ssimulacra2Checkpoint, Ssimulacra2State};
+use std::sync::Arc;
 
 /// Proposals verified per channel and round, best trellis proxy first.
 const PER_CHANNEL: usize = 4;
@@ -72,6 +74,8 @@ const EXTRA_TRIES: usize = 4;
 const MAX_POSITIONS: usize = 256;
 /// Distortion-ranked proposals priced per channel.
 const PRICE_CAP: usize = PER_CHANNEL * 6;
+/// SSIMULACRA2 objective below which a move improves the frame.
+const SS2_ACCEPT: f32 = -1e-6;
 
 /// Pass counter: a polisher left in a worker's scratch from an earlier pass
 /// is inert and gets rebuilt (see `CoefPolisher::is_current`).
@@ -82,14 +86,14 @@ pub(crate) static POLISH_EPOCH: std::sync::atomic::AtomicUsize =
 /// accepted frame, the DC error image it scores with, and its exchange rate.
 pub(crate) struct CvJudge {
     judge: CvvdpArbiter,
-    dc: Image3F,
+    dc: Arc<Image3F>,
     lambda_bits: f32,
     cp: CvvdpCheckpoint,
     base: f32,
 }
 
 impl CvJudge {
-    pub(crate) fn new(judge: CvvdpArbiter, dc: Image3F, lambda_bits: f32) -> Self {
+    pub(crate) fn new(judge: CvvdpArbiter, dc: Arc<Image3F>, lambda_bits: f32) -> Self {
         let base = judge.deficit();
         Self {
             judge,
@@ -102,6 +106,12 @@ impl CvJudge {
 }
 
 pub(crate) struct CoefPolisher {
+    /// Frame position of the baseline's first pixel: the judges may follow
+    /// a crop of the frame.
+    origin: (usize, usize),
+    baseline: Arc<Image3F>,
+    /// Mutable XYB trial pixels of the current block. Earlier commits remain
+    /// in the metric states and in the output capture.
     recon: Image3F,
     state: Ssimulacra2State,
     /// Deficit per bit at the frame's exchange rate.
@@ -112,11 +122,22 @@ pub(crate) struct CoefPolisher {
     cp: Ssimulacra2Checkpoint,
     delta_coef: Vec<f32>,
     delta_pix: Vec<f32>,
-    plane_delta: [Vec<f32>; 3],
+    /// Forward luma updates and inactive planes add a canonical +0. Preserve
+    /// their effect on initial signed zeros without repeatedly visiting them.
+    may_have_negative_zero: [bool; 3],
+    prepared_delta: Option<(usize, usize, i32, i32)>,
     options: Vec<PolishOption>,
     count_nonzero: CountNonzeroFn,
     add_scaled: AddScaledFn,
     area_budget: bool,
+    /// A judge's accepted update left in its state for the commit that
+    /// follows, with the block pixels it scored. The commit rebuilds the
+    /// pixels through one more subtraction and addition of the delta; where
+    /// that reproduces these bits the state already is the committed one.
+    kept_ss2: Option<Vec<f32>>,
+    kept_cv: Option<(f32, Vec<f32>)>,
+    /// Retired pixel snapshots.
+    spare: Vec<Vec<f32>>,
 }
 
 /// One channel of the block being polished.
@@ -154,21 +175,86 @@ pub(crate) struct PolishBlock<'a> {
 struct PolishMove {
     c: usize,
     idx: usize,
+    order: u16,
     from: i32,
     to: i32,
+    bits: f32,
     dbits: f32,
     proxy: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct PolishOption {
-    idx: usize,
     from: i32,
     to: i32,
     dd: f32,
     /// Scan position times two plus proposal direction. This preserves the
-    /// original insertion order for ties and also locates the token prefix.
-    order: usize,
+    /// original insertion order for ties and locates the coefficient. Even
+    /// for 128x128 transforms the value is at most 32767.
+    order: u16,
+}
+
+impl PolishOption {
+    fn position(self) -> usize {
+        usize::from(self.order) / 2
+    }
+
+    fn distortion_key(self) -> u64 {
+        // The unsigned float key has the same ordering as f32::total_cmp,
+        // including signed zeros and all NaNs. The low bits break ties
+        // in the original scan order.
+        let bits = self.dd.to_bits();
+        let mask = 0u32.wrapping_sub(bits >> 31) | (1 << 31);
+        (u64::from(bits ^ mask) << 16) | u64::from(self.order)
+    }
+}
+
+/// Score the original moves in insertion order. The cached dequantized
+/// magnitudes match `DequantBias::level` for the entire small-level range.
+fn push_distortion_options(
+    options: &mut Vec<PolishOption>,
+    bias: DequantBias,
+    weight: f32,
+    cur: i32,
+    ideal: f32,
+    order: u16,
+) {
+    let mut push = |to, base_err: f32, to_level: f32, order| {
+        let dd = weight * ((ideal - to_level).powi(2) - base_err);
+        options.push(PolishOption {
+            from: cur,
+            to,
+            dd,
+            order,
+        });
+    };
+    let abs = cur.unsigned_abs() as usize;
+    if abs == 0 {
+        if ideal.abs() >= RESTORE_MIN {
+            let to = if ideal > 0.0 { 1 } else { -1 };
+            push(to, (ideal - 0.0).powi(2), bias.one.copysign(ideal), order);
+        }
+        return;
+    }
+    let sign = cur.signum();
+    let (base, toward, away) = if abs < SMALL_LEVELS - 1 {
+        let sign_source = cur as f32;
+        (
+            bias.small_levels[abs].copysign(sign_source),
+            // The zero level is +0 even when approached from below.
+            0.0 + bias.small_levels[abs - 1].copysign(sign_source),
+            bias.small_levels[abs + 1].copysign(sign_source),
+        )
+    } else {
+        (
+            bias.level(cur),
+            bias.level(cur - sign),
+            bias.level(cur + sign),
+        )
+    };
+    let base_err = (ideal - base).powi(2);
+    push(cur - sign, base_err, toward, order);
+    push(cur + sign, base_err, away, order + 1);
 }
 
 #[cfg(test)]
@@ -177,13 +263,25 @@ fn rank_options(options: &mut Vec<PolishOption>) {
 }
 
 fn rank_options_cap(options: &mut Vec<PolishOption>, cap: usize) {
-    let cmp =
-        |a: &PolishOption, b: &PolishOption| a.dd.total_cmp(&b.dd).then(a.order.cmp(&b.order));
     if options.len() > cap {
-        options.select_nth_unstable_by(cap, cmp);
+        options.select_nth_unstable_by_key(cap, |option| option.distortion_key());
         options.truncate(cap);
-        options.sort_unstable_by(cmp);
+        options.sort_unstable_by_key(|option| option.distortion_key());
     }
+}
+
+/// Retain the best priced moves in stable proxy order.
+fn insert_priced_move(priced: &mut [PolishMove], len: &mut usize, candidate: PolishMove) {
+    if *len == priced.len() && !candidate.proxy.total_cmp(&priced[*len - 1].proxy).is_lt() {
+        return;
+    }
+    let mut i = (*len).min(priced.len() - 1);
+    while i > 0 && candidate.proxy.total_cmp(&priced[i - 1].proxy).is_lt() {
+        priced[i] = priced[i - 1];
+        i -= 1;
+    }
+    priced[i] = candidate;
+    *len = (*len + 1).min(priced.len());
 }
 
 type CountNonzeroFn = fn(&[i32]) -> usize;
@@ -250,30 +348,23 @@ impl TokenPrefix {
     }
 
     #[inline]
-    fn advance(
-        &mut self,
+    fn token_bits(
         ch: &PolishChannel,
         covered_blocks: usize,
         log2_covered_blocks: usize,
         k: usize,
+        remaining: usize,
+        prev: usize,
         coef: i32,
         prices: &FrozenTokenPrices,
-    ) {
+    ) -> f32 {
         let ctx = ch.histo_offset as usize
             + if covered_blocks == 1 {
-                zero_density_context_8x8(self.remaining, k, self.prev)
+                zero_density_context_8x8(remaining, k, prev)
             } else {
-                zero_density_context(
-                    self.remaining,
-                    k,
-                    covered_blocks,
-                    log2_covered_blocks,
-                    self.prev,
-                )
+                zero_density_context(remaining, k, covered_blocks, log2_covered_blocks, prev)
             };
-        self.bits += prices.token_bits(Token::new(ctx as u32, pack_signed(coef)));
-        self.prev = usize::from(coef != 0);
-        self.remaining -= usize::from(coef != 0);
+        prices.token_bits(Token::new(ctx as u32, pack_signed(coef)))
     }
 }
 
@@ -287,14 +378,19 @@ fn finish_bits(
 ) -> f32 {
     let log2_covered_blocks = covered_blocks.trailing_zeros() as usize;
     while k < block.len() && prefix.remaining != 0 {
-        prefix.advance(
+        let coef = block[ch.scan[k] as usize];
+        prefix.bits += TokenPrefix::token_bits(
             ch,
             covered_blocks,
             log2_covered_blocks,
             k,
-            block[ch.scan[k] as usize],
+            prefix.remaining,
+            prefix.prev,
+            coef,
             prices,
         );
+        prefix.prev = usize::from(coef != 0);
+        prefix.remaining -= prefix.prev;
         k += 1;
     }
     prefix.bits
@@ -318,86 +414,182 @@ fn block_bits(
     )
 }
 
-/// Save only prefixes requested by count-preserving proposals, before any
-/// trial edits. The bounded stack cache is rebuilt per channel and round.
-fn token_prefixes(
+fn reconstruct_coefficient_delta(
+    idct: &crate::dct::IdctMethods,
+    strategy: u8,
+    idx: usize,
+    delta: f32,
+    coeffs: &mut [f32],
+    pixels: &mut [f32],
+) {
+    if matches!(strategy, STRATEGY_DCT4X4..=STRATEGY_DCT8X4 | STRATEGY_AFV0..=STRATEGY_AFV3)
+        && idx != 0
+    {
+        let matrix = crate::inflated_cost::inverse_matrix(strategy);
+        // The unused DC product is +0 in every row. The other omitted
+        // products are ±0, so a single rounded product gives the same sum.
+        for (pixel, row) in pixels.iter_mut().zip(matrix.as_chunks::<64>().0) {
+            *pixel = 0.0 + row[idx] * delta;
+        }
+    } else {
+        coeffs[idx] = delta;
+        crate::inflated_cost::reconstruct_error(idct, strategy, coeffs, pixels);
+        coeffs[idx] = 0.0;
+    }
+}
+
+/// Price single edits together. Before the edit, their contexts depend only
+/// on the new count. After the edit and its successor, the original count
+/// and previous-token flag apply again. Share both price walks while adding
+/// every price to each proposal in the original f32 order.
+fn price_options(
     block: &[i32],
     ch: &PolishChannel,
-    covered_blocks: usize,
+    covered: usize,
     nzeros: usize,
     prices: &FrozenTokenPrices,
     options: &[PolishOption],
-) -> [TokenPrefix; PRICE_CAP] {
-    let mut requests = [(0usize, 0usize); PRICE_CAP];
-    let mut len = 0;
+) -> (f32, [f32; PRICE_CAP]) {
+    let mut order = [0; PRICE_CAP];
+    let order = &mut order[..options.len()];
+    let mut last = [0; 3];
+    let count_kind = |o: &PolishOption| 1 + usize::from(o.to != 0) - usize::from(o.from != 0);
     for (i, option) in options.iter().enumerate() {
-        if option.from != 0 && option.to != 0 {
-            requests[len] = (option.order / 2, i);
-            len += 1;
-        }
+        order[i] = i;
+        last[count_kind(option)] = last[count_kind(option)].max(option.position());
     }
-    let mut prefixes = [TokenPrefix::default(); PRICE_CAP];
-    if len == 0 {
-        return prefixes;
-    }
-    requests[..len].sort_unstable();
-    let log2_covered_blocks = covered_blocks.trailing_zeros() as usize;
-    let mut prefix = TokenPrefix::new(block.len(), nzeros, ch, prices);
-    let mut k = covered_blocks;
-    for &(position, i) in &requests[..len] {
-        while k < position && prefix.remaining != 0 {
-            prefix.advance(
-                ch,
-                covered_blocks,
-                log2_covered_blocks,
-                k,
-                block[ch.scan[k] as usize],
-                prices,
-            );
-            k += 1;
-        }
-        debug_assert_eq!(
-            k, position,
-            "nonzero proposal must lie inside the token walk"
-        );
-        prefixes[i] = prefix;
-    }
-    prefixes
-}
+    order.sort_unstable_by_key(|&i| options[i].order);
 
-fn proposal_bits(
-    block: &mut [i32],
-    ch: &PolishChannel,
-    covered_blocks: usize,
-    nzeros: usize,
-    prices: &FrozenTokenPrices,
-    option: &PolishOption,
-    prefix: TokenPrefix,
-) -> f32 {
-    debug_assert_eq!(block[option.idx], option.from);
-    block[option.idx] = option.to;
-    let bits = if option.from != 0 && option.to != 0 {
-        // Both the header and earlier contexts are unchanged. Continue from
-        // the exact saved f32 accumulator; do not subtract or regroup sums.
-        finish_bits(block, ch, covered_blocks, prices, option.order / 2, prefix)
-    } else {
-        let nzeros = nzeros + usize::from(option.to != 0) - usize::from(option.from != 0);
-        block_bits(block, ch, covered_blocks, nzeros, prices)
+    let log2_covered = covered.trailing_zeros() as usize;
+    let token = |k, remaining, prev, coef| {
+        TokenPrefix::token_bits(ch, covered, log2_covered, k, remaining, prev, coef, prices)
     };
-    block[option.idx] = option.from;
-    bits
+    let mut base = TokenPrefix::new(block.len(), nzeros, ch, prices);
+    if nzeros == 0 {
+        // All proposals are restores. They share the zero run up to the
+        // restored coefficient, which also ends the candidate's token walk.
+        let mut prefix = TokenPrefix::new(block.len(), 1, ch, prices);
+        let mut bits = [0.0; PRICE_CAP];
+        let mut k = covered;
+        for &i in order.iter() {
+            let option = &options[i];
+            let position = option.position();
+            while k < position {
+                prefix.bits += token(k, 1, prefix.prev, 0);
+                prefix.prev = 0;
+                k += 1;
+            }
+            bits[i] = prefix.bits + token(k, 1, prefix.prev, option.to);
+        }
+        return (base.bits, bits);
+    }
+
+    let mut prefixes = [TokenPrefix::default(); 3];
+    for (kind, prefix) in prefixes.iter_mut().enumerate() {
+        if kind != 1 && last[kind] != 0 {
+            *prefix = TokenPrefix::new(block.len(), nzeros + kind - 1, ch, prices);
+        }
+    }
+    let mut ready = 0;
+    let mut active = 0;
+    let mut sums = [0.0; PRICE_CAP];
+    // Large transforms often code many tokens beyond the last edit. Every
+    // trial has rejoined the base contexts two positions past that edit.
+    let tail_start = if covered >= 64 {
+        (last[0].max(last[1]).max(last[2]) + 2)
+            .max(covered)
+            .min(block.len())
+    } else {
+        block.len()
+    };
+    for k in covered..tail_start {
+        if base.remaining == 0 && ready == order.len() {
+            break;
+        }
+        let coef = block[ch.scan[k] as usize];
+        let next_prev = usize::from(coef != 0);
+        let next_remaining = base.remaining - next_prev;
+
+        let mut end = ready;
+        while end < order.len() {
+            let option = &options[order[end]];
+            if option.position() != k {
+                break;
+            }
+            debug_assert_eq!(coef, option.from);
+            let kind = count_kind(option);
+            let prefix = if kind == 1 { &base } else { &prefixes[kind] };
+            let mut bits = prefix.bits;
+            if prefix.remaining != 0 {
+                bits += token(k, prefix.remaining, prefix.prev, option.to);
+            }
+            if next_remaining != 0 && k + 1 < block.len() {
+                bits += token(
+                    k + 1,
+                    next_remaining,
+                    usize::from(option.to != 0),
+                    block[ch.scan[k + 1] as usize],
+                );
+            }
+            sums[end] = bits;
+            end += 1;
+        }
+
+        if base.remaining != 0 {
+            let price = token(k, base.remaining, base.prev, coef);
+            base.bits += price;
+            for bits in &mut sums[..active] {
+                *bits += price;
+            }
+        }
+        active = ready;
+        ready = end;
+
+        for kind in [0, 2] {
+            let prefix = &mut prefixes[kind];
+            if k < last[kind] && prefix.remaining != 0 {
+                prefix.bits += token(k, prefix.remaining, prefix.prev, coef);
+                prefix.remaining -= next_prev;
+                prefix.prev = next_prev;
+            }
+        }
+        base.remaining = next_remaining;
+        base.prev = next_prev;
+    }
+    let all_sums = &mut sums[..order.len()];
+    for (k, &index) in ch.scan[tail_start..block.len()].iter().enumerate() {
+        if base.remaining == 0 {
+            break;
+        }
+        let coef = block[index as usize];
+        let price = token(tail_start + k, base.remaining, base.prev, coef);
+        base.bits += price;
+        for bits in &mut *all_sums {
+            *bits += price;
+        }
+        base.prev = usize::from(coef != 0);
+        base.remaining -= base.prev;
+    }
+    let mut bits = [0.0; PRICE_CAP];
+    for (i, &option) in order.iter().enumerate() {
+        bits[option] = sums[i];
+    }
+    (base.bits, bits)
 }
 
 impl CoefPolisher {
     pub(crate) fn new(
-        recon: Image3F,
+        baseline: Arc<Image3F>,
         state: Ssimulacra2State,
         lambda_bits: f32,
         cv: Option<CvJudge>,
+        add_scaled: AddScaledFn,
     ) -> Self {
         let base_d = state.deficit();
         Self {
-            recon,
+            origin: (0, 0),
+            baseline,
+            recon: Image3F::new(0, 0),
             state,
             lambda_bits,
             cv,
@@ -406,16 +598,24 @@ impl CoefPolisher {
             cp: Ssimulacra2Checkpoint::default(),
             delta_coef: Vec::new(),
             delta_pix: Vec::new(),
-            plane_delta: Default::default(),
-            options: Vec::with_capacity(MAX_POSITIONS * 2),
+            may_have_negative_zero: [false; 3],
+            prepared_delta: None,
+            options: Vec::new(),
             count_nonzero: select_count_nonzero_fn(),
-            add_scaled: selected_add_scaled_fn(),
+            add_scaled,
             area_budget: false,
+            kept_ss2: None,
+            kept_cv: None,
+            spare: Vec::new(),
         }
     }
 
     /// Keep refinement work proportional to covered area when content-adaptive
     /// selection chooses a denser layout. Both exact judges remain active.
+    pub(crate) fn set_origin(&mut self, origin: (usize, usize)) {
+        self.origin = origin;
+    }
+
     pub(crate) fn set_area_budget(&mut self, enabled: bool) {
         self.area_budget = enabled;
     }
@@ -426,68 +626,111 @@ impl CoefPolisher {
     }
 
     fn rect(&self, b: &PolishBlock) -> Rect {
+        let (x0, y0) = (b.px0 - self.origin.0, b.py0 - self.origin.1);
         Rect::new(
-            b.px0,
-            b.py0,
-            (b.px0 + b.pw).min(self.recon.xsize()),
-            (b.py0 + b.ph).min(self.recon.ysize()),
+            x0,
+            y0,
+            (x0 + b.pw).min(self.baseline.xsize()),
+            (y0 + b.ph).min(self.baseline.ysize()),
         )
     }
 
-    /// Add `sign` times the accumulated plane deltas to the frame reconstruction.
+    /// Add `sign` times the accumulated plane deltas to the block reconstruction.
+    /// The dispatched add rounds the CfL multiplication before adding it.
     fn apply_plane_deltas(&mut self, b: &PolishBlock, sign: f32) {
-        let width = b.pw.min(self.recon.xsize() - b.px0);
-        let height = b.ph.min(self.recon.ysize() - b.py0);
-        for c in 0..3 {
-            for y in 0..height {
-                let delta = &self.plane_delta[c][y * b.pw..y * b.pw + width];
-                let row = &mut self.recon.plane_row_mut(c, b.py0 + y)[b.px0..b.px0 + width];
-                (self.add_scaled)(row, delta, sign);
+        let width = self.recon.xsize();
+        let height = self.recon.ysize();
+        let (channel, ..) = self.prepared_delta.expect("prepared pixel delta");
+        for (c, plane) in self.recon.all_planes_mut().into_iter().enumerate() {
+            let pixels = plane.as_mut_slice();
+            let scale = if channel == 1 {
+                b.cfl[c]
+            } else if c == channel {
+                1.0
+            } else {
+                0.0
+            };
+            // A forward luma or inactive-plane update adds +0 wherever the
+            // old materialized delta was zero. Canonicalize negative zeros
+            // once so applying the unmaterialized delta preserves that effect.
+            if sign > 0.0 && (channel == 1 || scale == 0.0) && self.may_have_negative_zero[c] {
+                for pixel in pixels.iter_mut() {
+                    *pixel += 0.0;
+                }
+                self.may_have_negative_zero[c] = false;
+            }
+            if scale == 0.0 {
+                continue;
+            }
+            let scale = sign * scale;
+            if width == b.pw {
+                (self.add_scaled)(pixels, &self.delta_pix[..width * height], scale);
+            } else {
+                for (row, delta) in pixels
+                    .chunks_exact_mut(width)
+                    .zip(self.delta_pix.chunks_exact(b.pw))
+                {
+                    (self.add_scaled)(row, &delta[..width], scale);
+                }
             }
         }
     }
 
     /// Pixel-domain delta of `m` on the three decoded planes.
     fn plane_deltas(&mut self, ctx: &EncodingContext, b: &PolishBlock, m: &PolishMove) {
-        let n = b.pw * b.ph;
-        for plane in &mut self.plane_delta {
-            plane[..n].fill(0.0);
+        let key = (m.c, m.idx, m.from, m.to);
+        if self.prepared_delta == Some(key) {
+            return;
+        }
+        self.prepared_delta = Some(key);
+        if self.delta_pix.len() < b.size {
+            self.delta_coef.resize(b.size, 0.0);
+            self.delta_pix.resize(b.size, 0.0);
         }
         let ch = &b.channels[m.c];
         let dq = (ch.bias.level(m.to) - ch.bias.level(m.from)) / (ch.inv_qm[m.idx] * ch.q_scaled);
-        self.delta_coef[..b.size].fill(0.0);
-        self.delta_coef[m.idx] = dq;
-        crate::inflated_cost::reconstruct_error(
+        reconstruct_coefficient_delta(
             ctx.idct,
             b.raw_strategy,
-            &self.delta_coef[..b.size],
+            m.idx,
+            dq,
+            &mut self.delta_coef[..b.size],
             &mut self.delta_pix[..b.size],
         );
-        if m.c == 1 {
-            for c in 0..3 {
-                let f = b.cfl[c];
-                if f == 0.0 {
-                    continue;
-                }
-                for (d, &p) in self.plane_delta[c][..n]
-                    .iter_mut()
-                    .zip(&self.delta_pix[..n])
-                {
-                    *d += f * p;
-                }
-            }
-        } else {
-            self.plane_delta[m.c][..n].copy_from_slice(&self.delta_pix[..n]);
-        }
     }
 
-    /// SSIMULACRA2 objective change of `m` alone.
+    /// The block pixels, plane after plane.
+    fn snapshot(&mut self) -> Vec<f32> {
+        let mut pixels = self.spare.pop().unwrap_or_default();
+        pixels.clear();
+        for c in 0..3 {
+            pixels.extend_from_slice(self.recon.plane(c).as_slice());
+        }
+        pixels
+    }
+
+    /// Whether the block pixels carry exactly the bits of `snapshot`.
+    fn matches(&self, snapshot: &[f32]) -> bool {
+        let n = self.recon.plane(0).as_slice().len();
+        (0..3).all(|c| {
+            self.recon
+                .plane(c)
+                .as_slice()
+                .iter()
+                .zip(&snapshot[c * n..(c + 1) * n])
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        })
+    }
+
+    /// SSIMULACRA2 objective change of `m` alone. With `keep`, an improving
+    /// update stays in the state until `commit` or `discard_ss2`.
     fn judge_ss2(
         &mut self,
         ctx: &EncodingContext,
         b: &PolishBlock,
         rect: Rect,
         m: &PolishMove,
+        keep: bool,
     ) -> f32 {
         self.plane_deltas(ctx, b, m);
         self.apply_plane_deltas(b, 1.0);
@@ -495,11 +738,24 @@ impl CoefPolisher {
         let CoefPolisher {
             recon, state, cp, ..
         } = self;
-        state.update_checkpointed(recon, rect, cp);
+        state.update_region_checkpointed(recon, (rect.x0, rect.y0), rect, cp);
         let j = state.deficit() - base_d + lambda * m.dbits;
-        state.rollback(cp);
+        if keep && j < SS2_ACCEPT {
+            let pixels = self.snapshot();
+            self.kept_ss2 = Some(pixels);
+        } else {
+            self.state.rollback(&self.cp);
+        }
         self.apply_plane_deltas(b, -1.0);
         j
+    }
+
+    /// Undo an update `judge_ss2_keeping` left behind.
+    fn discard_ss2(&mut self) {
+        if let Some(pixels) = self.kept_ss2.take() {
+            self.state.rollback(&self.cp);
+            self.spare.push(pixels);
+        }
     }
 
     /// ColorVideoVDP objective change of `m` alone (`None` without a judge).
@@ -516,11 +772,21 @@ impl CoefPolisher {
         self.apply_plane_deltas(b, 1.0);
         let CoefPolisher { recon, cv, .. } = self;
         let cv = cv.as_mut().expect("judge");
-        let d = cv
-            .judge
-            .update_checkpointed(recon, &cv.dc, rect, &mut cv.cp);
-        cv.judge.rollback(&cv.cp);
+        let d = cv.judge.update_region_checkpointed(
+            recon,
+            (rect.x0, rect.y0),
+            &cv.dc,
+            rect,
+            &mut cv.cp,
+        );
         let j = d - cv.base + cv.lambda_bits * m.dbits;
+        // Every caller commits a move this judge does not refuse.
+        if j >= 0.0 {
+            cv.judge.rollback(&cv.cp);
+        } else {
+            let pixels = self.snapshot();
+            self.kept_cv = Some((d, pixels));
+        }
         self.apply_plane_deltas(b, -1.0);
         Some(j)
     }
@@ -534,10 +800,67 @@ impl CoefPolisher {
             base_d,
             ..
         } = self;
-        state.update(recon, rect);
+        let origin = (rect.x0, rect.y0);
+        state.update_region(recon, origin, rect);
         *base_d = state.deficit();
         if let Some(cv) = cv {
-            cv.base = cv.judge.update(recon, &cv.dc, rect);
+            cv.base = cv.judge.update_region(recon, origin, &cv.dc, rect);
+        }
+    }
+
+    /// `accept_rect` for a commit: a judge's kept update stands where the
+    /// committed pixels are the ones it scored.
+    fn accept_judged(&mut self, rect: Rect) {
+        let origin = (rect.x0, rect.y0);
+        let kept = self.kept_ss2.take();
+        if !kept.as_ref().is_some_and(|pixels| self.matches(pixels)) {
+            if kept.is_some() {
+                self.state.rollback(&self.cp);
+            }
+            self.state.update_region(&self.recon, origin, rect);
+        }
+        self.spare.extend(kept);
+        self.base_d = self.state.deficit();
+        let kept = self.kept_cv.take();
+        let reuse = kept
+            .as_ref()
+            .is_some_and(|(_, pixels)| self.matches(pixels));
+        if let Some(cv) = &mut self.cv {
+            cv.base = match &kept {
+                Some((distortion, _)) if reuse => *distortion,
+                _ => {
+                    if kept.is_some() {
+                        cv.judge.rollback(&cv.cp);
+                    }
+                    cv.judge.update_region(&self.recon, origin, &cv.dc, rect)
+                }
+            };
+        }
+        self.spare.extend(kept.map(|(_, pixels)| pixels));
+    }
+
+    /// A layout visits each transform once. Its pixels start at the shared
+    /// frame baseline, unless earlier moves changed its quantizer contexts.
+    fn start_block(&mut self, rect: Rect, capture: (&Image3F, usize, usize)) {
+        let (plane, lx0, ly0) = capture;
+        let (width, height) = (rect.x1 - rect.x0, rect.y1 - rect.y0);
+        debug_assert!(self.kept_ss2.is_none() && self.kept_cv.is_none());
+        self.recon.resize(width, height);
+        self.may_have_negative_zero = [true; 3];
+        let mut changed = false;
+        for c in 0..3 {
+            for y in 0..height {
+                let src = &plane.plane_row(c, ly0 + y)[lx0..lx0 + width];
+                let baseline = &self.baseline.plane_row(c, rect.y0 + y)[rect.x0..rect.x1];
+                let row_changed = src != baseline;
+                self.recon
+                    .plane_row_mut(c, y)
+                    .copy_from_slice(if row_changed { src } else { baseline });
+                changed |= row_changed;
+            }
+        }
+        if changed {
+            self.accept_rect(rect);
         }
     }
 
@@ -555,29 +878,9 @@ impl CoefPolisher {
         if rect.x1 <= rect.x0 || rect.y1 <= rect.y0 {
             return;
         }
-        // Baseline: this block's pre-polish pixels into the frame reconstruction
-        // (earlier blocks' changed contexts can have moved its quantization).
         let (plane, lx0, ly0) = capture;
-        let mut changed = false;
-        for c in 0..3 {
-            for y in rect.y0..rect.y1 {
-                let src = &plane.plane_row(c, ly0 + (y - b.py0))[lx0..lx0 + (rect.x1 - rect.x0)];
-                let dst = &mut self.recon.plane_row_mut(c, y)[rect.x0..rect.x1];
-                if src != dst {
-                    dst.copy_from_slice(src);
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            self.accept_rect(rect);
-        }
-        self.delta_coef
-            .resize(self.delta_coef.len().max(b.size), 0.0);
-        self.delta_pix.resize(self.delta_pix.len().max(b.size), 0.0);
-        for plane in &mut self.plane_delta {
-            plane.resize(plane.len().max(b.pw * b.ph), 0.0);
-        }
+        self.start_block(rect, (plane, lx0, ly0));
+        self.prepared_delta = None;
         let covered = b.cx * b.cy;
         // Fixed per-transform budgets multiply the work when a 32x32 turns
         // into sixteen leaves. Spend by area on the adaptive selection path.
@@ -618,20 +921,32 @@ impl CoefPolisher {
         let mut nzeros: [usize; 3] = std::array::from_fn(|c| {
             count_nonzero_except_llf(quantized[c], b.cx, b.cy, self.count_nonzero)
         });
-        let mut base_bits: [f32; 3] = std::array::from_fn(|c| {
-            block_bits(quantized[c], &b.channels[c], covered, nzeros[c], prices)
-        });
-
+        let mut singles = [PolishMove::default(); PER_CHANNEL * 3];
+        let mut npriced = [0; 3];
+        let mut base_bits = [0.0; 3];
+        let mut reprice = [true; 3];
         for _round in 0..rounds {
             // ---- Proposals: proxy-ranked singles per channel ----
-            let mut singles = [PolishMove::default(); PER_CHANNEL * 3];
-            let mut nsingles = 0;
             let options = &mut self.options;
             for c in [1usize, 0, 2] {
+                if !reprice[c] {
+                    continue;
+                }
+                reprice[c] = false;
+                npriced[c] = 0;
                 let ch = &b.channels[c];
-                let block = &mut *quantized[c];
+                let block = &*quantized[c];
                 options.clear();
                 let end = b.size.min(covered + positions);
+                // Zero levels produce at most one proposal. Bound the
+                // extra slots by the nonzero count and cap amortized growth
+                // at the largest possible proposal list.
+                let positions = end - covered;
+                let needed = positions + nzeros[c].min(positions);
+                let capacity = options.capacity();
+                if capacity < needed {
+                    options.reserve_exact(needed.max((capacity * 2).min(MAX_POSITIONS * 2)));
+                }
                 for k in covered..end {
                     let idx = ch.scan[k] as usize;
                     let (v, u) = (idx >> row_shift, idx & column_mask);
@@ -640,70 +955,67 @@ impl CoefPolisher {
                     }
                     let cur = block[idx];
                     let ideal = ch.source[idx] * ch.inv_qm[idx] * ch.q_scaled;
-                    let base_err = (ideal - ch.bias.level(cur)).powi(2);
-                    let mut order = k * 2;
-                    let mut push = |to: i32| {
-                        let dd = ch.weight * ((ideal - ch.bias.level(to)).powi(2) - base_err);
-                        options.push(PolishOption {
-                            idx,
-                            from: cur,
-                            to,
-                            dd,
-                            order,
-                        });
-                        order += 1;
-                    };
-                    if cur != 0 {
-                        push(cur - cur.signum());
-                        push(cur + cur.signum());
-                    } else if ideal.abs() >= RESTORE_MIN {
-                        push(if ideal > 0.0 { 1 } else { -1 });
-                    }
+                    push_distortion_options(
+                        options,
+                        ch.bias,
+                        ch.weight,
+                        cur,
+                        ideal,
+                        (k * 2) as u16,
+                    );
                 }
                 // Price the most promising by distortion, then rank by the proxy.
                 rank_options_cap(options, price_cap);
                 if options.is_empty() {
                     continue;
                 }
-                let prefixes = token_prefixes(block, ch, covered, nzeros[c], prices, options);
-                let mut priced = [PolishMove::default(); PRICE_CAP];
-                let mut npriced = 0;
+                let (base, bits) = price_options(block, ch, covered, nzeros[c], prices, options);
+                base_bits[c] = base;
+                let start = c * PER_CHANNEL;
+                let priced = &mut singles[start..start + per_channel];
                 for (i, option) in options.iter().enumerate() {
-                    let PolishOption {
-                        idx, from, to, dd, ..
-                    } = *option;
-                    let dbits =
-                        proposal_bits(block, ch, covered, nzeros[c], prices, option, prefixes[i])
-                            - base_bits[c];
+                    let PolishOption { from, to, dd, .. } = *option;
+                    let dbits = bits[i] - base;
                     if dbits > MAX_COST_BITS {
                         continue;
                     }
-                    priced[npriced] = PolishMove {
-                        c,
-                        idx,
-                        from,
-                        to,
-                        dbits,
-                        proxy: dd + b.lambda * dbits,
-                    };
-                    npriced += 1;
+                    insert_priced_move(
+                        priced,
+                        &mut npriced[c],
+                        PolishMove {
+                            c,
+                            idx: ch.scan[option.position()] as usize,
+                            order: option.order,
+                            from,
+                            to,
+                            bits: bits[i],
+                            dbits,
+                            proxy: dd + b.lambda * dbits,
+                        },
+                    );
                 }
-                let priced = &mut priced[..npriced];
-                priced.sort_by(|a, b| a.proxy.total_cmp(&b.proxy));
-                let len = npriced.min(per_channel);
-                singles[nsingles..nsingles + len].copy_from_slice(&priced[..len]);
-                nsingles += len;
             }
-            let singles = &singles[..nsingles];
 
             // ---- Judge: SSIMULACRA2 ranks, ColorVideoVDP checks the best few ----
             let mut scored = [(0.0f32, 0usize); PER_CHANNEL * 3];
             let mut nscored = 0;
-            for (i, m) in singles.iter().enumerate() {
-                let j = self.judge_ss2(ctx, b, rect, m);
-                if j < -1e-6 {
-                    scored[nscored] = (j, i);
-                    nscored += 1;
+            // The last judged move keeps its update: it is the committed
+            // one whenever it turns out to be the best.
+            let mut left: usize = npriced.iter().sum();
+            let mut kept_move = None;
+            for c in [1usize, 0, 2] {
+                let start = c * PER_CHANNEL;
+                for i in 0..npriced[c] {
+                    let m = singles[start + i];
+                    left -= 1;
+                    let j = self.judge_ss2(ctx, b, rect, &m, left == 0);
+                    if j < SS2_ACCEPT {
+                        scored[nscored] = (j, start + i);
+                        nscored += 1;
+                        if left == 0 {
+                            kept_move = Some(start + i);
+                        }
+                    }
                 }
             }
             let scored = &mut scored[..nscored];
@@ -721,25 +1033,21 @@ impl CoefPolisher {
             }
 
             // ---- Accept ----
+            if best.map(|(_, i)| i) != kept_move {
+                self.discard_ss2();
+            }
             let Some((m, best_i)) = best else { break };
             // The final judge_cv call prepared this move, even without a judge.
+            reprice[m.c] = true;
             let at = (&mut *plane, lx0, ly0);
-            self.commit(
-                prices,
-                b,
-                rect,
-                &m,
-                at,
-                quantized,
-                &mut nzeros,
-                &mut base_bits,
-            );
+            self.commit(b, rect, &m, at, quantized, &mut nzeros, &mut base_bits);
 
             // ---- Further accepted proposals, re-priced and re-judged on the new block ----
             let mut touched = [(m.c, m.idx); EXTRA_TRIES + 1];
             let mut ntouched = 1;
             let mut tries = 0;
-            for &(_, i) in scored.iter() {
+            let mut cached_price = [None; PER_CHANNEL * 3];
+            for (rank, &(_, i)) in scored.iter().enumerate() {
                 if tries == extra_tries {
                     break;
                 }
@@ -750,45 +1058,86 @@ impl CoefPolisher {
                 {
                     continue;
                 }
-                quantized[m.c][m.idx] = m.to;
-                let nz = nzeros[m.c] + usize::from(m.to != 0) - usize::from(m.from != 0);
-                let bits = block_bits(quantized[m.c], &b.channels[m.c], covered, nz, prices);
-                quantized[m.c][m.idx] = m.from;
-                m.dbits = bits - base_bits[m.c];
-                if m.dbits > MAX_COST_BITS {
-                    continue;
+                if reprice[m.c] {
+                    if covered >= 64 && tries + 1 < extra_tries && cached_price[i].is_none() {
+                        let mut batch = [PolishOption {
+                            from: 0,
+                            to: 0,
+                            dd: 0.0,
+                            order: 0,
+                        }; PER_CHANNEL];
+                        let mut indices = [0; PER_CHANNEL];
+                        let mut len = 0;
+                        for &(_, j) in &scored[rank..] {
+                            let other = &singles[j];
+                            if other.c != m.c
+                                || touched[..ntouched].contains(&(other.c, other.idx))
+                                || quantized[m.c][other.idx] != other.from
+                            {
+                                continue;
+                            }
+                            batch[len] = PolishOption {
+                                from: other.from,
+                                to: other.to,
+                                dd: 0.0,
+                                order: other.order,
+                            };
+                            indices[len] = j;
+                            len += 1;
+                        }
+                        if len > 1 {
+                            let (_, bits) = price_options(
+                                quantized[m.c],
+                                &b.channels[m.c],
+                                covered,
+                                nzeros[m.c],
+                                prices,
+                                &batch[..len],
+                            );
+                            for (&j, &bits) in indices[..len].iter().zip(&bits) {
+                                cached_price[j] = Some(bits);
+                            }
+                        }
+                    }
+                    m.bits = if let Some(bits) = cached_price[i] {
+                        bits
+                    } else {
+                        quantized[m.c][m.idx] = m.to;
+                        let nz = nzeros[m.c] + usize::from(m.to != 0) - usize::from(m.from != 0);
+                        let bits =
+                            block_bits(quantized[m.c], &b.channels[m.c], covered, nz, prices);
+                        quantized[m.c][m.idx] = m.from;
+                        bits
+                    };
+                    m.dbits = m.bits - base_bits[m.c];
+                    if m.dbits > MAX_COST_BITS {
+                        continue;
+                    }
                 }
                 tries += 1;
-                if self.judge_ss2(ctx, b, rect, &m) >= -1e-6 {
+                if self.judge_ss2(ctx, b, rect, &m, true) >= SS2_ACCEPT {
                     continue;
                 }
                 if let Some(j_cv) = self.judge_cv(ctx, b, rect, &m)
                     && j_cv >= 0.0
                 {
+                    self.discard_ss2();
                     continue;
                 }
                 touched[ntouched] = (m.c, m.idx);
                 ntouched += 1;
+                reprice[m.c] = true;
+                let start = m.c * PER_CHANNEL;
+                cached_price[start..start + PER_CHANNEL].fill(None);
                 let at = (&mut *plane, lx0, ly0);
-                self.commit(
-                    prices,
-                    b,
-                    rect,
-                    &m,
-                    at,
-                    quantized,
-                    &mut nzeros,
-                    &mut base_bits,
-                );
+                self.commit(b, rect, &m, at, quantized, &mut nzeros, &mut base_bits);
             }
         }
     }
 
     /// Commit `m`, whose plane deltas the last judge call prepared.
-    #[allow(clippy::too_many_arguments)]
     fn commit(
         &mut self,
-        prices: &FrozenTokenPrices,
         b: &PolishBlock,
         rect: Rect,
         m: &PolishMove,
@@ -798,24 +1147,17 @@ impl CoefPolisher {
         base_bits: &mut [f32; 3],
     ) {
         self.apply_plane_deltas(b, 1.0);
-        self.accept_rect(rect);
+        self.accept_judged(rect);
         // Keep the capture plane consistent with the frame reconstruction.
         for c in 0..3 {
-            for y in rect.y0..rect.y1 {
-                let src = &self.recon.plane_row(c, y)[rect.x0..rect.x1];
-                plane.plane_row_mut(c, ly0 + (y - b.py0))[lx0..lx0 + (rect.x1 - rect.x0)]
-                    .copy_from_slice(src);
+            for y in 0..self.recon.ysize() {
+                let src = self.recon.plane_row(c, y);
+                plane.plane_row_mut(c, ly0 + y)[lx0..lx0 + src.len()].copy_from_slice(src);
             }
         }
         quantized[m.c][m.idx] = m.to;
         nzeros[m.c] = nzeros[m.c] + usize::from(m.to != 0) - usize::from(m.from != 0);
-        base_bits[m.c] = block_bits(
-            quantized[m.c],
-            &b.channels[m.c],
-            b.cx * b.cy,
-            nzeros[m.c],
-            prices,
-        );
+        base_bits[m.c] = m.bits;
     }
 }
 
@@ -897,11 +1239,10 @@ mod tests {
             let from = block[idx];
             let mut push = |to, direction| {
                 options.push(PolishOption {
-                    idx,
                     from,
                     to,
                     dd: ((k * 17) % 29) as f32,
-                    order: k * 2 + direction,
+                    order: (k * 2 + direction) as u16,
                 })
             };
             if from != 0 {
@@ -916,7 +1257,40 @@ mod tests {
     }
 
     #[test]
-    fn token_prefixes_preserve_full_walk_bits_for_all_shapes_and_moves() {
+    fn sparse_matrix_inverse_preserves_dense_impulse_bits() {
+        let idct = crate::dct::IdctMethods::scalar();
+        for strategy in (STRATEGY_DCT4X4..=STRATEGY_DCT8X4).chain(STRATEGY_AFV0..=STRATEGY_AFV3) {
+            let mut coeffs = [0.0; 64];
+            let mut expected = [0.0; 64];
+            let mut actual = [0.0; 64];
+            for idx in 0..64 {
+                for magnitude in [0.0, f32::from_bits(1), 1e-7, 0.03875, 127.5] {
+                    for delta in [magnitude, -magnitude] {
+                        coeffs[idx] = delta;
+                        crate::inflated_cost::reconstruct_error(
+                            &idct,
+                            strategy,
+                            &coeffs,
+                            &mut expected,
+                        );
+                        coeffs[idx] = 0.0;
+                        reconstruct_coefficient_delta(
+                            &idct,
+                            strategy,
+                            idx,
+                            delta,
+                            &mut coeffs,
+                            &mut actual,
+                        );
+                        assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_prices_preserve_full_walk_bits_for_all_shapes_and_moves() {
         let orders = crate::coeff_order::CoeffOrders::natural();
         for prefix_code in [false, true] {
             let prices = test_prices(prefix_code);
@@ -983,10 +1357,12 @@ mod tests {
                                 base.to_bits()
                             );
                             let options = pricing_options(&block, &scan, covered);
-                            let prefixes =
-                                token_prefixes(&block, &ch, covered, nzeros, &prices, &options);
+                            let (base_batched, bits) =
+                                price_options(&block, &ch, covered, nzeros, &prices, &options);
+                            assert_eq!(base_batched.to_bits(), base.to_bits());
                             for (i, option) in options.iter().enumerate() {
-                                block[option.idx] = option.to;
+                                let idx = scan[option.position()] as usize;
+                                block[idx] = option.to;
                                 let trial_nzeros =
                                     count_nonzero_except_llf(&block, cx, cy, count_nonzero_scalar);
                                 let expected = reference_block_bits(
@@ -996,16 +1372,8 @@ mod tests {
                                     trial_nzeros,
                                     &prices,
                                 );
-                                block[option.idx] = option.from;
-                                let actual = proposal_bits(
-                                    &mut block,
-                                    &ch,
-                                    covered,
-                                    nzeros,
-                                    &prices,
-                                    option,
-                                    prefixes[i],
-                                );
+                                block[idx] = option.from;
+                                let actual = bits[i];
                                 assert_eq!(
                                     actual.to_bits(),
                                     expected.to_bits(),
@@ -1016,7 +1384,7 @@ mod tests {
                             }
                             // Rebuild against a changed accepted baseline in the next round.
                             let accepted = options[0];
-                            block[accepted.idx] = accepted.to;
+                            block[scan[accepted.position()] as usize] = accepted.to;
                         }
                     }
                 }
@@ -1060,7 +1428,7 @@ mod tests {
                     let start = Instant::now();
                     for _ in 0..repeats {
                         if cached {
-                            let prefixes = token_prefixes(
+                            let (_, bits) = price_options(
                                 black_box(&block),
                                 &ch,
                                 covered,
@@ -1068,29 +1436,22 @@ mod tests {
                                 &prices,
                                 &options,
                             );
-                            for (i, option) in options.iter().enumerate() {
-                                sums[1] += black_box(proposal_bits(
-                                    black_box(&mut block),
-                                    &ch,
-                                    covered,
-                                    nzeros,
-                                    &prices,
-                                    option,
-                                    prefixes[i],
-                                ));
-                            }
+                            sums[1] += black_box(bits[..options.len()].iter().sum::<f32>());
                         } else {
+                            let mut bits = 0.0;
                             for option in &options {
-                                block[option.idx] = option.to;
-                                sums[0] += black_box(block_bits(
+                                let idx = scan[option.position()] as usize;
+                                block[idx] = option.to;
+                                bits += black_box(block_bits(
                                     black_box(&block),
                                     &ch,
                                     covered,
                                     nzeros,
                                     &prices,
                                 ));
-                                block[option.idx] = option.from;
+                                block[idx] = option.from;
                             }
+                            sums[0] += bits;
                         }
                     }
                     let time = start.elapsed().as_secs_f64();
@@ -1154,14 +1515,17 @@ mod tests {
             }),
             cfl: [0.5, 1.0, -0.25],
         };
+        let recon = Arc::new(recon);
         for c in 0..3 {
-            let mut p = CoefPolisher::new(recon.clone(), reference.state(&recon), 1.0, None);
-            p.delta_coef.resize(64, 0.0);
-            p.delta_pix.resize(64, 0.0);
-            for plane in &mut p.plane_delta {
-                plane.resize(64, 123.0);
-            }
+            let mut p = CoefPolisher::new(
+                Arc::clone(&recon),
+                reference.state(&recon),
+                1.0,
+                None,
+                ctx.add_scaled,
+            );
             let rect = p.rect(&block);
+            p.start_block(rect, (&recon, rect.x0, rect.y0));
             let selected = PolishMove {
                 c,
                 idx: 1,
@@ -1171,26 +1535,123 @@ mod tests {
             };
             assert!(p.judge_cv(&ctx, &block, rect, &selected).is_none());
             for plane in 0..3 {
-                assert_eq!(
-                    p.recon.plane(plane).as_slice(),
-                    recon.plane(plane).as_slice()
-                );
+                for y in rect.y0..rect.y1 {
+                    assert_eq!(
+                        p.recon.plane_row(plane, y - rect.y0),
+                        &recon.plane_row(plane, y)[rect.x0..rect.x1],
+                    );
+                }
             }
-            let prepared = p.plane_delta.clone();
             p.apply_plane_deltas(&block, 1.0);
             p.accept_rect(rect);
+            let mut expected_recon = recon.as_ref().clone();
             for plane in 0..3 {
                 for y in rect.y0..rect.y1 {
                     for x in rect.x0..rect.x1 {
-                        let expected = recon.plane_row(plane, y)[x]
-                            + prepared[plane][(y - block.py0) * 8 + x - block.px0];
-                        assert_eq!(p.recon.plane_row(plane, y)[x].to_bits(), expected.to_bits());
+                        let pixel = p.delta_pix[(y - block.py0) * 8 + x - block.px0];
+                        let delta = if c == 1 {
+                            0.0 + block.cfl[plane] * pixel
+                        } else if c == plane {
+                            pixel
+                        } else {
+                            0.0
+                        };
+                        let expected = recon.plane_row(plane, y)[x] + delta;
+                        assert_eq!(
+                            p.recon.plane_row(plane, y - rect.y0)[x - rect.x0].to_bits(),
+                            expected.to_bits(),
+                        );
+                        expected_recon.plane_row_mut(plane, y)[x] = expected;
                     }
                 }
             }
             assert!(p.base_d.is_finite());
-            assert!(prepared[c].iter().any(|&v| v != 0.0));
-            assert!((p.base_d - reference.deficit(&p.recon)).abs() < 1e-3);
+            assert!(p.delta_pix.iter().any(|&v| v != 0.0));
+            assert!((p.base_d - reference.deficit(&expected_recon)).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn shared_pixel_delta_preserves_forward_and_rollback_bits() {
+        let ctx = EncodingContext::default();
+        let mut baseline = Image3F::new(8, 8);
+        let samples = [0.0, -0.0, f32::from_bits(1), -f32::from_bits(1), -0.3, 0.6];
+        for c in 0..3 {
+            for (i, pixel) in baseline.plane_mut(c).as_mut_slice().iter_mut().enumerate() {
+                *pixel = samples[(i * 7 + c) % samples.len()];
+            }
+        }
+        let baseline = Arc::new(baseline);
+        let reference = crate::ssimulacra2::Ssimulacra2Reference::new(&baseline).unwrap();
+        let mut p = CoefPolisher::new(
+            Arc::clone(&baseline),
+            reference.state(&baseline),
+            1.0,
+            None,
+            ctx.add_scaled,
+        );
+        let channel = || PolishChannel {
+            source: &[],
+            inv_qm: &[],
+            q_scaled: 1.0,
+            bias: DequantBias::DEFAULT[0],
+            weight: 1.0,
+            scan: &[],
+            histo_offset: 0,
+            nzero_ctx: 0,
+        };
+        p.delta_pix
+            .extend((0..64).map(|i| samples[i % samples.len()]));
+        for (width, height) in [(8, 8), (7, 5)] {
+            for cfl in [[0.5, 1.0, -0.25], [-0.0, 1.0, 0.0]] {
+                let block = PolishBlock {
+                    raw_strategy: 0,
+                    cx: 1,
+                    cy: 1,
+                    size: 64,
+                    px0: 0,
+                    py0: 0,
+                    pw: 8,
+                    ph: 8,
+                    lambda: 1.0,
+                    channels: std::array::from_fn(|_| channel()),
+                    cfl,
+                };
+                let rect = Rect::new(0, 0, width, height);
+                p.start_block(rect, (&baseline, 0, 0));
+                let mut expected = p.recon.clone();
+                for channel in [0, 2, 1, 2, 0, 1] {
+                    p.prepared_delta = Some((channel, 0, 0, 1));
+                    for sign in [1.0, -1.0, 1.0] {
+                        p.apply_plane_deltas(&block, sign);
+                        for (c, plane) in expected.all_planes_mut().into_iter().enumerate() {
+                            for y in 0..height {
+                                let delta: Vec<_> = p.delta_pix[y * 8..y * 8 + width]
+                                    .iter()
+                                    .map(|&pixel| {
+                                        if channel == 1 && cfl[c] != 0.0 {
+                                            0.0 + cfl[c] * pixel
+                                        } else if channel != 1 && c == channel {
+                                            pixel
+                                        } else {
+                                            0.0
+                                        }
+                                    })
+                                    .collect();
+                                (p.add_scaled)(plane.row_mut(y), &delta, sign);
+                            }
+                            assert!(
+                                p.recon
+                                    .plane_data(c)
+                                    .iter()
+                                    .zip(plane.as_slice())
+                                    .all(|(&actual, &expected)| actual.to_bits()
+                                        == expected.to_bits())
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1230,7 +1691,6 @@ mod tests {
         for len in 0..=MAX_POSITIONS * 2 {
             let mut options: Vec<_> = (0..len)
                 .map(|i| PolishOption {
-                    idx: i,
                     from: 0,
                     to: 1,
                     dd: [
@@ -1241,8 +1701,13 @@ mod tests {
                         f32::INFINITY,
                         f32::NEG_INFINITY,
                         f32::NAN,
-                    ][(i * 31) % 7],
-                    order: i,
+                        -f32::NAN,
+                        f32::from_bits(0x7f80_0001),
+                        f32::from_bits(0xff80_0001),
+                        f32::from_bits(1),
+                        f32::from_bits(0x8000_0001),
+                    ][(i * 31) % 12],
+                    order: i as u16,
                 })
                 .collect();
             let mut expected = options.clone();
@@ -1255,6 +1720,71 @@ mod tests {
                 options.iter().map(|o| o.order).collect::<Vec<_>>(),
                 expected.iter().map(|o| o.order).collect::<Vec<_>>()
             );
+        }
+    }
+
+    #[test]
+    fn distortion_proposals_match_direct_dequantization() {
+        let mut actual = Vec::new();
+        for bias in DequantBias::DEFAULT
+            .into_iter()
+            .chain(DequantBias::channels(true))
+        {
+            for ideal in [-3.4, -0.25, -0.0, 0.0, 0.249, 0.25, 1.6, 17.2] {
+                for cur in (-40i32..=40).chain([-32768, 32768]) {
+                    actual.clear();
+                    push_distortion_options(&mut actual, bias, 0.37, cur, ideal, 17);
+                    let mut expected = Vec::new();
+                    if cur != 0 {
+                        expected.extend([cur - cur.signum(), cur + cur.signum()]);
+                    } else if ideal.abs() >= RESTORE_MIN {
+                        expected.push(if ideal > 0.0 { 1 } else { -1 });
+                    }
+                    assert_eq!(actual.len(), expected.len());
+                    let base = (ideal - bias.level(cur)).powi(2);
+                    for (i, (&to, proposal)) in expected.iter().zip(&actual).enumerate() {
+                        let dd = 0.37 * ((ideal - bias.level(to)).powi(2) - base);
+                        assert_eq!(proposal.order, 17 + i as u16);
+                        assert_eq!((proposal.from, proposal.to), (cur, to));
+                        assert_eq!(proposal.dd.to_bits(), dd.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn priced_top_moves_preserve_stable_total_order() {
+        let values = [
+            f32::NAN,
+            -0.0,
+            0.0,
+            -1.0,
+            1.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        for len in 0..=PRICE_CAP {
+            let input: Vec<_> = (0..len)
+                .map(|idx| PolishMove {
+                    idx,
+                    proxy: values[(idx * 3) % values.len()],
+                    ..PolishMove::default()
+                })
+                .collect();
+            let mut sorted = input.clone();
+            sorted.sort_by(|a, b| a.proxy.total_cmp(&b.proxy));
+            for cap in 1..=PER_CHANNEL {
+                let mut kept = [PolishMove::default(); PER_CHANNEL];
+                let mut len = 0;
+                for &m in &input {
+                    insert_priced_move(&mut kept[..cap], &mut len, m);
+                }
+                assert_eq!(len, sorted.len().min(cap));
+                for (actual, expected) in kept[..len].iter().zip(&sorted) {
+                    assert_eq!(actual.idx, expected.idx);
+                }
+            }
         }
     }
 

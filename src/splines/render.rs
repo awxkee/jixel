@@ -256,7 +256,7 @@ impl RenderPlan {
         if (!quantized || !template.empty) && left < right && top < bottom {
             plan.bounds = Some((left, top, right - 1, bottom - 1));
             plan.dot = Some(DotPlacement {
-                add_scaled: ctx.spline_kernels.add_scaled_f32,
+                add_scaled: ctx.add_scaled,
                 template,
                 x0,
                 y0,

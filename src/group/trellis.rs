@@ -37,7 +37,9 @@ use crate::ac_context::{
 };
 use crate::entropy::{FrozenTokenPrices, Token, pack_signed};
 use crate::image::Image3F;
-use crate::util::{FastRound, HeapMatrix, heap_array};
+use crate::util::FastRound;
+#[cfg(test)]
+use crate::util::heap_array;
 
 const RDOQ_MAX_STRIDE: usize = 2 * (256 + 1);
 
@@ -274,12 +276,12 @@ pub(super) fn rdoq_block(
     lambda: f32,
     restore_penalty: f32,
     search: RdoqSearch,
-    choices: &mut [u8; RDOQ_MAX_CHOICES],
-    costs: &mut [[f32; RDOQ_MAX_STRIDE]; 2],
+    scratch: &mut RdoqScratch,
 ) {
     let covered_blocks = cx * cy;
     let (window_cap, restore_len) = rdoq_window_len(covered_blocks);
     if search == RdoqSearch::Beam {
+        let choices = scratch.choices(window_cap * (2 * RDOQ_BEAM_WIDTH));
         rdoq_block_beam::<RDOQ_BEAM_WIDTH>(
             channel_weight,
             window_cap,
@@ -331,6 +333,7 @@ pub(super) fn rdoq_block(
     // The 128 family always takes the banded trellis: the full DP grows with
     // a block's nonzero count, thousands of states over 16384 coefficients.
     let legacy_limit = window_cap <= 64 && !crate::dc_group_data::is_128_strategy(raw_strategy);
+    let (choices, costs) = scratch.trellis(window_cap);
     // Factor level selection over shared count contexts. Specialize the
     // single-block path so its context arithmetic folds to the 8x8 case;
     // retain the unfactored DP below as a bit-exact test oracle.
@@ -534,7 +537,7 @@ fn rdoq_block_beam<const K: usize>(
     qf_hi: bool,
     lambda: f32,
     restore_penalty: f32,
-    back: &mut [u8; RDOQ_MAX_CHOICES],
+    back: &mut [u8],
 ) {
     const { assert!(K <= 8) };
     let covered_blocks = cx * cy;
@@ -773,8 +776,8 @@ fn rdoq_block_banded<const FACTORED: bool, const SINGLE_BLOCK: bool>(
     qf_hi: bool,
     lambda: f32,
     restore_penalty: f32,
-    choices: &mut [u8; RDOQ_MAX_CHOICES],
-    costs: &mut [[f32; RDOQ_MAX_STRIDE]; 2],
+    choices: &mut [u8],
+    costs: &mut [[f32; RDOQ_BAND_STRIDE]; 2],
 ) {
     const MAX_NZERO_DELTA: usize = RDOQ_MAX_NZERO_DELTA;
     const BAND_STRIDE: usize = RDOQ_BAND_STRIDE;
@@ -1189,17 +1192,33 @@ pub(crate) fn chroma_rdoq_weight(distance: f32) -> f32 {
     CHROMA_RDOQ_WEIGHT_HQ + t * (1.0 - CHROMA_RDOQ_WEIGHT_HQ)
 }
 
+#[derive(Default)]
 pub(super) struct RdoqScratch {
-    pub(super) choices: Box<[u8; RDOQ_MAX_CHOICES]>,
-    pub(super) costs: HeapMatrix<f32, 2, RDOQ_MAX_STRIDE>,
+    // One choice row per scan position, sized for the largest active search.
+    pub(super) choices: Box<[u8]>,
+    // Only the banded trellis reads these alternating cost rows.
+    pub(super) costs: Option<Box<[[f32; RDOQ_BAND_STRIDE]; 2]>>,
 }
 
-impl Default for RdoqScratch {
-    fn default() -> Self {
-        Self {
-            choices: heap_array(u8::MAX),
-            costs: HeapMatrix::new(f32::INFINITY),
-        }
+impl RdoqScratch {
+    fn choices(&mut self, len: usize) -> &mut [u8] {
+        grow_choices(&mut self.choices, len);
+        &mut self.choices[..len]
+    }
+
+    fn trellis(&mut self, window_len: usize) -> (&mut [u8], &mut [[f32; RDOQ_BAND_STRIDE]; 2]) {
+        let len = window_len * RDOQ_BAND_STRIDE;
+        grow_choices(&mut self.choices, len);
+        let costs = self
+            .costs
+            .get_or_insert_with(|| Box::new([[f32::INFINITY; RDOQ_BAND_STRIDE]; 2]));
+        (&mut self.choices[..len], costs)
+    }
+}
+
+fn grow_choices(choices: &mut Box<[u8]>, len: usize) {
+    if choices.len() < len {
+        *choices = vec![u8::MAX; len].into_boxed_slice();
     }
 }
 
@@ -1352,8 +1371,8 @@ mod tests {
         let prices = FrozenTokenPrices::new(&code);
         let orders = crate::coeff_order::CoeffOrders::natural();
         let run = |cap: usize, cx: usize, source: &[f32], scan: &[u32], block: &mut [i32]| {
-            let mut choices = super::heap_array(0xA5);
-            let mut costs = Box::new([[f32::NAN; super::RDOQ_MAX_STRIDE]; 2]);
+            let mut choices = super::heap_array::<_, { super::RDOQ_MAX_CHOICES }>(0xA5);
+            let mut costs = Box::new([[f32::NAN; super::RDOQ_BAND_STRIDE]; 2]);
             let inv_qm = vec![1.; block.len()];
             let refine = if cx == 1 {
                 super::rdoq_block_banded::<true, true>
@@ -1386,7 +1405,7 @@ mod tests {
                 false,
                 0.1,
                 2.,
-                &mut choices,
+                choices.as_mut_slice(),
                 &mut costs,
             );
         };
@@ -1548,8 +1567,10 @@ mod tests {
             .collect();
         let prices = FrozenTokenPrices::new(&code);
         let orders = crate::coeff_order::CoeffOrders::natural();
-        let mut choices = super::heap_array(0xA5u8);
-        let mut costs = Box::new([[f32::NAN; super::RDOQ_MAX_STRIDE]; 2]);
+        let mut reused = super::RdoqScratch {
+            choices: vec![0xA5; super::RDOQ_MAX_CHOICES].into_boxed_slice(),
+            costs: Some(Box::new([[f32::NAN; super::RDOQ_BAND_STRIDE]; 2])),
+        };
         let mut seed = 73u32;
         let mut random = || {
             seed ^= seed << 13;
@@ -1595,9 +1616,13 @@ mod tests {
             let original: Vec<i32> = source.iter().map(|v| v.round() as i32).collect();
             let mut expected = original.clone();
             let mut actual = original.clone();
-            let mut fresh_choices = super::heap_array(u8::MAX);
-            let mut fresh_costs = Box::new([[f32::INFINITY; super::RDOQ_MAX_STRIDE]; 2]);
-            let run = |block: &mut [i32], choices: &mut _, costs: &mut _| {
+            let search = [
+                super::RdoqSearch::Trellis,
+                super::RdoqSearch::Beam,
+                super::RdoqSearch::Greedy,
+            ][case % 3];
+            let mut fresh = super::RdoqScratch::default();
+            let run = |block: &mut [i32], scratch: &mut super::RdoqScratch| {
                 super::rdoq_block(
                     super::rdoq_channel_weights(coding)[c],
                     &prices,
@@ -1617,13 +1642,20 @@ mod tests {
                     case % 2 == 0,
                     super::rdoq_lambda(crate::Arbiter::Ssimulacra2, [0.5, 1.0, 1.2, 2.0][case % 4]),
                     1.0,
-                    super::RdoqSearch::Trellis,
-                    choices,
-                    costs,
+                    search,
+                    scratch,
                 );
             };
-            run(&mut expected, &mut fresh_choices, &mut fresh_costs);
-            run(&mut actual, &mut choices, &mut costs);
+            run(&mut expected, &mut fresh);
+            run(&mut actual, &mut reused);
+            let (window, _) = super::rdoq_window_len(cx * cy);
+            let stride = match search {
+                super::RdoqSearch::Greedy => 0,
+                super::RdoqSearch::Beam => 2 * super::RDOQ_BEAM_WIDTH,
+                super::RdoqSearch::Trellis => super::RDOQ_BAND_STRIDE,
+            };
+            assert_eq!(fresh.choices.len(), window * stride);
+            assert_eq!(fresh.costs.is_some(), search == super::RdoqSearch::Trellis);
             assert_eq!(actual, expected, "scratch reuse in case {case}");
             changed += usize::from(actual != original);
         }
@@ -1667,9 +1699,9 @@ mod tests {
             .collect();
         let prices = FrozenTokenPrices::new(&code);
         let orders = crate::coeff_order::CoeffOrders::natural();
-        let mut choices0 = super::heap_array(0xA5u8);
-        let mut choices1 = super::heap_array(0xA5u8);
-        let mut costs0 = Box::new([[f32::NAN; super::RDOQ_MAX_STRIDE]; 2]);
+        let mut choices0 = super::heap_array::<_, { super::RDOQ_MAX_CHOICES }>(0xA5u8);
+        let mut choices1 = super::heap_array::<_, { super::RDOQ_MAX_CHOICES }>(0xA5u8);
+        let mut costs0 = Box::new([[f32::NAN; super::RDOQ_BAND_STRIDE]; 2]);
         let mut costs1 = costs0.clone();
         let mut seed = 173u32;
         let mut random = || {
@@ -1755,8 +1787,8 @@ mod tests {
                         costs,
                     );
                 };
-                run(false, &mut expected, &mut choices0, &mut costs0);
-                run(true, &mut actual, &mut choices1, &mut costs1);
+                run(false, &mut expected, choices0.as_mut_slice(), &mut costs0);
+                run(true, &mut actual, choices1.as_mut_slice(), &mut costs1);
                 assert_eq!(actual, expected, "coefficients, case={case}, cap={cap}");
                 assert_eq!(
                     choices0.as_slice(),
@@ -1799,9 +1831,9 @@ mod tests {
             #[cfg(feature = "extraslow")]
             (STRATEGY_DCT128X128, 16, 16),
         ];
-        let mut choices0 = super::heap_array(0xA5);
-        let mut choices1 = super::heap_array(0xA5);
-        let mut costs0 = Box::new([[f32::from_bits(0x7fc0_1234); super::RDOQ_MAX_STRIDE]; 2]);
+        let mut choices0 = super::heap_array::<_, { super::RDOQ_MAX_CHOICES }>(0xA5);
+        let mut choices1 = super::heap_array::<_, { super::RDOQ_MAX_CHOICES }>(0xA5);
+        let mut costs0 = Box::new([[f32::from_bits(0x7fc0_1234); super::RDOQ_BAND_STRIDE]; 2]);
         let mut costs1 = costs0.clone();
         let mut single_zero = 0;
         let mut single_nonzero = 0;
@@ -1884,8 +1916,8 @@ mod tests {
                 };
                 let mut expected = original.clone();
                 let mut actual = original.clone();
-                run(false, &mut expected, &mut choices0, &mut costs0);
-                run(true, &mut actual, &mut choices1, &mut costs1);
+                run(false, &mut expected, choices0.as_mut_slice(), &mut costs0);
+                run(true, &mut actual, choices1.as_mut_slice(), &mut costs1);
                 assert_eq!(
                     actual, expected,
                     "levels, case={case}, restore={restore_len}"
@@ -1934,9 +1966,9 @@ mod tests {
                 expected[idx as usize] = 1;
             }
             let mut actual = expected;
-            let mut choices0 = super::heap_array(0xA5);
-            let mut choices1 = super::heap_array(0xA5);
-            let mut costs0 = Box::new([[f32::NAN; super::RDOQ_MAX_STRIDE]; 2]);
+            let mut choices0 = super::heap_array::<_, { super::RDOQ_MAX_CHOICES }>(0xA5);
+            let mut choices1 = super::heap_array::<_, { super::RDOQ_MAX_CHOICES }>(0xA5);
+            let mut costs0 = Box::new([[f32::NAN; super::RDOQ_BAND_STRIDE]; 2]);
             let mut costs1 = costs0.clone();
             let run = |factored, block: &mut [i32], choices: &mut _, costs: &mut _| {
                 let refine = if factored {
@@ -1969,8 +2001,8 @@ mod tests {
                     costs,
                 );
             };
-            run(false, &mut expected, &mut choices0, &mut costs0);
-            run(true, &mut actual, &mut choices1, &mut costs1);
+            run(false, &mut expected, choices0.as_mut_slice(), &mut costs0);
+            run(true, &mut actual, choices1.as_mut_slice(), &mut costs1);
             assert_eq!(actual, expected);
             assert_eq!(choices0.as_slice(), choices1.as_slice());
             for (&a, &b) in costs0.iter().flatten().zip(costs1.iter().flatten()) {

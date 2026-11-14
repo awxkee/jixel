@@ -52,7 +52,9 @@ const SIDE: usize = TILE;
 const CACHE_SIZE: usize = crate::dc_group_data::NUM_STRATEGIES * TILE * TILE;
 const AXIS_INTERVALS: usize = SIDE * (SIDE + 1) / 2;
 const REGION_COUNT: usize = AXIS_INTERVALS * AXIS_INTERVALS;
-const LINE_COUNT: usize = SIDE * (SIDE + 1) * (SIDE + 1);
+// Each end column has one entry for each possible start, including itself.
+const LINE_INTERVALS: usize = (SIDE + 1) * (SIDE + 2) / 2;
+const LINE_COUNT: usize = SIDE * LINE_INTERVALS;
 /// The 400 grid placements plus at most two incumbent 64-family blocks.
 const MAX_CANDIDATES: usize = 402;
 /// Tile-grid offsets, in blocks, of the re-tiling passes that follow the
@@ -131,6 +133,15 @@ impl Piece {
     fn key(self) -> usize {
         self.strategy as usize * 64 + self.y as usize * 8 + self.x as usize
     }
+    fn mask(self, stride: usize) -> u64 {
+        let row = (1u64 << self.width()) - 1;
+        let offset = self.y as usize * stride + self.x as usize;
+        let mut mask = 0;
+        for y in 0..self.height() {
+            mask |= row << (offset + y * stride);
+        }
+        mask
+    }
     #[cfg(test)]
     fn shifted32(self) -> bool {
         matches!(
@@ -144,18 +155,24 @@ impl Piece {
 #[derive(Clone, Copy, Debug)]
 struct Candidate {
     piece: Piece,
-    width: usize,
-    height: usize,
+    width: u8,
+    height: u8,
     cost: f64,
 }
 impl Candidate {
     fn new(piece: Piece, cost: f64) -> Self {
         Self {
             piece,
-            width: piece.width(),
-            height: piece.height(),
+            width: piece.width() as u8,
+            height: piece.height() as u8,
             cost,
         }
+    }
+    fn width(self) -> usize {
+        usize::from(self.width)
+    }
+    fn height(self) -> usize {
+        usize::from(self.height)
     }
     fn x(self) -> usize {
         self.piece.x as usize
@@ -165,14 +182,10 @@ impl Candidate {
     }
 }
 
-// A tile has at most MAX_CANDIDATES pieces and cuts are at most SIDE - 1.
-// Narrow payloads leave each f64 cost and its backpointer in 16 bytes.
 #[derive(Clone, Copy, Debug)]
 enum Choice {
     None,
     Tile(u16),
-    Vertical(u16),
-    Horizontal(u16),
     Fallback,
 }
 #[derive(Clone, Copy, Debug)]
@@ -218,13 +231,22 @@ impl<V: Copy + Default> Default for OpenTable<V> {
 }
 
 impl<V: Copy + Default> OpenTable<V> {
-    fn resize(&mut self, capacity: usize) {
-        debug_assert!(capacity.is_power_of_two());
-        self.keys = vec![0; capacity];
-        self.stamps = vec![0; capacity];
-        self.values = vec![V::default(); capacity];
+    fn grow(&mut self) {
+        let capacity = (self.keys.len() * 2).max(128);
+        // Rehash directly from the old buffers, copying only this generation.
+        let old_keys = std::mem::replace(&mut self.keys, vec![0; capacity]);
+        let old_stamps = std::mem::replace(&mut self.stamps, vec![0; capacity]);
+        let old_values = std::mem::replace(&mut self.values, vec![V::default(); capacity]);
         self.shift = 32 - capacity.trailing_zeros();
-        self.len = 0;
+        for ((key, stamp), value) in old_keys.into_iter().zip(old_stamps).zip(old_values) {
+            if stamp != self.generation {
+                continue;
+            }
+            let (slot, _) = self.slot(key);
+            self.keys[slot] = key;
+            self.stamps[slot] = stamp;
+            self.values[slot] = value;
+        }
     }
 
     fn clear(&mut self) {
@@ -263,20 +285,13 @@ impl<V: Copy + Default> OpenTable<V> {
 
     fn insert(&mut self, key: u32, value: V) {
         if self.keys.is_empty() {
-            self.resize(1 << 12);
+            self.grow();
         }
-        let (slot, found) = self.slot(key);
+        let (mut slot, found) = self.slot(key);
         if !found {
             if (self.len + 1) * 2 > self.keys.len() {
-                let live: Vec<(u32, V)> = (0..self.keys.len())
-                    .filter(|&i| self.stamps[i] == self.generation)
-                    .map(|i| (self.keys[i], self.values[i]))
-                    .collect();
-                self.resize(self.keys.len() * 2);
-                for (key, value) in live {
-                    self.insert(key, value);
-                }
-                return self.insert(key, value);
+                self.grow();
+                slot = self.slot(key).0;
             }
             self.keys[slot] = key;
             self.stamps[slot] = self.generation;
@@ -295,7 +310,9 @@ impl Default for Memo {
 #[derive(Default)]
 struct PlannerScratch {
     memo: OpenTable<Memo>,
-    regions: Vec<Entry>,
+    // Cut scans read the costs without loading the backpointers.
+    region_costs: Vec<f64>,
+    region_choices: Vec<u16>,
     anchors: Vec<Vec<usize>>,
     columns: [[f64; SIDE + 1]; SIDE],
     rows: Vec<f64>,
@@ -313,7 +330,7 @@ fn region_index(x: usize, y: usize, w: usize, h: usize) -> usize {
     axis(y, h) * AXIS_INTERVALS + axis(x, w)
 }
 fn line_index(y: usize, start: usize, end: usize) -> usize {
-    (y * (SIDE + 1) + start) * (SIDE + 1) + end
+    y * LINE_INTERVALS + end * (end + 1) / 2 + start
 }
 fn profile_key(profile: [u8; SIDE]) -> u32 {
     profile
@@ -330,7 +347,7 @@ fn first_open(profile: [u8; SIDE], width: usize) -> (usize, usize) {
     (x, y as usize)
 }
 fn advance(mut profile: [u8; SIDE], c: Candidate) -> [u8; SIDE] {
-    profile[c.x()..c.x() + c.width].fill((c.y() + c.height) as u8);
+    profile[c.x()..c.x() + c.width()].fill((c.y() + c.height()) as u8);
     profile
 }
 
@@ -346,65 +363,83 @@ fn add_lower(a: f64, b: f64) -> f64 {
     if error < 0.0 { sum.next_down() } else { sum }
 }
 
-fn prepare_regions(candidates: &[Candidate], width: usize, height: usize, s: &mut PlannerScratch) {
+// A zero backpointer means no choice. Tile IDs are stored plus one, followed
+// by the two ranges for vertical and horizontal cut positions.
+const REGION_LAST_TILE: u16 = MAX_CANDIDATES as u16;
+const REGION_VERTICAL_BASE: u16 = REGION_LAST_TILE;
+const REGION_HORIZONTAL_BASE: u16 = REGION_VERTICAL_BASE + SIDE as u16;
+
+fn prepare_regions(
+    candidates: &[Candidate],
+    width: usize,
+    height: usize,
+    max_side: usize,
+    short_side: usize,
+    s: &mut PlannerScratch,
+) {
     debug_assert!(candidates.len() <= MAX_CANDIDATES);
-    s.regions.clear();
-    s.regions.resize(REGION_COUNT, EMPTY);
+    s.region_costs.clear();
+    s.region_costs.resize(REGION_COUNT, f64::INFINITY);
+    s.region_choices.clear();
+    s.region_choices.resize(REGION_COUNT, 0);
     for (i, &c) in candidates.iter().enumerate() {
         if !c.cost.is_finite() {
             continue;
         }
-        let r = &mut s.regions[region_index(c.x(), c.y(), c.width, c.height)];
-        if c.cost < r.cost {
-            *r = Entry {
-                cost: c.cost,
-                choice: Choice::Tile(i as u16),
-            };
+        let index = region_index(c.x(), c.y(), c.width(), c.height());
+        if c.cost < s.region_costs[index] {
+            s.region_costs[index] = c.cost;
+            s.region_choices[index] = 1 + i as u16;
         }
     }
     assert!(width <= SIDE && height <= SIDE);
-    let regions = &mut s.regions[..REGION_COUNT];
+    let regions = &mut s.region_costs[..REGION_COUNT];
+    let choices = &mut s.region_choices[..REGION_COUNT];
     // SAFETY: every region read or written below lies inside the
     // width x height <= SIDE x SIDE tile, so region_index < REGION_COUNT.
-    let cost_of = |regions: &[Entry], x, y, w, h| unsafe {
-        regions.get_unchecked(region_index(x, y, w, h)).cost
-    };
-    for h in 1..=height {
-        for w in 1..=width {
+    let cost_of =
+        |regions: &[f64], x, y, w, h| unsafe { *regions.get_unchecked(region_index(x, y, w, h)) };
+    for h in 1..=height.min(max_side) {
+        let max_width = if h <= short_side {
+            max_side
+        } else {
+            short_side
+        };
+        for w in 1..=width.min(max_width) {
             for y in 0..=height - h {
                 for x in 0..=width - w {
                     let slot = region_index(x, y, w, h);
                     // SAFETY: as above.
                     let mut best = unsafe { *regions.get_unchecked(slot) };
+                    let mut choice = unsafe { *choices.get_unchecked(slot) };
                     for cut in 1..w {
                         let cost = cost_of(regions, x, y, cut, h)
                             + cost_of(regions, x + cut, y, w - cut, h);
-                        if cost < best.cost {
-                            best = Entry {
-                                cost,
-                                choice: Choice::Vertical(cut as u16),
-                            };
+                        if cost < best {
+                            best = cost;
+                            choice = REGION_VERTICAL_BASE + cut as u16;
                         }
                     }
                     for cut in 1..h {
                         let cost = cost_of(regions, x, y, w, cut)
                             + cost_of(regions, x, y + cut, w, h - cut);
-                        if cost < best.cost {
-                            best = Entry {
-                                cost,
-                                choice: Choice::Horizontal(cut as u16),
-                            };
+                        if cost < best {
+                            best = cost;
+                            choice = REGION_HORIZONTAL_BASE + cut as u16;
                         }
                     }
                     // SAFETY: as above.
-                    unsafe { *regions.get_unchecked_mut(slot) = best };
+                    unsafe {
+                        *regions.get_unchecked_mut(slot) = best;
+                        *choices.get_unchecked_mut(slot) = choice;
+                    }
                 }
             }
         }
     }
 }
 
-fn entering_column(objective: &[f64]) -> Option<usize> {
+fn entering_column(objective: &[f64], column_ids: &[u16]) -> Option<usize> {
     const LIMIT: f64 = -1e-10;
     let (quads, tail) = objective.as_chunks::<4>();
     let mut minima = [LIMIT; 4];
@@ -417,13 +452,20 @@ fn entering_column(objective: &[f64]) -> Option<usize> {
     for &value in tail {
         reduced = reduced.min(value);
     }
-    // Only costs strictly below LIMIT can enter. Look up the first
-    // occurrence of the minimum to preserve the original pivot on ties.
-    if reduced < LIMIT {
-        objective.iter().position(|&value| value == reduced)
-    } else {
-        None
+    // Only costs strictly below LIMIT can enter. Break ties by the original
+    // column order even after pivots have exchanged the stored columns.
+    if reduced >= LIMIT {
+        return None;
     }
+    let mut best = None;
+    let mut best_id = u16::MAX;
+    for (i, (&value, &id)) in objective.iter().zip(column_ids).enumerate() {
+        if value == reduced && id < best_id {
+            best = Some(i);
+            best_id = id;
+        }
+    }
+    best
 }
 
 // A fractional packing maximizes savings over the best all-leaf tiling.
@@ -440,7 +482,7 @@ fn prepare_packing_bound(
     let cells = width * height;
     let mut leaves = [f64::INFINITY; SIDE * SIDE];
     for &c in candidates {
-        if c.width == 1 && c.height == 1 && c.cost.is_finite() {
+        if c.width() == 1 && c.height() == 1 && c.cost.is_finite() {
             let i = c.y() * width + c.x();
             leaves[i] = leaves[i].min(c.cost);
         }
@@ -451,15 +493,19 @@ fn prepare_packing_bound(
     if leaves[..cells].iter().any(|x| !x.is_finite()) {
         return;
     }
-    let mut variables = Vec::new();
+    // Candidate IDs seed the tableau, then the same slots hold simplex
+    // column IDs. The bounded tile sizes keep both sets of IDs in u16.
+    let mut column_ids = [0u16; MAX_CANDIDATES];
+    let mut benefits = [0.0f64; MAX_CANDIDATES];
+    let mut n = 0;
     for (k, &c) in candidates.iter().enumerate() {
-        if !c.cost.is_finite() || c.width * c.height == 1 {
+        if !c.cost.is_finite() || c.width() * c.height() == 1 {
             continue;
         }
         let mut baseline = 0.0;
         let mut baseline_upper = 0.0;
-        for y in c.y()..c.y() + c.height {
-            for x in c.x()..c.x() + c.width {
+        for y in c.y()..c.y() + c.height() {
+            for x in c.x()..c.x() + c.width() {
                 baseline += leaves[y * width + x];
                 baseline_upper = -add_lower(-baseline_upper, -leaves[y * width + x]);
             }
@@ -467,31 +513,35 @@ fn prepare_packing_bound(
         if c.cost >= baseline_upper {
             s.dominated[k] = true;
         } else {
-            variables.push((k, baseline - c.cost));
+            column_ids[n] = k as u16;
+            benefits[n] = baseline - c.cost;
+            n += 1;
         }
     }
-    let n = variables.len();
-    let cols = n + cells + 1;
+    // Basic columns are identity vectors. Store only the nonbasic columns
+    // and exchange entering/leaving column IDs after each pivot.
+    let cols = n + 1;
     let rows = cells + 1;
     let objective = cells * cols;
     s.tableau.clear();
     s.tableau.resize(rows * cols, 0.0);
-    let mut basis: [usize; SIDE * SIDE] = std::array::from_fn(|row| n + row);
-    for (v, &(k, benefit)) in variables.iter().enumerate() {
-        let c = candidates[k];
-        for y in c.y()..c.y() + c.height {
-            for x in c.x()..c.x() + c.width {
+    let mut basis: [u16; SIDE * SIDE] = std::array::from_fn(|row| (n + row) as u16);
+    let nonbasic = &mut column_ids[..n];
+    for (v, (id, &benefit)) in nonbasic.iter_mut().zip(&benefits).enumerate() {
+        let c = candidates[usize::from(*id)];
+        *id = v as u16;
+        for y in c.y()..c.y() + c.height() {
+            for x in c.x()..c.x() + c.width() {
                 s.tableau[(y * width + x) * cols + v] = 1.0;
             }
         }
         s.tableau[objective + v] = -benefit;
     }
     for row in 0..cells {
-        s.tableau[row * cols + n + row] = 1.0;
         s.tableau[row * cols + cols - 1] = 1.0;
     }
     for _ in 0..PIVOTS {
-        let Some(enter) = entering_column(&s.tableau[objective..objective + cols - 1]) else {
+        let Some(enter) = entering_column(&s.tableau[objective..objective + n], nonbasic) else {
             break;
         };
         let mut leave = None;
@@ -517,39 +567,50 @@ fn prepare_packing_bound(
         let (above, rest) = s.tableau[..rows * cols].split_at_mut(leave * cols);
         let (pivot_row, below) = rest.split_at_mut(cols);
         let pivot = pivot_row[enter];
-        for v in pivot_row.iter_mut() {
-            *v /= pivot;
+        // Unit pivots leave every entry of the pivot row unchanged.
+        if pivot != 1.0 {
+            for v in pivot_row.iter_mut() {
+                *v /= pivot;
+            }
         }
-        pivot_row[enter] = 1.0;
+        // The entering column takes the place of the leaving basis column.
+        // Before this pivot that column had 1 in the pivot row and 0 elsewhere.
+        pivot_row[enter] = 1.0 / pivot;
         let pivot_row = &*pivot_row;
         let mut changed = above
             .chunks_exact_mut(cols)
             .chain(below.chunks_exact_mut(cols))
-            .filter(|row| row[enter] != 0.0);
-        while let Some(row) = changed.next() {
-            let factor = row[enter];
-            if let Some(next) = changed.next() {
+            .filter_map(|row| {
+                let factor = row[enter];
+                row[enter] = 0.0;
+                (factor != 0.0).then_some((row, factor))
+            });
+        while let Some((row, factor)) = changed.next() {
+            if let Some((next, next_factor)) = changed.next() {
                 // Both rows read the same immutable pivot. Loading it once
                 // preserves each element's multiply and subtraction.
-                let next_factor = next[enter];
                 for ((v, n), &p) in row.iter_mut().zip(next.iter_mut()).zip(pivot_row) {
                     *v -= factor * p;
                     *n -= next_factor * p;
                 }
-                next[enter] = 0.0;
             } else {
                 for (v, &p) in row.iter_mut().zip(pivot_row) {
                     *v -= factor * p;
                 }
             }
-            row[enter] = 0.0;
         }
-        basis[leave] = enter;
+        std::mem::swap(&mut basis[leave], &mut nonbasic[enter]);
     }
     let mut potentials = [0.0; SIDE * SIDE];
     for i in 0..cells {
-        let price = s.tableau[objective + n + i].max(0.0);
-        potentials[i] = leaves[i] - price;
+        potentials[i] = leaves[i] - 0.0;
+    }
+    for (i, &column) in nonbasic.iter().enumerate() {
+        let column = usize::from(column);
+        if column >= n {
+            let cell = column - n;
+            potentials[cell] = leaves[cell] - s.tableau[objective + i].max(0.0);
+        }
     }
     if potentials[..cells].iter().any(|x| !x.is_finite()) {
         return;
@@ -561,8 +622,8 @@ fn prepare_packing_bound(
             continue;
         }
         let mut sum = 0.0;
-        for y in c.y()..c.y() + c.height {
-            for x in c.x()..c.x() + c.width {
+        for y in c.y()..c.y() + c.height() {
+            for x in c.x()..c.x() + c.width() {
                 sum = -add_lower(-sum, -potentials[y * width + x]);
             }
         }
@@ -586,7 +647,10 @@ fn prepare_bounds(candidates: &[Candidate], width: usize, height: usize, s: &mut
     // cost across its width. Ignoring agreement between columns can only lower
     // the optimum. Repeat horizontally with cost divided by height; either
     // relaxation bounds every legal completion, so their maximum is valid.
-    let mut vertical = [[[f64::INFINITY; SIDE + 1]; SIDE + 1]; SIDE];
+    // Every transform side is a power of two. Store those lengths in
+    // ascending order, omitting the other lengths' permanently empty edges.
+    const EDGE_LENGTHS: usize = SIDE.ilog2() as usize + 1;
+    let mut vertical = [[[f64::INFINITY; EDGE_LENGTHS]; SIDE]; SIDE];
     let mut horizontal = vertical;
     for &c in candidates {
         if !c.cost.is_finite() {
@@ -594,19 +658,29 @@ fn prepare_bounds(candidates: &[Candidate], width: usize, height: usize, s: &mut
         }
         // Widths and heights are powers of two, so f32 candidate costs can be
         // divided exactly after promotion to f64.
-        for column in vertical.iter_mut().skip(c.x()).take(c.width) {
-            column[c.y()][c.height] = column[c.y()][c.height].min(c.cost / c.width as f64);
+        let width_class = c.width().trailing_zeros() as usize;
+        let height_class = c.height().trailing_zeros() as usize;
+        let vertical_cost = c.cost / c.width() as f64;
+        let horizontal_cost = c.cost / c.height() as f64;
+        for column in &mut vertical[c.x()..c.x() + c.width()] {
+            let edge = &mut column[c.y()][height_class];
+            *edge = edge.min(vertical_cost);
         }
-        for row in horizontal.iter_mut().skip(c.y()).take(c.height) {
-            row[c.x()][c.width] = row[c.x()][c.width].min(c.cost / c.height as f64);
+        for row in &mut horizontal[c.y()..c.y() + c.height()] {
+            let edge = &mut row[c.x()][width_class];
+            *edge = edge.min(horizontal_cost);
         }
     }
     for (x, edges) in vertical.iter().enumerate().take(width) {
         s.columns[x].fill(f64::INFINITY);
         s.columns[x][height] = 0.0;
         for y in (0..height).rev() {
-            for h in 1..=height - y {
-                s.columns[x][y] = s.columns[x][y].min(add_lower(edges[y][h], s.columns[x][y + h]));
+            for (power, &edge) in edges[y].iter().enumerate() {
+                let end = y + (1 << power);
+                if end > height {
+                    break;
+                }
+                s.columns[x][y] = s.columns[x][y].min(add_lower(edge, s.columns[x][end]));
             }
         }
     }
@@ -616,42 +690,61 @@ fn prepare_bounds(candidates: &[Candidate], width: usize, height: usize, s: &mut
     let rows = &mut s.rows[..LINE_COUNT];
     for (y, edges) in horizontal.iter().enumerate().take(height) {
         for end in 0..=width {
-            // SAFETY: y < SIDE and every start <= end <= width <= SIDE, so
-            // each line_index below is under LINE_COUNT.
-            unsafe { *rows.get_unchecked_mut(line_index(y, end, end)) = 0.0 };
+            let base = line_index(y, 0, end);
+            let intervals = &mut rows[base..=base + end];
+            intervals[end] = 0.0;
             for x in (0..end).rev() {
                 let mut best = f64::INFINITY;
-                for (w, &edge) in edges[x].iter().enumerate().take(end - x + 1).skip(1) {
-                    // SAFETY: as above, with start = x + w <= end.
-                    let tail = unsafe { *rows.get_unchecked(line_index(y, x + w, end)) };
-                    best = best.min(add_lower(edge, tail));
+                for (power, &edge) in edges[x].iter().enumerate() {
+                    let next = x + (1 << power);
+                    if next > end {
+                        break;
+                    }
+                    best = best.min(add_lower(edge, intervals[next]));
                 }
-                // SAFETY: as above.
-                unsafe { *rows.get_unchecked_mut(line_index(y, x, end)) = best };
+                intervals[x] = best;
             }
         }
     }
 }
+
+// Store the first run's triangular-table offset in the low six bits and
+// the remaining open cells in the high bits.
+const ROW_RUNS: [u16; 1 << SIDE] = {
+    let mut runs = [0; 1 << SIDE];
+    let mut mask = 1usize;
+    while mask < 1 << SIDE {
+        let start = mask.trailing_zeros() as usize;
+        let end = start + (mask >> start).trailing_ones() as usize;
+        let offset = end * (end + 1) / 2 + start;
+        runs[mask] = ((mask & (usize::MAX << end)) << 6 | offset) as u16;
+        mask += 1;
+    }
+    runs
+};
 
 fn lower_bound(profile: [u8; SIDE], width: usize, height: usize, s: &PlannerScratch) -> f64 {
     let mut columns = 0.0;
     for (x, &y) in profile.iter().enumerate().take(width) {
         columns = add_lower(columns, s.columns[x][y as usize]);
     }
+    let lanes = u64::from_le_bytes(profile);
+    // Bit 7 of each lane guards the subtraction against cross-lane borrows.
+    // Bits stay set for columns where y >= profile[x].
+    let guard: u64 = 0x8080_8080_8080_8080;
+    let mut levels = guard;
+    let mask = guard >> ((SIDE - width) * 8);
     let mut rows = 0.0;
-    for y in 0..height {
-        let mut x = 0;
-        while x < width {
-            if profile[x] as usize > y {
-                x += 1;
-                continue;
-            }
-            let start = x;
-            while x < width && profile[x] as usize <= y {
-                x += 1;
-            }
-            rows = add_lower(rows, s.rows[line_index(y, start, x)]);
+    for row in s.rows.as_chunks::<LINE_INTERVALS>().0.iter().take(height) {
+        let open = levels.wrapping_sub(lanes) & mask;
+        // Gather each lane's flag into its column bit in the low byte.
+        let mut open = ((open >> 7).wrapping_mul(0x0102_0408_1020_4080) >> 56) as usize;
+        while open != 0 {
+            let entry = ROW_RUNS[open];
+            rows = add_lower(rows, row[usize::from(entry & 63)]);
+            open = usize::from(entry >> 6);
         }
+        levels += 0x0101_0101_0101_0101;
     }
     let mut packing = f64::NEG_INFINITY;
     if s.packing_valid {
@@ -673,7 +766,7 @@ fn fallback_cost(profile: [u8; SIDE], width: usize, height: usize, s: &PlannerSc
             x += 1;
         }
         if y < height {
-            cost += s.regions[region_index(start, y, x - start, height - y)].cost;
+            cost += s.region_costs[region_index(start, y, x - start, height - y)];
         }
     }
     cost
@@ -714,7 +807,7 @@ fn visit(
     for i in 0..expand {
         let k = s.anchors[anchor][i];
         let c = candidates[k];
-        if !c.cost.is_finite() || profile[x..x + c.width].iter().any(|&h| h as usize != y) {
+        if !c.cost.is_finite() || profile[x..x + c.width()].iter().any(|&h| h as usize != y) {
             continue;
         }
         let next = advance(profile, c);
@@ -754,19 +847,20 @@ fn visit(
 }
 
 fn unpack_region(x: usize, y: usize, w: usize, h: usize, s: &PlannerScratch, out: &mut Vec<usize>) {
-    match s.regions[region_index(x, y, w, h)].choice {
-        Choice::Tile(k) => out.push(usize::from(k)),
-        Choice::Vertical(cut) => {
-            let cut = usize::from(cut);
-            unpack_region(x, y, cut, h, s, out);
-            unpack_region(x + cut, y, w - cut, h, s, out);
-        }
-        Choice::Horizontal(cut) => {
-            let cut = usize::from(cut);
+    let choice = s.region_choices[region_index(x, y, w, h)];
+    match choice {
+        0 => unreachable!("infeasible rectangle in a finite fallback"),
+        1..=REGION_LAST_TILE => out.push(usize::from(choice - 1)),
+        REGION_HORIZONTAL_BASE.. => {
+            let cut = usize::from(choice - REGION_HORIZONTAL_BASE);
             unpack_region(x, y, w, cut, s, out);
             unpack_region(x, y + cut, w, h - cut, s, out);
         }
-        _ => unreachable!("infeasible rectangle in a finite fallback"),
+        _ => {
+            let cut = usize::from(choice - REGION_VERTICAL_BASE);
+            unpack_region(x, y, cut, h, s, out);
+            unpack_region(x + cut, y, w - cut, h, s, out);
+        }
     }
 }
 
@@ -814,7 +908,7 @@ fn prepare_planner(candidates: &[Candidate], width: usize, height: usize, s: &mu
         anchor.clear();
     }
     for &c in candidates {
-        assert!(c.x() + c.width <= width && c.y() + c.height <= height);
+        assert!(c.x() + c.width() <= width && c.y() + c.height() <= height);
     }
     prepare_packing_bound(candidates, width, height, s);
     for (i, &c) in candidates.iter().enumerate() {
@@ -822,7 +916,7 @@ fn prepare_planner(candidates: &[Candidate], width: usize, height: usize, s: &mu
             s.anchors[c.y() * SIDE + c.x()].push(i);
         }
     }
-    prepare_regions(candidates, width, height, s);
+    prepare_regions(candidates, width, height, SIDE, SIDE, s);
     prepare_bounds(candidates, width, height, s);
 }
 
@@ -868,18 +962,34 @@ pub(crate) struct LayoutDpScratch {
     /// Scores by absolute block position and strategy, kept across the
     /// tile grids of one re-tiling so a shifted grid rescores only the
     /// pieces the aligned grid could not place.
-    global: OpenTable<CachedCost>,
+    global: Option<OpenTable<CachedCost>>,
     candidates: Vec<Candidate>,
     planner: PlannerScratch,
     current: Vec<Piece>,
     layout: Vec<Piece>,
     choices: Vec<usize>,
     best: Vec<MergeUpgrade>,
-    small: SmallPlanner,
+    small: Option<SmallPlanner>,
     compact: compact::CompactPlanner,
     proposals: Vec<crate::dc_group_data::DpRegion>,
 }
 impl LayoutDpScratch {
+    fn start_grid(&mut self, grid: Grid) -> (bool, (usize, usize)) {
+        match grid {
+            Grid::Aligned { keep_scores } => {
+                // Aligned tiles have disjoint anchors. Only a later shifted
+                // grid can use scores outside the tile-local cache.
+                if keep_scores {
+                    self.global.get_or_insert_with(OpenTable::default).clear();
+                } else {
+                    self.global = None;
+                }
+                (false, (0, 0))
+            }
+            Grid::Shifted(offset) => (true, offset),
+        }
+    }
+
     fn reset(&mut self) {
         self.reconstruction.clear();
         self.reconstruction
@@ -920,7 +1030,11 @@ impl Scores<'_, '_> {
             let params = self.rerank.params;
             let (x, y) = (self.bx + p.x as usize, self.by + p.y as usize);
             let global_key = ((y * 256 + x) << 5 | p.strategy as usize) as u32;
-            if let Some(hit) = cache.global.get(global_key) {
+            if let Some(hit) = cache
+                .global
+                .as_ref()
+                .and_then(|table| table.get(global_key))
+            {
                 cache.reconstruction[key] = hit;
                 return hit;
             }
@@ -963,8 +1077,10 @@ impl Scores<'_, '_> {
                 cost: score.cost,
                 base: score.base,
             };
-            if score.cost.is_finite() {
-                cache.global.insert(global_key, score);
+            if let Some(table) = &mut cache.global
+                && score.cost.is_finite()
+            {
+                table.insert(global_key, score);
             }
             cache.reconstruction[key] = score;
         }
@@ -1006,25 +1122,38 @@ fn leaf(
     }
     Candidate::new(best, cost as f64)
 }
+/// Membership of complete pieces, indexed by strategy and top-left cell.
+#[derive(Default)]
+struct PieceSet([u64; crate::dc_group_data::NUM_STRATEGIES]);
+
+impl PieceSet {
+    fn from_slice(pieces: &[Piece]) -> Self {
+        let mut set = Self::default();
+        for &piece in pieces {
+            set.insert(piece);
+        }
+        set
+    }
+
+    fn insert(&mut self, piece: Piece) {
+        self.0[piece.strategy as usize] |= 1 << (piece.y as usize * SIDE + piece.x as usize);
+    }
+
+    fn contains(&self, piece: Piece) -> bool {
+        self.0[piece.strategy as usize] & (1 << (piece.y as usize * SIDE + piece.x as usize)) != 0
+    }
+}
+
 /// The minimal closed rectangles (x, y, w, h) covering every block whose
 /// piece differs between `current` and `layout`: connected changed blocks
 /// grown until no piece of either layout crosses the border, with
 /// overlapping rectangles merged.
-fn changed_regions(current: &[Piece], layout: &[Piece]) -> Vec<(usize, usize, usize, usize)> {
+fn changed_regions(
+    current: &[Piece],
+    layout: &[Piece],
+    mut changed: u64,
+) -> Vec<(usize, usize, usize, usize)> {
     let footprint = |p: &Piece| (p.x as usize, p.y as usize, p.width(), p.height());
-    let mut changed = [false; 64];
-    for p in layout
-        .iter()
-        .filter(|p| !current.contains(p))
-        .chain(current.iter().filter(|p| !layout.contains(p)))
-    {
-        let (x, y, w, h) = footprint(p);
-        for yy in y..y + h {
-            for xx in x..x + w {
-                changed[yy * 8 + xx] = true;
-            }
-        }
-    }
     let close = |mut r: (usize, usize, usize, usize)| {
         loop {
             let mut grew = false;
@@ -1044,41 +1173,31 @@ fn changed_regions(current: &[Piece], layout: &[Piece]) -> Vec<(usize, usize, us
             }
         }
     };
-    let mut seen = [false; 64];
     let mut regions: Vec<(usize, usize, usize, usize)> = Vec::new();
-    for start in 0..64 {
-        if !changed[start] || seen[start] {
-            continue;
+    while changed != 0 {
+        // Start with the first remaining cell in raster order. Flood its
+        // four-connected neighbors without crossing either horizontal edge.
+        let mut component = 1u64 << changed.trailing_zeros();
+        loop {
+            let adjacent = ((component & 0xfefe_fefe_fefe_fefe) >> 1)
+                | ((component & 0x7f7f_7f7f_7f7f_7f7f) << 1)
+                | (component >> SIDE)
+                | (component << SIDE);
+            let expanded = component | (adjacent & changed);
+            if expanded == component {
+                break;
+            }
+            component = expanded;
         }
-        let (mut x0, mut y0, mut x1, mut y1) = (8usize, 8usize, 0usize, 0usize);
-        let mut stack = vec![start];
-        seen[start] = true;
-        while let Some(i) = stack.pop() {
-            let (x, y) = (i % 8, i / 8);
-            x0 = x0.min(x);
-            y0 = y0.min(y);
-            x1 = x1.max(x + 1);
-            y1 = y1.max(y + 1);
-            let mut neighbors = Vec::with_capacity(4);
-            if x > 0 {
-                neighbors.push(i - 1);
-            }
-            if x < 7 {
-                neighbors.push(i + 1);
-            }
-            if y > 0 {
-                neighbors.push(i - 8);
-            }
-            if y < 7 {
-                neighbors.push(i + 8);
-            }
-            for n in neighbors {
-                if changed[n] && !seen[n] {
-                    seen[n] = true;
-                    stack.push(n);
-                }
-            }
-        }
+        changed &= !component;
+        // Collapse the rows to locate the two extreme columns.
+        let columns = component | component >> 32;
+        let columns = columns | columns >> 16;
+        let columns = (columns | columns >> 8) as u8;
+        let x0 = columns.trailing_zeros() as usize;
+        let x1 = SIDE - columns.leading_zeros() as usize;
+        let y0 = component.trailing_zeros() as usize / SIDE;
+        let y1 = SIDE - component.leading_zeros() as usize / SIDE;
         regions.push(close((x0, y0, x1 - x0, y1 - y0)));
     }
     // Merge overlapping rectangles until they are disjoint.
@@ -1107,13 +1226,9 @@ fn changed_regions(current: &[Piece], layout: &[Piece]) -> Vec<(usize, usize, us
 fn pieces_mask(pieces: &[Piece]) -> u64 {
     let mut mask = 0;
     for p in pieces {
-        for y in p.y as usize..p.y as usize + p.height() {
-            for x in p.x as usize..p.x as usize + p.width() {
-                let bit = 1u64 << (y * 8 + x);
-                debug_assert_eq!(mask & bit, 0, "layout overlaps");
-                mask |= bit;
-            }
-        }
+        let piece = p.mask(SIDE);
+        debug_assert_eq!(mask & piece, 0, "layout overlaps");
+        mask |= piece;
     }
     mask
 }
@@ -1170,18 +1285,29 @@ fn search_tile(
     } else {
         COEFFICIENT_STRATEGIES.len()
     };
+    let incumbent = PieceSet::from_slice(&current);
+    let mut considered = PieceSet::default();
     for (i, &strategy) in STRATEGIES[..families].iter().enumerate() {
-        if matches!(i, 3 | 4 | 6 | 8) {
-            if families == COEFFICIENT_STRATEGIES.len() {
-                compact::prepare_square_bounds(
-                    &cache.candidates,
-                    width,
-                    height,
-                    &mut cache.planner,
-                );
-            } else {
-                prepare_regions(&cache.candidates, width, height, &mut cache.planner);
+        // At each family boundary prepare only the shapes read by that
+        // family's score caps and their guillotine subrectangles.
+        match i {
+            3 => {
+                compact::prepare_square_bounds(&cache.candidates, width, height, &mut cache.planner)
             }
+            4 | 6 | 8 => {
+                let short_side = 1 << ((i - 4) / 2);
+                if width.min(height) >= short_side && width.max(height) >= 4 {
+                    prepare_regions(
+                        &cache.candidates,
+                        width,
+                        height,
+                        4,
+                        short_side,
+                        &mut cache.planner,
+                    );
+                }
+            }
+            _ => {}
         }
         let w = AcStrategyImage::covered_blocks_x_of(strategy);
         let h = AcStrategyImage::covered_blocks_y_of(strategy);
@@ -1201,20 +1327,21 @@ fn search_tile(
                 }
                 if blocked != 0 {
                     if strategy == STRATEGY_DCT && is_blocked(x, y) {
+                        considered.insert(p);
                         cache.candidates.push(Candidate::new(p, 0.0));
                         continue;
                     }
-                    if pieces_mask(&[p]) & blocked != 0 {
+                    if p.mask(SIDE) & blocked != 0 {
                         continue;
                     }
                 }
                 let candidate = if strategy == STRATEGY_DCT {
                     leaf(scores, coder, cache, map, x, y)
                 } else {
-                    let limit = if i < 3 || current.contains(&p) {
+                    let limit = if i < 3 || incumbent.contains(p) {
                         f32::INFINITY
                     } else {
-                        (cache.planner.regions[region_index(x, y, w, h)].cost as f32 * BOUND_SLACK)
+                        (cache.planner.region_costs[region_index(x, y, w, h)] as f32 * BOUND_SLACK)
                             .next_up()
                     };
                     Candidate::new(
@@ -1222,6 +1349,7 @@ fn search_tile(
                         f64::from(scores.reconstruction_bounded(coder, cache, p, limit).cost),
                     )
                 };
+                considered.insert(candidate.piece);
                 cache.candidates.push(candidate);
             }
         }
@@ -1229,7 +1357,7 @@ fn search_tile(
     // The incumbent layout stays feasible: its 64-family blocks, which only
     // the 64 pass places, compete as themselves.
     for &p in &current {
-        if p.width() * p.height() > 1 && !cache.candidates.iter().any(|c| c.piece == p) {
+        if p.width() * p.height() > 1 && !considered.contains(p) {
             let cost = scores.reconstruction(coder, cache, p).cost as f64;
             cache.candidates.push(Candidate::new(p, cost));
         }
@@ -1259,18 +1387,28 @@ fn search_tile(
     debug_assert_eq!(pieces_mask(&layout), pieces_mask(&current));
     // The incumbent can contain fine leaves outside this pass's candidate set.
     // Compare only changed pieces so unchanged costs cancel without rounding.
+    let winner = PieceSet::from_slice(&layout);
+    let mut changed = 0;
     let old = current
         .iter()
-        .filter(|p| !layout.contains(p))
-        .map(|&p| scores.reconstruction(coder, cache, p).cost)
+        .copied()
+        .filter(|&p| !winner.contains(p))
+        .map(|p| {
+            changed |= p.mask(SIDE);
+            scores.reconstruction(coder, cache, p).cost
+        })
         .sum::<f32>();
     let new = layout
         .iter()
-        .filter(|p| !current.contains(p))
-        .map(|&p| scores.reconstruction(coder, cache, p).cost)
+        .copied()
+        .filter(|&p| !incumbent.contains(p))
+        .map(|p| {
+            changed |= p.mask(SIDE);
+            scores.reconstruction(coder, cache, p).cost
+        })
         .sum::<f32>();
     if new < old {
-        for &p in layout.iter().filter(|p| !current.contains(p)) {
+        for p in layout.iter().copied().filter(|&p| !incumbent.contains(p)) {
             let base = scores.reconstruction(coder, cache, p).base;
             cache.best.push(MergeUpgrade {
                 bx: scores.bx + p.x as usize,
@@ -1279,7 +1417,7 @@ fn search_tile(
                 base,
             });
         }
-        for (x, y, w, h) in changed_regions(&current, &layout) {
+        for (x, y, w, h) in changed_regions(&current, &layout, changed) {
             cache.proposals.push(crate::dc_group_data::DpRegion {
                 bx: scores.bx + x,
                 by: scores.by + y,
@@ -1321,7 +1459,11 @@ impl CoefficientScores<'_, '_> {
             let params = self.selection.params;
             let (x, y) = (self.bx + p.x as usize, self.by + p.y as usize);
             let global_key = ((y * 256 + x) << 5 | p.strategy as usize) as u32;
-            if let Some(hit) = cache.global.get(global_key) {
+            if let Some(hit) = cache
+                .global
+                .as_ref()
+                .and_then(|table| table.get(global_key))
+            {
                 cache.reconstruction[key] = hit;
                 return hit.cost;
             }
@@ -1364,8 +1506,10 @@ impl CoefficientScores<'_, '_> {
                 cost,
                 ..CachedCost::default()
             };
-            if cost.is_finite() {
-                cache.global.insert(global_key, score);
+            if let Some(table) = &mut cache.global
+                && cost.is_finite()
+            {
+                table.insert(global_key, score);
             }
             cache.reconstruction[key] = score;
         }
@@ -1373,19 +1517,19 @@ impl CoefficientScores<'_, '_> {
     }
 }
 
-/// Choice of the small planner at a cell, in the low bits of a `from` entry.
-const SMALL_PREFILLED: u16 = 0;
-const SMALL_LEAF: u16 = 1;
-const SMALL_WIDE: u16 = 2;
-const SMALL_TALL: u16 = 3;
-const SMALL_SQUARE: u16 = 4;
-const SMALL_STATES: usize = 1 << (SIDE + 2);
-const SMALL_PARENTS: usize = SMALL_STATES / 2;
+/// Choice of the small planner at a cell.
+const SMALL_PREFILLED: u8 = 0;
+const SMALL_LEAF: u8 = 1;
+const SMALL_WIDE: u8 = 2;
+const SMALL_TALL: u8 = 3;
+const SMALL_SQUARE: u8 = 4;
+const SMALL_STATES: usize = 1 << (SIDE + 1);
 
 /// Exact broken-profile DP over 1x1, 2x1, 1x2 and 2x2 pieces on a `w x h`
 /// grid of at most 8x8 cells. Cells are visited in row-major order; a state
-/// holds the filled flags of the next `w + 2` cells, which is all a piece
-/// anchored at the current cell can reach.
+/// holds the filled flags of the next `w + 1` cells. Only a square anchored
+/// at the current cell can reach the following cell, so its bit comes from
+/// the fixed mask and is shared by every state in the layer.
 struct SmallPlanner {
     cost: Box<[f32; SMALL_STATES]>,
     next: Box<[f32; SMALL_STATES]>,
@@ -1394,11 +1538,10 @@ struct SmallPlanner {
     active: Box<[u16; SMALL_STATES]>,
     next_active: Box<[u16; SMALL_STATES]>,
     active_len: usize,
-    /// Direct predecessors (`previous_state << 3 | choice`) per cell and state,
-    /// `SMALL_PARENTS` per cell. The incoming fixed bit is constant within a
-    /// layer, so omit that bit.
-    parents: Vec<[u16; SMALL_PARENTS]>,
-    plan: Vec<(usize, u16)>,
+    /// The winning placement per cell and state. Its predecessor is recovered
+    /// by undoing the shift and removing the cells filled by the placement.
+    choices: Vec<u8>,
+    plan: Vec<(usize, u8)>,
 }
 
 impl Default for SmallPlanner {
@@ -1409,7 +1552,7 @@ impl Default for SmallPlanner {
             active: heap_array(0),
             next_active: heap_array(0),
             active_len: 0,
-            parents: Vec::new(),
+            choices: Vec::new(),
             plan: Vec::new(),
         }
     }
@@ -1490,51 +1633,51 @@ fn plan_small(
     replace_below: f32,
 ) -> f32 {
     let cells = w * h;
-    let bit = |cell: usize| -> usize {
-        if cell < cells {
-            ((fixed >> cell) & 1) as usize
-        } else {
-            0
-        }
-    };
-    if s.parents.len() < cells {
-        s.parents.resize(cells, [0; SMALL_PARENTS]);
+    let states = 1 << (w + 1);
+    let mask = states - 1;
+    if s.choices.len() < cells * states {
+        s.choices.resize(cells * states, 0);
     }
-    // States fit in w + 2 <= SIDE + 2 bits and predecessors in w + 1 bits:
-    // the index masks below are no-ops that let the compiler drop checks.
+    // The index mask is a no-op that lets the compiler drop checks.
     const STATE_MASK: usize = SMALL_STATES - 1;
-    const PARENT_MASK: usize = SMALL_PARENTS - 1;
-    let start = (fixed & ((1u64 << (w + 2)) - 1)) as usize;
-    s.cost[start] = 0.0;
-    s.active[0] = start as u16;
-    s.active_len = 1;
-    for i in 0..cells {
-        let incoming = bit(i + w + 2) << (w + 1);
-        let SmallPlanner {
-            cost,
-            next,
-            active,
-            next_active,
-            active_len,
-            parents,
-            ..
-        } = &mut *s;
-        let from = &mut parents[i];
+    let start = fixed as usize & mask;
+    let below_bit = 1 << w;
+    let corner_bit = 2 << w;
+    let added = [0, 0, 2, below_bit, 2 | below_bit | corner_bit];
+    let SmallPlanner {
+        cost,
+        next,
+        active,
+        next_active,
+        active_len,
+        choices,
+        ..
+    } = &mut *s;
+    cost[start] = 0.0;
+    active[0] = start as u16;
+    *active_len = 1;
+    let mut incoming = fixed >> (w + 1);
+    for (i, from) in choices[..cells * states]
+        .chunks_exact_mut(states)
+        .enumerate()
+    {
+        let corner = (incoming as usize & 1) << w;
+        incoming >>= 1;
+        let shapes = live[i];
         let mut next_len = 0usize;
         for &state in &active[..*active_len] {
             let state = state as usize & STATE_MASK;
             let here = cost[state];
             cost[state] = f32::INFINITY;
-            let mut relax = |filled: usize, cost: f32, choice: u16| {
-                let shifted = filled >> 1;
-                let to = (shifted | incoming) & STATE_MASK;
+            let mut relax = |filled: usize, cost: f32, choice: u8| {
+                let to = ((filled >> 1) | corner) & STATE_MASK;
                 if cost < next[to] {
                     if next[to] == f32::INFINITY {
                         next_active[next_len & STATE_MASK] = to as u16;
                         next_len += 1;
                     }
                     next[to] = cost;
-                    from[shifted & PARENT_MASK] = (state as u16) << 3 | choice;
+                    from[to] = choice;
                 }
             };
             if state & 1 != 0 {
@@ -1543,16 +1686,16 @@ fn plan_small(
             }
             relax(state, here + costs.leaf[i], SMALL_LEAF);
             let right = state & 2 == 0;
-            let below = state & (1 << w) == 0;
-            if right && live[i] & 1 != 0 {
+            let below = state & below_bit == 0;
+            if right && shapes & 1 != 0 {
                 relax(state | 2, here + costs.wide[i], SMALL_WIDE);
             }
-            if below && live[i] & 2 != 0 {
-                relax(state | 1 << w, here + costs.tall[i], SMALL_TALL);
+            if below && shapes & 2 != 0 {
+                relax(state | below_bit, here + costs.tall[i], SMALL_TALL);
             }
-            if right && below && live[i] & 4 != 0 && state & (1 << (w + 1)) == 0 {
+            if right && below && corner == 0 && shapes & 4 != 0 {
                 relax(
-                    state | 2 | 1 << w | 1 << (w + 1),
+                    state | added[SMALL_SQUARE as usize],
                     here + costs.square[i],
                     SMALL_SQUARE,
                 );
@@ -1570,21 +1713,21 @@ fn plan_small(
         return total;
     }
     s.plan.clear();
-    let mut state = 0u16;
+    let mut state = 0;
     for i in (0..cells).rev() {
         // Every reached predecessor was written during this plan. Unreached
         // entries may retain old values; no clearing or layer copies are needed.
-        let from = s.parents[i][state as usize & (SMALL_PARENTS - 1) & ((1 << (w + 1)) - 1)];
-        let choice = from & 7;
+        let choice = s.choices[i * states + state];
         if choice != SMALL_PREFILLED {
             s.plan.push((i, choice));
         }
-        state = from >> 3;
+        state =
+            ((state << 1) ^ added[choice as usize]) & mask | usize::from(choice == SMALL_PREFILLED);
     }
     total
 }
 
-fn small_strategy(choice: u16) -> u8 {
+fn small_strategy(choice: u8) -> u8 {
     match choice {
         SMALL_LEAF => STRATEGY_DCT,
         SMALL_WIDE => STRATEGY_DCT8X16,
@@ -1621,18 +1764,9 @@ fn search_tile_coefficient(
     }
     // On a shifted grid the cells of incumbents crossing the tile border stay
     // out of the plan (cell bits are `y * width + x` here).
-    let cells = |p: Piece| {
-        let mut m = 0u64;
-        for y in p.y as usize..p.y as usize + p.height() {
-            for x in p.x as usize..p.x as usize + p.width() {
-                m |= 1 << (y * width + x);
-            }
-        }
-        m
-    };
     let blocked = if crossing {
         let full = (0..width * height).fold(0u64, |m, i| m | 1 << i);
-        current.iter().fold(full, |m, &p| m & !cells(p))
+        current.iter().fold(full, |m, &p| m & !p.mask(width))
     } else {
         0
     };
@@ -1666,7 +1800,10 @@ fn search_tile_coefficient(
                 (SMALL_SQUARE, &mut costs.square),
             ] {
                 let p = Piece::new(x, y, small_strategy(choice));
-                if x + p.width() > width || y + p.height() > height || cells(p) & blocked != 0 {
+                if x + p.width() > width
+                    || y + p.height() > height
+                    || (blocked != 0 && p.mask(width) & blocked != 0)
+                {
                     continue;
                 }
                 // Without unaligned placements a piece stays inside its
@@ -1700,35 +1837,25 @@ fn search_tile_coefficient(
         if COEFFICIENT_STRATEGIES.contains(&p.strategy) {
             continue;
         }
-        for y in p.y as usize..p.y as usize + p.height() {
-            for x in p.x as usize..p.x as usize + p.width() {
-                fixed |= 1 << (y * width + x);
-            }
-        }
+        fixed |= p.mask(width);
         fixed_cost += scores.score(coder, cache, p);
     }
     let mut layout = std::mem::take(&mut cache.layout);
     let live = costs.live_masks(width, height);
+    let small = cache.small.get_or_insert_with(SmallPlanner::default);
     let around = plan_small(
         &costs,
         &live,
         fixed | blocked,
         [width, height],
-        &mut cache.small,
+        small,
         f32::INFINITY,
     ) + fixed_cost;
     layout.clear();
     let mut keep_fixed = true;
     let mut winner = around;
     if fixed != 0 {
-        let over = plan_small(
-            &costs,
-            &live,
-            blocked,
-            [width, height],
-            &mut cache.small,
-            around,
-        );
+        let over = plan_small(&costs, &live, blocked, [width, height], small, around);
         if over < around {
             winner = over;
             keep_fixed = false;
@@ -1736,8 +1863,7 @@ fn search_tile_coefficient(
     }
     if winner.is_finite() {
         layout.extend(
-            cache
-                .small
+            small
                 .plan
                 .iter()
                 .map(|&(i, choice)| Piece::new(i % width, i / width, small_strategy(choice))),
@@ -1751,27 +1877,22 @@ fn search_tile_coefficient(
         }
         layout.sort_by_key(|p| (p.y, p.x, p.strategy));
         debug_assert_eq!(pieces_mask(&layout), pieces_mask(&current));
-        let mut was = [0u64; CACHE_SIZE.div_ceil(64)];
-        let mut now = was;
-        for p in &current {
-            was[p.key() / 64] |= 1 << (p.key() % 64);
-        }
-        for p in &layout {
-            now[p.key() / 64] |= 1 << (p.key() % 64);
-        }
-        let changed = |set: &[u64], p: &Piece| set[p.key() / 64] & 1 << (p.key() % 64) == 0;
+        let was = PieceSet::from_slice(&current);
+        let now = PieceSet::from_slice(&layout);
         let old = current
             .iter()
-            .filter(|p| changed(&now, p))
-            .map(|&p| scores.score(coder, cache, p))
+            .copied()
+            .filter(|&p| !now.contains(p))
+            .map(|p| scores.score(coder, cache, p))
             .sum::<f32>();
         let new = layout
             .iter()
-            .filter(|p| changed(&was, p))
-            .map(|&p| scores.score(coder, cache, p))
+            .copied()
+            .filter(|&p| !was.contains(p))
+            .map(|p| scores.score(coder, cache, p))
             .sum::<f32>();
         if new < old {
-            for &p in layout.iter().filter(|p| changed(&was, p)) {
+            for p in layout.iter().copied().filter(|&p| !was.contains(p)) {
                 cache.best.push(MergeUpgrade {
                     bx: scores.bx + p.x as usize,
                     by: scores.by + p.y as usize,
@@ -1798,13 +1919,7 @@ fn find(
     output.merge_upgrades.clear();
     output.dp_regions.clear();
     let mut cache = std::mem::take(&mut output.layout_dp);
-    let (crossing, (ox, oy)) = match grid {
-        Grid::Aligned => {
-            cache.global.clear();
-            (false, (0, 0))
-        }
-        Grid::Shifted(offset) => (true, offset),
-    };
+    let (crossing, (ox, oy)) = cache.start_grid(grid);
     let first_y = oy + band.0.saturating_sub(oy).div_ceil(TILE) * TILE;
     for by in (first_y..band.1.min(map.ysize())).step_by(TILE) {
         for bx in (ox..map.xsize()).step_by(TILE) {
@@ -1868,6 +1983,7 @@ pub(super) fn retile(
         .flat_map(|b| &b.fine_rollbacks)
         .map(|r| (r.bx, r.by, r.cov_x, r.cov_y))
         .collect();
+    let offsets = crossing_grids(rerank.params.ctx.speed.effort());
     let read: &AcStrategyImage = map;
     rerank
         .params
@@ -1882,7 +1998,9 @@ pub(super) fn retile(
                 rerank.bands[i],
                 out,
                 &rollbacks,
-                Grid::Aligned,
+                Grid::Aligned {
+                    keep_scores: install && !offsets.is_empty(),
+                },
             );
         });
     if install {
@@ -1890,7 +2008,7 @@ pub(super) fn retile(
         // Further passes on shifted grids, where pieces may cross the 64px
         // tiles the aligned grid fences. Each pass sees the previous one's
         // layout; the score cache carries over.
-        for &offset in crossing_grids(rerank.params.ctx.speed.effort()) {
+        for &offset in offsets {
             let read: &AcStrategyImage = map;
             rerank
                 .params
@@ -1922,7 +2040,7 @@ pub(super) fn retile(
 #[derive(Clone, Copy)]
 enum Grid {
     /// The 64px CfL tiles; pieces stay inside their tile.
-    Aligned,
+    Aligned { keep_scores: bool },
     /// A grid shifted by this many blocks, whose pieces may cross the CfL
     /// tiles (the decoder takes the tile of a piece's first block).
     Shifted((usize, usize)),
@@ -1938,13 +2056,7 @@ fn find_coefficient(
 ) {
     output.merge_upgrades.clear();
     let mut cache = std::mem::take(&mut output.layout_dp);
-    let (crossing, (ox, oy)) = match grid {
-        Grid::Aligned => {
-            cache.global.clear();
-            (false, (0, 0))
-        }
-        Grid::Shifted(offset) => (true, offset),
-    };
+    let (crossing, (ox, oy)) = cache.start_grid(grid);
     let first_y = oy + band.0.saturating_sub(oy).div_ceil(TILE) * TILE;
     for by in (first_y..band.1.min(map.ysize())).step_by(TILE) {
         for bx in (ox..map.xsize()).step_by(TILE) {
@@ -1984,6 +2096,7 @@ pub(super) fn retile_coefficient(
     num_threads: usize,
     current_costs: &mut [f32],
 ) {
+    let offsets = crossing_grids(selection.params.ctx.speed.effort());
     let read: &AcStrategyImage = map;
     selection
         .params
@@ -1991,10 +2104,19 @@ pub(super) fn retile_coefficient(
         .thread_pool
         .steal_for_each_mut_with_threads(scratch, band_scratch, num_threads, |i, out, coder| {
             let mut prices = selection.params.price(coder);
-            find_coefficient(selection, &mut prices, read, bands[i], out, Grid::Aligned);
+            find_coefficient(
+                selection,
+                &mut prices,
+                read,
+                bands[i],
+                out,
+                Grid::Aligned {
+                    keep_scores: !offsets.is_empty(),
+                },
+            );
         });
     apply(map, band_scratch, current_costs);
-    for &offset in crossing_grids(selection.params.ctx.speed.effort()) {
+    for &offset in offsets {
         let read: &AcStrategyImage = map;
         selection
             .params
@@ -2052,8 +2174,8 @@ mod tests {
                 continue;
             }
             let mut mask = 0;
-            for cy in y..y + c.height {
-                for cx in x..x + c.width {
+            for cy in y..y + c.height() {
+                for cx in x..x + c.width() {
                     mask |= 1 << (cy * w + cx);
                 }
             }
@@ -2158,7 +2280,7 @@ mod tests {
         let mut out = Vec::new();
         let cost = plan(&c, 3, 3, &mut s, &mut out);
         assert_eq!(cost, 5.0);
-        assert!(s.regions[region_index(0, 0, 3, 3)].cost > cost);
+        assert!(s.region_costs[region_index(0, 0, 3, 3)] > cost);
         assert_coverage(&out.iter().map(|&k| c[k].piece).collect::<Vec<_>>(), 3, 3);
     }
     #[test]
@@ -2237,7 +2359,7 @@ mod tests {
                 },
             ))
         });
-        assert!(c.iter().all(|c| c.width * c.height <= 16));
+        assert!(c.iter().all(|c| c.width() * c.height() <= 16));
         let (cost, pieces) = solve(&c, 8, 8);
         assert_eq!(cost, 64.0);
         c.push(direct(0, 1, STRATEGY_DCT32X64, 1.0));
@@ -2249,6 +2371,14 @@ mod tests {
     }
     #[test]
     fn changed_regions_are_minimal_closed_and_disjoint() {
+        let changed = |current: &[Piece], layout: &[Piece]| {
+            let cells = current
+                .iter()
+                .filter(|p| !layout.contains(p))
+                .chain(layout.iter().filter(|p| !current.contains(p)))
+                .fold(0, |cells, &piece| cells | piece.mask(SIDE));
+            changed_regions(current, layout, cells)
+        };
         let mut current = Vec::new();
         for y in 0..8 {
             for x in 0..8 {
@@ -2263,7 +2393,7 @@ mod tests {
             .collect();
         layout.push(Piece::new(0, 0, STRATEGY_DCT16X16));
         layout.push(Piece::new(6, 7, STRATEGY_DCT8X16));
-        let mut regions = changed_regions(&current, &layout);
+        let mut regions = changed(&current, &layout);
         regions.sort_unstable();
         assert_eq!(regions, vec![(0, 0, 2, 2), (6, 7, 2, 1)]);
         // A 32x32 replaced by pieces crossing its grid grows to one closed region.
@@ -2285,8 +2415,8 @@ mod tests {
         for y in 0..4 {
             shifted.push(Piece::new(0, y, STRATEGY_DCT));
         }
-        assert_eq!(changed_regions(&big, &shifted), vec![(0, 0, 5, 4)]);
-        assert!(changed_regions(&current, &current).is_empty());
+        assert_eq!(changed(&big, &shifted), vec![(0, 0, 5, 4)]);
+        assert!(changed(&current, &current).is_empty());
     }
     #[test]
     fn failed_budgets_do_not_poison_the_exact_memo() {
@@ -2319,16 +2449,87 @@ mod tests {
     }
 
     #[test]
-    fn entering_column_uses_the_first_strict_minimum() {
-        assert_eq!(entering_column(&[0.0, -0.0, -1e-10, f64::NAN]), None);
+    fn entering_column_uses_the_earliest_original_column_on_ties() {
         assert_eq!(
-            entering_column(&[f64::NAN, -2.0, -1.0, -0.0, -2.0, f64::INFINITY, -2.0]),
-            Some(1),
+            entering_column(&[0.0, -0.0, -1e-10, f64::NAN], &[0, 1, 2, 3]),
+            None
         );
         assert_eq!(
-            entering_column(&[-2.0, 0.0, 0.0, 0.0, f64::NEG_INFINITY]),
+            entering_column(
+                &[f64::NAN, -2.0, -1.0, -0.0, -2.0, f64::INFINITY, -2.0],
+                &[0, 4, 5, 3, 1, 6, 2],
+            ),
+            Some(4),
+        );
+        assert_eq!(
+            entering_column(&[-2.0, 0.0, 0.0, 0.0, f64::NEG_INFINITY], &[0, 1, 2, 3, 4]),
             Some(4)
         );
+    }
+
+    #[test]
+    fn open_table_growth_preserves_current_generation() {
+        let mut table = OpenTable::default();
+        let key = |i: u32| i.wrapping_mul(0x9e37_79b1);
+        for i in 0u32..129 {
+            table.insert(key(i), i);
+        }
+        for i in 0u32..129 {
+            assert_eq!(table.get(key(i)), Some(i));
+        }
+        table.clear();
+        for i in 129u32..1024 {
+            table.insert(key(i), i);
+        }
+        for i in 0u32..129 {
+            assert_eq!(table.get(key(i)), None);
+        }
+        for i in 129u32..1024 {
+            assert_eq!(table.get(key(i)), Some(i));
+        }
+        assert_eq!(table.len, 895);
+    }
+
+    #[test]
+    fn restricted_guillotine_regions_match_full_table() {
+        let mut full = PlannerScratch::default();
+        let mut restricted = PlannerScratch::default();
+        for width in 1..=SIDE {
+            for height in (1..=SIDE).rev() {
+                for (families, short_side) in [(4, 1), (6, 2), (8, 4)] {
+                    let mut candidates = Vec::new();
+                    for_each_piece(width, height, |p| {
+                        if !STRATEGIES[..families].contains(&p.strategy) {
+                            return;
+                        }
+                        let cost = match p.key() % 19 {
+                            0 => f64::INFINITY,
+                            1 => -0.0,
+                            2 => 0.0,
+                            n => (n % 4) as f64 - 1.0,
+                        };
+                        candidates.push(Candidate::new(p, cost));
+                    });
+                    prepare_regions(&candidates, width, height, SIDE, SIDE, &mut full);
+                    prepare_regions(&candidates, width, height, 4, short_side, &mut restricted);
+                    for (w, h) in [(4, short_side), (short_side, 4)] {
+                        if w > width || h > height {
+                            continue;
+                        }
+                        for y in 0..=height - h {
+                            for x in 0..=width - w {
+                                let i = region_index(x, y, w, h);
+                                assert_eq!(
+                                    full.region_costs[i].to_bits(),
+                                    restricted.region_costs[i].to_bits()
+                                );
+                                assert_eq!(full.region_choices[i], restricted.region_choices[i]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2648,7 +2849,7 @@ mod protection_tests {
             &map,
             (0, 8),
             &mut output,
-            Grid::Aligned,
+            Grid::Aligned { keep_scores: false },
         );
         for up in &output.merge_upgrades {
             assert!(COEFFICIENT_STRATEGIES.contains(&up.strategy));
@@ -2677,7 +2878,7 @@ mod protection_tests {
             &large,
             (0, 16),
             &mut output,
-            Grid::Aligned,
+            Grid::Aligned { keep_scores: false },
         );
         assert!(output.merge_upgrades.is_empty());
         // A shifted grid keeps the cells of an incumbent crossing its tile
@@ -2748,7 +2949,7 @@ mod protection_tests {
             (0, 16),
             &mut output,
             &[],
-            Grid::Aligned,
+            Grid::Aligned { keep_scores: false },
         );
         assert!(output.merge_upgrades.is_empty());
         assert!(
@@ -2763,7 +2964,7 @@ mod protection_tests {
             (0, 8),
             &mut output,
             &[(1, 1, 2, 2)],
-            Grid::Aligned,
+            Grid::Aligned { keep_scores: false },
         );
         assert!(output.merge_upgrades.is_empty());
         assert!(
@@ -2778,7 +2979,7 @@ mod protection_tests {
             (0, 8),
             &mut output,
             &[],
-            Grid::Aligned,
+            Grid::Aligned { keep_scores: false },
         );
         assert!(
             output.merge_upgrades.is_empty(),
@@ -2792,13 +2993,13 @@ mod protection_tests {
             (0, 8),
             &mut output,
             &[],
-            Grid::Aligned,
+            Grid::Aligned { keep_scores: false },
         );
         assert!(
             !output.layout_dp.candidates.is_empty(),
             "8-pixel slivers must enter the DP"
         );
-        assert!(output.layout_dp.candidates.iter().all(|c| c.width == 1));
+        assert!(output.layout_dp.candidates.iter().all(|c| c.width() == 1));
 
         // A shifted grid keeps the cells of an incumbent crossing its tile
         // border out of the plan and never re-tiles over them.

@@ -84,6 +84,11 @@ impl CvvdpArbiter {
         Self::new_shared(source, Self::prepare(source)?)
     }
 
+    /// Keep the prepared source while releasing the comparison workspace.
+    pub(crate) fn into_reference(self) -> std::sync::Arc<PreparedReference> {
+        self.reference
+    }
+
     /// An arbiter over an already analysed source.
     pub(crate) fn new_shared(
         source: &Image3F,
@@ -109,6 +114,7 @@ impl CvvdpArbiter {
     fn write_linear(
         &mut self,
         recon: &Image3F,
+        (ox, oy): (usize, usize),
         dc_error: &Image3F,
         r: Rect,
         out: &mut [Vec<f32>; 3],
@@ -120,10 +126,11 @@ impl CvvdpArbiter {
             row.resize(n, 0.0);
         }
         let [r_out, g_out, b_out] = out;
+        let xs = r.x0 - ox..r.x1 - ox;
         for y in r.y0..r.y1 {
             for (c, row) in rows.iter_mut().enumerate() {
                 let err = dc_error.plane_row(c, y / 8);
-                let src = &recon.plane_row(c, y)[r.x0..r.x1];
+                let src = &recon.plane_row(c, y - oy)[xs.clone()];
                 for ((v, &s), x) in row.iter_mut().zip(src).zip(r.x0..) {
                     *v = s + err[x / 8];
                 }
@@ -160,7 +167,7 @@ impl CvvdpArbiter {
     pub(crate) fn deficit_of(&mut self, recon: &Image3F, dc_error: &Image3F) -> f32 {
         let (w, h) = (self.width, self.height);
         let mut linear = [vec![0f32; w * h], vec![0f32; w * h], vec![0f32; w * h]];
-        self.write_linear(recon, dc_error, self.full(), &mut linear);
+        self.write_linear(recon, (0, 0), dc_error, self.full(), &mut linear);
         let image = self.image(&linear);
         self.workspace
             .compare(&self.reference, image)
@@ -182,7 +189,7 @@ impl CvvdpArbiter {
         for plane in &mut linear {
             plane.resize(self.width * self.height, 0.0);
         }
-        self.write_linear(recon, dc_error, self.full(), &mut linear);
+        self.write_linear(recon, (0, 0), dc_error, self.full(), &mut linear);
         self.linear = linear;
         let image = self.image(&self.linear);
         self.state =
@@ -195,9 +202,17 @@ impl CvvdpArbiter {
     }
 
     /// Commit a reconstruction change without saving rollback data.
-    pub(crate) fn update(&mut self, recon: &Image3F, dc_error: &Image3F, r: Rect) -> f32 {
+    /// `origin` locates the supplied reconstruction in frame coordinates.
+    /// Linear RGB outside `r` remains available for aligned metric reads.
+    pub(crate) fn update_region(
+        &mut self,
+        recon: &Image3F,
+        origin: (usize, usize),
+        dc_error: &Image3F,
+        r: Rect,
+    ) -> f32 {
         let mut linear = std::mem::take(&mut self.linear);
-        self.write_linear(recon, dc_error, r, &mut linear);
+        self.write_linear(recon, origin, dc_error, r, &mut linear);
         self.linear = linear;
         let image = self.image(&self.linear);
         let rect = cvvdp_lite::Rect::new(r.x0, r.y0, r.x1, r.y1);
@@ -218,6 +233,17 @@ impl CvvdpArbiter {
         r: Rect,
         cp: &mut CvvdpCheckpoint,
     ) -> f32 {
+        self.update_region_checkpointed(recon, (0, 0), dc_error, r, cp)
+    }
+
+    pub(crate) fn update_region_checkpointed(
+        &mut self,
+        recon: &Image3F,
+        origin: (usize, usize),
+        dc_error: &Image3F,
+        r: Rect,
+        cp: &mut CvvdpCheckpoint,
+    ) -> f32 {
         let w = self.width;
         cp.rect = Some(r);
         cp.linear.clear();
@@ -228,7 +254,7 @@ impl CvvdpArbiter {
             }
         }
         let mut linear = std::mem::take(&mut self.linear);
-        self.write_linear(recon, dc_error, r, &mut linear);
+        self.write_linear(recon, origin, dc_error, r, &mut linear);
         self.linear = linear;
         let image = self.image(&self.linear);
         let rect = cvvdp_lite::Rect::new(r.x0, r.y0, r.x1, r.y1);
@@ -285,6 +311,16 @@ mod tests {
             std::array::from_fn(|c| (committed.rows[c].as_ptr(), committed.rows[c].capacity()));
         let mut cp = CvvdpCheckpoint::default();
         let mut trial_cp = CvvdpCheckpoint::default();
+        let crop = |image: &Image3F, r: Rect| {
+            let mut out = Image3F::new(r.x1 - r.x0, r.y1 - r.y0);
+            for c in 0..3 {
+                for y in r.y0..r.y1 {
+                    out.plane_row_mut(c, y - r.y0)
+                        .copy_from_slice(&image.plane_row(c, y)[r.x0..r.x1]);
+                }
+            }
+            out
+        };
         for r in [
             Rect::new(7, 9, 24, 31),
             Rect::new(64, 48, 65, 49),
@@ -300,11 +336,11 @@ mod tests {
                     }
                 }
             }
-            let base = committed.update(&recon, &dc, r).to_bits();
+            let base = committed.update_region(&recon, (0, 0), &dc, r).to_bits();
             assert_eq!(
                 base,
                 checkpointed
-                    .update_checkpointed(&recon, &dc, r, &mut cp)
+                    .update_region_checkpointed(&crop(&recon, r), (r.x0, r.y0), &dc, r, &mut cp)
                     .to_bits()
             );
             assert_eq!(committed.linear, checkpointed.linear);
@@ -317,7 +353,13 @@ mod tests {
             trial.plane_row_mut(1, 17)[23] += 0.003;
             let rect = Rect::new(23, 17, 24, 18);
             let a = committed.update_checkpointed(&trial, &dc, rect, &mut trial_cp);
-            let b = checkpointed.update_checkpointed(&trial, &dc, rect, &mut cp);
+            let b = checkpointed.update_region_checkpointed(
+                &crop(&trial, rect),
+                (rect.x0, rect.y0),
+                &dc,
+                rect,
+                &mut cp,
+            );
             assert_eq!(a.to_bits(), b.to_bits());
             committed.rollback(&trial_cp);
             checkpointed.rollback(&cp);

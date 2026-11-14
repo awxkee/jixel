@@ -34,7 +34,9 @@ use super::ac_entropy::{
 };
 #[cfg(not(feature = "extraslow"))]
 use super::ac_groups::RefinedAcGroup;
-use super::ac_groups::{PendingAcGroup, ac_qf_threshold, paste_group, process_ac_group};
+use super::ac_groups::{
+    AcGroupCapture, PendingAcGroup, ac_qf_threshold, paste_group, process_ac_group,
+};
 #[cfg(feature = "splines")]
 use super::dc_groups::provisional_dc_group;
 use super::dc_groups::{assemble_source_dc, merge_quant_dc, setup_dc_group};
@@ -1007,7 +1009,19 @@ fn encode_frame_core_inner(
         && dim.xsize >= 16
         && dim.ysize >= 16;
     // The grain probe reads its survival off the same reconstruction.
+    // The DC polish judges its moves on the loop's final reconstruction.
+    #[cfg(feature = "extraslow")]
+    let try_dc_polish = ctx.speed.effort().coef_polish()
+        && ctx.arbiter == crate::Arbiter::Ssimulacra2
+        && ctx.coding.is_xyb()
+        && color_is_unpatched(frame_kind)
+        && !use_dc_frame
+        && num_passes == 1;
+    #[cfg(feature = "extraslow")]
+    let mut dc_polish = super::dc_polish::Handoff::default();
     let want_recon = fit_epf || (probe_stats.is_some() && !use_dc_frame && num_passes == 1);
+    #[cfg(feature = "extraslow")]
+    let want_recon = want_recon || try_dc_polish;
 
     // Per-image quant-field threshold for the fine AC block-context layout.
     // The median splits the field into halves with genuinely different
@@ -1061,7 +1075,11 @@ fn encode_frame_core_inner(
                     want_order_stats || use_dc_frame || want_recon,
                     qf_threshold,
                     // Without custom orders this pass is the final quantization.
-                    want_recon && !want_order_stats,
+                    if want_recon && !want_order_stats {
+                        AcGroupCapture::Pixels
+                    } else {
+                        AcGroupCapture::None
+                    },
                     None,
                 );
                 if let (Some(target), Some((image, _))) = (&target, capture) {
@@ -1232,7 +1250,7 @@ fn encode_frame_core_inner(
                         &[],
                         false,
                         qf_threshold,
-                        false,
+                        AcGroupCapture::None,
                         None,
                     )
                     .0
@@ -1342,6 +1360,7 @@ fn encode_frame_core_inner(
                 qf_threshold,
                 &prices,
                 want_recon,
+                try_dc_polish.then_some(&mut dc_polish),
                 // Patch atlases and reference frames are judged by the
                 // frames that use them, not by their own reconstruction.
                 if color_is_unpatched(frame_kind)
@@ -1392,7 +1411,11 @@ fn encode_frame_core_inner(
                         &order_alternatives,
                         false,
                         qf_threshold,
-                        want_recon,
+                        if want_recon {
+                            AcGroupCapture::Pixels
+                        } else {
+                            AcGroupCapture::None
+                        },
                         None,
                     );
                     if let (Some(target), Some((image, _))) = (&target, capture) {
@@ -1428,14 +1451,7 @@ fn encode_frame_core_inner(
             base_x: crate::color_correlation::y_to_x_ratio(ctx.cfl_frame(), ytox_dc as i8),
             ..ctx.cfl_frame()
         };
-        distp.dc_step = dc_rdo::choose_x_dc_step(
-            &mut dc_datas,
-            &distp,
-            cfl,
-            ctx.quantize_dc_cfl,
-            &ctx.thread_pool,
-            scratch,
-        );
+        distp.dc_step = dc_rdo::choose_x_dc_step(ctx, &mut dc_datas, &distp, cfl, scratch);
     }
     // Only DC reconstruction uses the extra X slope. The AC map and the
     // header's base correlations retain the frame's original parameters.
@@ -1505,6 +1521,17 @@ fn encode_frame_core_inner(
         )?;
     let mut epf_sharpness = epf_sharpness_id(distance, ctx.screen_content());
     let mut survival = None;
+    // Before the DC error and the loop filters enter the reconstruction.
+    #[cfg(feature = "extraslow")]
+    let dc_polish_pixels = epf_recon
+        .as_ref()
+        .filter(|_| dc_polish.ready())
+        .map(|recon| {
+            let source_dc = epf_source_dc
+                .clone()
+                .unwrap_or_else(|| assemble_source_dc(&dc_datas, &group_coords, &dim));
+            (recon.clone(), source_dc)
+        });
     if let Some(mut recon) = epf_recon {
         let decoded_dc = dc_smoothing::decoded_dc(
             &dim,
@@ -1544,12 +1571,27 @@ fn encode_frame_core_inner(
             // Source pixel decisions are complete. The EPF proxy needs only Y;
             // release X/B before allocating its pyramid and candidate output.
             // A Gaborish source also replaces the original source altogether.
-            let source_y = match (source, opsin_image.take().unwrap()) {
-                (Some(source), _) | (None, Cow::Owned(source)) => {
+            // The DC polish still judges against the whole source.
+            #[cfg(feature = "extraslow")]
+            let keep_source = dc_polish_pixels.is_some();
+            #[cfg(not(feature = "extraslow"))]
+            let keep_source = false;
+            let source_y = match (source, keep_source) {
+                (Some(source), keep) => {
+                    if !keep {
+                        opsin_image = None;
+                    }
                     let [_, y, _] = source.into_planes();
                     Cow::Owned(y)
                 }
-                (None, Cow::Borrowed(source)) => Cow::Borrowed(source.plane(1)),
+                (None, true) => Cow::Borrowed(opsin.plane(1)),
+                (None, false) => match opsin_image.take().unwrap() {
+                    Cow::Owned(source) => {
+                        let [_, y, _] = source.into_planes();
+                        Cow::Owned(y)
+                    }
+                    Cow::Borrowed(source) => Cow::Borrowed(source.plane(1)),
+                },
             };
             #[cfg(feature = "splines")]
             // Splines are drawn after the filter: the fit sees them as a layer.
@@ -1607,7 +1649,13 @@ fn encode_frame_core_inner(
         }
     }
     // Pixel-domain decisions are finished; entropy coding only reads DC data
-    // and tokens. Release the full-resolution planes before its working sets.
+    // and tokens. Release the full-resolution planes before its working sets,
+    // unless the DC polish still judges against them.
+    #[cfg(feature = "extraslow")]
+    if dc_polish_pixels.is_none() {
+        opsin_image = None;
+    }
+    #[cfg(not(feature = "extraslow"))]
     drop(opsin_image);
 
     /// A weighted-predictor candidate whose estimate under the incumbent's
@@ -1721,6 +1769,57 @@ fn encode_frame_core_inner(
             // MediumSlow that matched a rebuild from scratch (bytes
             // −0.0006 % in all, −0.20..+0.03 % per image) at a third of
             // the call's time.
+            let trees = trees.clone();
+            let warmed = dc_entropy
+                .dc_tokens_under(ctx, scratch, &dc_datas, dc_entropy.wp_params)
+                .and_then(|dc| dc_entropy.warmed(ctx, scratch, dc, dc_entropy.wp_params));
+            dc_entropy = match warmed {
+                Some(entropy) => entropy,
+                None => super::dc_entropy::prepare_dc_entropy(
+                    ctx,
+                    scratch,
+                    &dc_datas,
+                    dim.num_dc_groups,
+                    epf_sharpness,
+                    use_dc_frame,
+                    distp.distance,
+                    dc_entropy.wp_params,
+                    Some(&trees),
+                ),
+            };
+        }
+    }
+    // DC polish: unit moves of the finished levels under both metrics,
+    // priced by the written tree and re-tokenized through it.
+    #[cfg(feature = "extraslow")]
+    if let (Some((recon, source_dc)), Some(source)) = (dc_polish_pixels, opsin_image.as_deref())
+        && !dc_entropy.ma_leaf_ctx.is_empty()
+        && let Some(trees) = dc_entropy.ma_tree.as_ref()
+    {
+        let rates = dc_rdo::LearnedDcRates {
+            tree: &trees.dc,
+            leaf_ctx: &dc_entropy.ma_leaf_ctx,
+            offsets: &dc_entropy.ma_offsets,
+            code: &dc_entropy.code,
+            wp_params: dc_entropy.wp_params,
+        };
+        let changed = super::dc_polish::run(
+            ctx,
+            scratch,
+            dc_polish,
+            source,
+            recon,
+            &source_dc,
+            &dim,
+            &mut dc_datas,
+            &group_coords,
+            &distp,
+            ytob_dc,
+            dc_cfl,
+            skip_dc_smoothing,
+            &rates,
+        )?;
+        if changed {
             let trees = trees.clone();
             let warmed = dc_entropy
                 .dc_tokens_under(ctx, scratch, &dc_datas, dc_entropy.wp_params)

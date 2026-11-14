@@ -95,6 +95,42 @@ pub(crate) struct FrozenTokenPrices {
     small_value_bits: Vec<f32>,
 }
 
+/// Integer counts for the adaptive rate estimate under frozen token contexts.
+pub(crate) struct AdaptiveRate<'a> {
+    prices: &'a FrozenTokenPrices,
+    counts: Vec<u32>,
+    extra: u64,
+}
+
+impl AdaptiveRate<'_> {
+    pub(crate) fn add(&mut self, stream: TokenSlice<'_>) {
+        for token in stream.iter() {
+            let cluster = self.prices.context_map[token.context as usize] as usize;
+            let (symbol, extra_bits, _) =
+                uint_encode_with_config(token.value, self.prices.configs[cluster]);
+            self.counts[cluster * ALPHABET_SIZE + (symbol as usize).min(ALPHABET_SIZE - 1)] += 1;
+            self.extra += u64::from(extra_bits);
+        }
+    }
+
+    pub(crate) fn bits(self) -> f32 {
+        let mut bits = self.extra as f64;
+        for hist in self.counts.as_chunks::<ALPHABET_SIZE>().0 {
+            let total: u32 = hist.iter().sum();
+            if total == 0 {
+                continue;
+            }
+            let log_total = f_log2(total as f64);
+            for &n in hist {
+                if n > 0 {
+                    bits += n as f64 * (log_total - f_log2(n as f64));
+                }
+            }
+        }
+        bits as f32
+    }
+}
+
 impl FrozenTokenPrices {
     const NUM_SMALL_VALUES: usize = 256;
 
@@ -164,32 +200,19 @@ impl FrozenTokenPrices {
         I: IntoIterator,
         I::Item: Into<TokenSlice<'a>>,
     {
-        let clusters = self.configs.len();
-        let mut counts = vec![0u32; clusters * ALPHABET_SIZE];
-        let mut extra = 0u64;
+        let mut rate = self.adaptive_rate();
         for stream in streams {
-            stream.into().iter().for_each(|token| {
-                let cluster = self.context_map[token.context as usize] as usize;
-                let (symbol, extra_bits, _) =
-                    uint_encode_with_config(token.value, self.configs[cluster]);
-                counts[cluster * ALPHABET_SIZE + (symbol as usize).min(ALPHABET_SIZE - 1)] += 1;
-                extra += u64::from(extra_bits);
-            });
+            rate.add(stream.into());
         }
-        let mut bits = extra as f64;
-        for hist in counts.as_chunks::<ALPHABET_SIZE>().0 {
-            let total: u32 = hist.iter().sum();
-            if total == 0 {
-                continue;
-            }
-            let log_total = f_log2(total as f64);
-            for &n in hist {
-                if n > 0 {
-                    bits += n as f64 * (log_total - f_log2(n as f64));
-                }
-            }
+        rate.bits()
+    }
+
+    pub(crate) fn adaptive_rate(&self) -> AdaptiveRate<'_> {
+        AdaptiveRate {
+            prices: self,
+            counts: vec![0; self.configs.len() * ALPHABET_SIZE],
+            extra: 0,
         }
-        bits as f32
     }
 
     /// Prices the adjacent `prev = 0/1` coefficient contexts together.

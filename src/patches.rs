@@ -1839,12 +1839,12 @@ pub(crate) fn plan_lossy_glyph_patches(
         return None;
     }
     let templates = if ctx.template_probe.is_some() || params.templates {
-        let plan = plan_glyph_templates(width, &label, &fine, &shapes);
+        let plan = plan_glyph_templates(ctx, width, &label, &fine, &shapes);
         if let (Some(probe), Some(plan)) = (&ctx.template_probe, &plan) {
             probe.fetch_max(plan.saved_area(), std::sync::atomic::Ordering::Relaxed);
         }
         plan.filter(|_| params.templates)
-            .and_then(|plan| build_glyph_templates(plan, xyb))
+            .and_then(|plan| build_glyph_templates(ctx, plan, xyb))
     } else {
         None
     };
@@ -2067,6 +2067,7 @@ struct TemplatePlan<'a> {
 
 /// A template: the members' mean coverage, rounded, and mean foreground.
 fn template_of(
+    ctx: &EncodingContext,
     shapes: &[GlyphShape],
     occurrences: &[Occurrence],
     members: &[usize],
@@ -2078,9 +2079,9 @@ fn template_of(
     alpha.resize(w * h, 0.0);
     let mut fg = [0.0f32; 3];
     for &i in members {
-        for (t, a) in alpha.iter_mut().zip(&occurrences[i].alpha) {
-            *t += a * inv;
-        }
+        let coverage = &occurrences[i].alpha;
+        let len = alpha.len().min(coverage.len());
+        (ctx.add_scaled)(&mut alpha[..len], coverage, inv);
         for c in 0..3 {
             fg[c] += occurrences[i].fg[c] * inv;
         }
@@ -2114,6 +2115,7 @@ impl TemplatePlan<'_> {
 /// Y, X, B; `label` the component of every pixel. `None` when no group
 /// shares a template.
 fn plan_glyph_templates<'a>(
+    ctx: &EncodingContext,
     width: usize,
     label: &[u32],
     fine: &[Vec<i32>; 3],
@@ -2259,7 +2261,7 @@ fn plan_glyph_templates<'a>(
                 if !has_multiple_backgrounds(&group) {
                     break;
                 }
-                let fg = template_of(shapes, &occurrences, &group, &mut template_alpha);
+                let fg = template_of(ctx, shapes, &occurrences, &group, &mut template_alpha);
                 group.retain(|&i| {
                     let accepted = fits(&shapes[i], &occurrences[i].alpha, &template_alpha, &fg);
                     if !accepted {
@@ -2286,7 +2288,11 @@ fn plan_glyph_templates<'a>(
 
 /// The template atlas (color tiles, coverage in alpha), placements and the
 /// base with the template glyphs un-premultiplied out of it.
-fn build_glyph_templates(plan: TemplatePlan<'_>, xyb: &Image3F) -> Option<GlyphTemplates> {
+fn build_glyph_templates(
+    ctx: &EncodingContext,
+    plan: TemplatePlan<'_>,
+    xyb: &Image3F,
+) -> Option<GlyphTemplates> {
     let lattice = TEMPLATE_LATTICE;
     let image_plane = [1usize, 0, 2];
     let TemplatePlan {
@@ -2344,7 +2350,7 @@ fn build_glyph_templates(plan: TemplatePlan<'_>, xyb: &Image3F) -> Option<GlyphT
     let mut coverage = Vec::new();
     for (g, (ax, ay)) in groups.iter().zip(slots) {
         let GlyphShape { w, h, .. } = shapes[g[0]];
-        let fg = template_of(shapes, &occurrences, g, &mut coverage);
+        let fg = template_of(ctx, shapes, &occurrences, g, &mut coverage);
         // The tile: the foreground color everywhere, the coverage in alpha.
         let color: [i32; 3] = std::array::from_fn(|c| (fg[c] * lattice[c]).round() as i32);
         let decoded_color: [f32; 3] = std::array::from_fn(|c| color[c] as f32 / lattice[c]);

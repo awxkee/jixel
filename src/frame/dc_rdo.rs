@@ -40,8 +40,10 @@ use crate::color_correlation::{CflFrame, dc_cfl_factor, dc_cfl_factor_x};
 use crate::dc_group_data::DcGroupData;
 use crate::dc_ops::BdcCompensation;
 use crate::dct::fmla;
+use crate::encoding_context::EncodingContext;
 use crate::entropy::{ALPHABET_SIZE, Token, f_log2, pack_signed, uint_encode};
 use crate::quant_weights::INV_DC_QUANT;
+use crate::simd::scaled_add::AddScaledFn;
 use crate::static_entropy_codes::{K_GRADIENT_CONTEXT_LUT, K_NUM_DC_CONTEXTS};
 use crate::util::{EncodeError, try_vec};
 use crate::weighted_predictor::{WpParams, WpPrediction, WpState, WpUpdate};
@@ -440,10 +442,11 @@ fn trace_row(
         .min_by(|(_, a), (_, b)| a.cost.total_cmp(&b.cost))
         .unwrap()
         .0;
-    for x in (0..w).rev() {
-        let step = history[starts[x] + best];
-        levels[x] = step.level;
-        path[x] = starts[x] + best;
+    for ((level, path_index), &start) in levels[..w].iter_mut().zip(path).zip(starts).rev() {
+        let index = start + best;
+        let step = &history[index];
+        *level = step.level;
+        *path_index = index;
         best = usize::from(step.back);
     }
 }
@@ -674,11 +677,10 @@ const X_DC_STEP_SPACING: f32 = 0.02;
 /// error plane is low-passed first, as chroma vision is: noise averages out,
 /// a shared offset does not. Returns the frame's DC steps.
 pub(super) fn choose_x_dc_step(
+    ctx: &EncodingContext,
     groups: &mut [DcGroupData],
     distp: &DistanceParams,
     cfl: CflFrame,
-    quantize: crate::group::QuantizeDcCflFn,
-    pool: &crate::thread_pool::ThreadPool,
     scratch: &mut crate::coder_scratch::CoderScratch,
 ) -> [f32; 3] {
     let mut dc_step = distp.dc_step;
@@ -686,6 +688,8 @@ pub(super) fn choose_x_dc_step(
         return dc_step;
     }
     let dc_error = crate::dc_ops::selected_dc_error_row_fn();
+    let quantize = ctx.quantize_dc_cfl;
+    let add_scaled = ctx.add_scaled;
     let base = dc_step[0];
     let kernel = gaussian_kernel(X_DC_STEP_SIGMA);
     // Cost of the X DC levels under `base * m`; `keep` receives each group's.
@@ -716,7 +720,7 @@ pub(super) fn choose_x_dc_step(
                     &mut errors[y * w..][..w],
                 );
             }
-            distortion += lowpass_energy(&errors, w, h, &kernel, &mut blurred);
+            distortion += lowpass_energy(add_scaled, &errors, w, h, &kernel, &mut blurred);
             price.add(&levels, w, h, w);
             if let Some(keep) = keep.as_deref_mut() {
                 keep.push(levels[..w * h].to_vec());
@@ -733,9 +737,11 @@ pub(super) fn choose_x_dc_step(
         .collect();
     // Candidates are priced independently, then picked in order.
     let shared: &[DcGroupData] = groups;
-    let costs = pool.steal_map(scratch, multipliers.len(), |i, _| {
-        cost(multipliers[i], shared, None)
-    });
+    let costs = ctx
+        .thread_pool
+        .steal_map(scratch, multipliers.len(), |i, _| {
+            cost(multipliers[i], shared, None)
+        });
     let mut best = (costs[0], 1.0f32);
     for (&m, &candidate) in multipliers.iter().zip(&costs).skip(1) {
         if candidate < best.0 {
@@ -785,14 +791,20 @@ fn mirror(mut i: isize, n: usize) -> usize {
 }
 
 /// Energy of a `w`×`h` plane after a separable blur by `kernel`.
-fn lowpass_energy(plane: &[f32], w: usize, h: usize, kernel: &[f32], tmp: &mut Vec<f32>) -> f64 {
+fn lowpass_energy(
+    add_scaled: AddScaledFn,
+    plane: &[f32],
+    w: usize,
+    h: usize,
+    kernel: &[f32],
+    tmp: &mut Vec<f32>,
+) -> f64 {
     let n = w * h;
     if n == 0 || kernel.is_empty() {
         tmp.resize(n, 0.0);
         tmp.fill(0.0);
         return 0.0;
     }
-    let add_scaled = crate::simd::scaled_add::selected_add_scaled_fn();
     let r = kernel.len() / 2;
     let padded_len = w + kernel.len() - 1;
     // Reuse the plane's scratch allocation for the padded source row and
@@ -845,13 +857,13 @@ pub(super) struct LearnedDcRates<'a> {
     pub(super) wp_params: WpParams,
 }
 
-struct LearnedCost {
+pub(crate) struct LearnedCost {
     /// Bits per symbol per cluster.
     tables: Vec<Vec<f32>>,
 }
 
 impl LearnedCost {
-    fn new(code: &crate::entropy::OwnedEntropyCode) -> Option<Self> {
+    pub(crate) fn new(code: &crate::entropy::OwnedEntropyCode) -> Option<Self> {
         if code.use_prefix_code {
             return None;
         }
@@ -891,9 +903,9 @@ impl LearnedCost {
 
 /// A previously coded plane of the same size, as the decoder's reference
 /// properties see it.
-struct RefPlane<'a> {
-    pixels: &'a [i32],
-    width: usize,
+pub(super) struct RefPlane<'a> {
+    pub(super) pixels: &'a [i32],
+    pub(super) width: usize,
 }
 
 /// The decoder's reference-plane properties of a pixel (`walk_channel_ma`'s
@@ -1195,6 +1207,68 @@ pub(super) fn refine_dc_rounding_learned(
         }
     }
     Ok(changed)
+}
+
+/// Bits of the cells `cols` of row `y` of a plane under the learned model,
+/// continuing from `wp` (the predictor state in front of the first cell).
+/// `on_cell` receives each cell's bits.
+#[cfg(feature = "extraslow")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn learned_row_bits(
+    levels: &[i16],
+    w: usize,
+    chan: i32,
+    stream: i32,
+    refs: &[RefPlane<'_>],
+    rates: &LearnedDcRates<'_>,
+    cost: &LearnedCost,
+    wp: &mut WpState,
+    y: usize,
+    cols: std::ops::Range<usize>,
+    mut on_cell: impl FnMut(usize, f32),
+) {
+    let mut props = [0i32; crate::ma_tree::NUM_MA_PROPS];
+    let above = |x: usize| i64::from(levels[(y - 1) * w + x]);
+    let above2 = |x: usize| i64::from(levels[(y - 2) * w + x]);
+    for x in cols {
+        let west = if x > 0 {
+            i64::from(levels[y * w + x - 1])
+        } else {
+            0
+        };
+        let west_west = if x > 1 {
+            i64::from(levels[y * w + x - 2])
+        } else {
+            0
+        };
+        let north = if y > 0 { above(x) } else { west };
+        let left = if x > 0 { west } else { north };
+        let ne = if x + 1 < w && y > 0 {
+            above(x + 1)
+        } else {
+            north
+        };
+        let nw = if x > 0 && y > 0 { above(x - 1) } else { left };
+        let nn = if y > 1 { above2(x) } else { north };
+        let wp_pred = wp.predict(x, y, north, left, ne, nw, nn);
+        learned_ref_props(x, y, refs, &mut props);
+        let n = learned_props(
+            chan, stream, x, y, w, &above, &above2, west, west_west, wp.wp_prop, &mut props,
+        );
+        let (node, pred) = rates.tree.lookup(&props);
+        let prediction = crate::lossless::predictor_value(pred, n, wp_pred)
+            + i64::from(rates.offsets[node as usize]);
+        let level = i64::from(levels[y * w + x]);
+        on_cell(
+            x,
+            cost.bits(
+                rates.code,
+                rates.leaf_ctx[node as usize],
+                level - prediction,
+            ),
+        );
+        wp.update(level, x, y);
+    }
 }
 
 /// Bits of a plane under the learned model, walked as the decoder does.
@@ -1982,15 +2056,15 @@ mod tests {
 
     #[test]
     fn x_step_moves_a_level_under_a_flat_offset() {
+        let ctx = EncodingContext::default();
         let params = super::super::quantization::compute_distance_params(7.0);
         // Every block sits 0.4 levels above level 3: all round down alike.
         let mut groups = [x_step_fixture(&params, |_, _| 3.4)];
         let step = choose_x_dc_step(
+            &ctx,
             &mut groups,
             &params,
             CflFrame::XYB,
-            crate::group::quantize_dc_cfl_scalar,
-            &crate::thread_pool::ThreadPool::new(2),
             &mut Default::default(),
         );
         assert!(step[0] < params.dc_step[0], "kept the default step");
@@ -2011,6 +2085,7 @@ mod tests {
 
     #[test]
     fn x_step_keeps_the_default_for_unbiased_texture() {
+        let ctx = EncodingContext::default();
         let params = super::super::quantization::compute_distance_params(7.0);
         let mut state = 0x9e37_79b9u32;
         let mut noise = vec![0.0f32; 32 * 32];
@@ -2020,11 +2095,10 @@ mod tests {
         }
         let mut groups = [x_step_fixture(&params, |x, y| noise[y * 32 + x])];
         let step = choose_x_dc_step(
+            &ctx,
             &mut groups,
             &params,
             CflFrame::XYB,
-            crate::group::quantize_dc_cfl_scalar,
-            &crate::thread_pool::ThreadPool::new(2),
             &mut Default::default(),
         );
         assert_eq!(step, params.dc_step);
@@ -2040,17 +2114,17 @@ mod tests {
 
     #[test]
     fn x_step_needs_every_source() {
+        let ctx = EncodingContext::default();
         let params = super::super::quantization::compute_distance_params(7.0);
         let mut groups = [
             x_step_fixture(&params, |_, _| 3.4),
             DcGroupData::new(4, 4).unwrap(),
         ];
         let step = choose_x_dc_step(
+            &ctx,
             &mut groups,
             &params,
             CflFrame::XYB,
-            crate::group::quantize_dc_cfl_scalar,
-            &crate::thread_pool::ThreadPool::new(2),
             &mut Default::default(),
         );
         assert_eq!(step, params.dc_step);
@@ -2066,20 +2140,25 @@ mod tests {
 
     #[test]
     fn lowpass_keeps_offsets_and_averages_out_alternation() {
+        let add_scaled = EncodingContext::default().add_scaled;
         let kernel = gaussian_kernel(X_DC_STEP_SIGMA);
         assert!((kernel.iter().sum::<f32>() - 1.0).abs() < 1e-5);
         let (w, h) = (24, 20);
         let mut tmp = Vec::new();
         let flat = vec![0.5f32; w * h];
-        let energy = lowpass_energy(&flat, w, h, &kernel, &mut tmp);
+        let energy = lowpass_energy(add_scaled, &flat, w, h, &kernel, &mut tmp);
         assert!((energy - 0.25 * (w * h) as f64).abs() < 1e-3);
         let checker: Vec<f32> = (0..w * h)
             .map(|i| if (i % w + i / w) % 2 == 0 { 0.5 } else { -0.5 })
             .collect();
-        assert!(lowpass_energy(&checker, w, h, &kernel, &mut tmp) < 1e-3 * energy);
+        assert!(lowpass_energy(add_scaled, &checker, w, h, &kernel, &mut tmp) < 1e-3 * energy);
         // A single row or column mirrors onto itself.
-        assert!((lowpass_energy(&[0.5; 7], 7, 1, &kernel, &mut tmp) - 1.75).abs() < 1e-4);
-        assert!((lowpass_energy(&[0.5; 7], 1, 7, &kernel, &mut tmp) - 1.75).abs() < 1e-4);
+        assert!(
+            (lowpass_energy(add_scaled, &[0.5; 7], 7, 1, &kernel, &mut tmp) - 1.75).abs() < 1e-4
+        );
+        assert!(
+            (lowpass_energy(add_scaled, &[0.5; 7], 1, 7, &kernel, &mut tmp) - 1.75).abs() < 1e-4
+        );
     }
 
     #[test]
@@ -2109,6 +2188,7 @@ mod tests {
             energy
         }
 
+        let add_scaled = EncodingContext::default().add_scaled;
         let mut tmp = vec![f32::NAN; 512];
         let mut expected_tmp = Vec::new();
         let kernels = [
@@ -2129,7 +2209,7 @@ mod tests {
                 .collect();
             for kernel in &kernels {
                 let expected = reference(&plane, w, h, kernel, &mut expected_tmp);
-                let actual = lowpass_energy(&plane, w, h, kernel, &mut tmp);
+                let actual = lowpass_energy(add_scaled, &plane, w, h, kernel, &mut tmp);
                 assert_eq!(actual.to_bits(), expected.to_bits(), "{w}x{h} {kernel:?}");
                 assert_eq!(tmp, expected_tmp, "{w}x{h} {kernel:?}");
             }

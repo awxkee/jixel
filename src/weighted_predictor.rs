@@ -92,6 +92,7 @@ static WP_DIV: [u32; 64] = [
     289262, 284359, 279620, 275036, 270600, 266305, 262144,
 ];
 
+#[derive(Clone, PartialEq)]
 pub(crate) struct WpState {
     xsize: usize,
     pred_errors: [Vec<u32>; 4],
@@ -345,6 +346,36 @@ impl WpState {
                 let slot = errors.get_unchecked_mut(row.previous + x + 1);
                 *slot = slot.wrapping_add(error);
             }
+        }
+    }
+
+    /// Resume row `y` in front of column `x` on a state whose rows above are
+    /// complete: `next` is the state the unchanged row leaves behind (the
+    /// start of row `y + 1`). The cells before `x` take their records from
+    /// it, with the sums they left in the row above.
+    #[cfg(feature = "extraslow")]
+    pub(crate) fn enter_row(&mut self, next: &WpState, y: usize, x: usize) {
+        let row = self.row_offsets(y);
+        let cur = row.current..row.current + x;
+        self.error[cur.clone()].copy_from_slice(&next.error[cur.clone()]);
+        for (errors, from) in self.pred_errors.iter_mut().zip(&next.pred_errors) {
+            errors[cur.clone()].copy_from_slice(&from[cur.clone()]);
+            for j in 0..x {
+                let slot = &mut errors[row.previous + j + 1];
+                *slot = slot.wrapping_add(from[row.current + j]);
+            }
+        }
+    }
+
+    /// Complete row `y` from column `x` with the records of `next`, the
+    /// state the unchanged row leaves behind.
+    #[cfg(feature = "extraslow")]
+    pub(crate) fn leave_row(&mut self, next: &WpState, y: usize, x: usize) {
+        let row = self.row_offsets(y);
+        let cur = row.current + x..row.current + self.xsize;
+        self.error[cur.clone()].copy_from_slice(&next.error[cur.clone()]);
+        for (errors, from) in self.pred_errors.iter_mut().zip(&next.pred_errors) {
+            errors[cur.clone()].copy_from_slice(&from[cur.clone()]);
         }
     }
 

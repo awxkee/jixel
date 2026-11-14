@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-// use image::imageops::FilterType;
 use jixel::{CodingTransform, ColorEncoding, DecodingSpeed, EncodeConfig, Speed};
 use std::num::NonZero;
 use std::path::Path;
@@ -8,12 +7,8 @@ use std::thread::available_parallelism;
 
 fn main() {
     let output = "encoded_lossy_b.jxl";
-    // let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new("./assets/nasa/457046main-wise20100524-full.png")).unwrap();
+    let image = image::open(Path::new("./assets/cerys_no_alpha.png")).unwrap();
     let rgb_img = image.to_rgb8();
-    // let rgba_img = image.to_rgba8();
-    // let gray_img = image.to_luma8();
-    // let src_rgb = rgb_img.as_raw();
     let distance = 1.64;
     let width = image.width() as usize;
     let height = image.height() as usize;
@@ -38,18 +33,4 @@ fn main() {
         .with_dots(true);
     let bytes = jixel::encode_image(&rgb_img, width, height, &cfg).unwrap();
     std::fs::write(output, &bytes).expect("failed to write output");
-    // let width = 2000;
-    // let height = 1000;
-    // let img10 = vec![0u8; width * height * 3];
-    // let bytes = jixel::encode_image(
-    //     &img10,
-    //     width,
-    //     height,
-    //     &EncodeConfig::default()
-    //         .with_lossless(false)
-    //         .with_quality(90.)
-    //         .with_color_encoding(ColorEncoding::srgb()),
-    // )
-    // .unwrap();
-    // std::fs::write(&output, &bytes).expect("failed to write output");
 }

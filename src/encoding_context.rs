@@ -29,6 +29,7 @@
 
 use crate::afv;
 use crate::quant_weights::DequantMatrices;
+use crate::simd::scaled_add::{AddScaledFn, selected_add_scaled_fn};
 use crate::thread_pool::ThreadPool;
 use crate::{
     Speed, ac_strategy, adaptive_quant, color_correlation, dct, frame, group, inflated_cost, xyb,
@@ -225,6 +226,7 @@ pub(crate) struct EncodingContext {
     pub(crate) quantize_dc_i32: group::QuantizeDcI32Fn,
     pub(crate) quantize_dc_cfl_i32: group::QuantizeDcCflI32Fn,
     pub(crate) dc_rows: crate::dc_ops::DcRowKernels,
+    pub(crate) add_scaled: AddScaledFn,
     pub(crate) apply_cfl: ac_strategy::ApplyCflFn,
     pub(crate) mosaic_seam_stats: crate::mosaic_seam::MosaicSeamStatsFn,
     pub(crate) cfl_regression: color_correlation::CflRegressionFn,
@@ -714,6 +716,7 @@ impl EncodingContext {
             quantize_dc_i32: quantize_dc.quantize_i32,
             quantize_dc_cfl_i32: quantize_dc.quantize_cfl_i32,
             dc_rows: crate::dc_ops::selected_dc_row_kernels(),
+            add_scaled: selected_add_scaled_fn(),
             apply_cfl: ac_strategy::selected_apply_cfl_fn(),
             mosaic_seam_stats: crate::mosaic_seam::select_mosaic_seam_stats_fn(),
             cfl_regression: color_correlation::selected_cfl_regression_fn(),

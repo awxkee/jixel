@@ -1066,8 +1066,15 @@ const GLYPH_MIN_REPEAT_PIXELS: usize = 48;
 /// and when the atlas frames take more than this share of the patched bits.
 const GLYPH_CHECK_MIN_DISTANCE: f32 = 6.0;
 const GLYPH_CHECK_ATLAS_SHARE: f64 = 0.35;
-/// Patched bits may exceed the regular frame's by this factor.
+/// Patched bits may exceed the frame's without tiles by this factor.
 pub(super) const GLYPH_BITS_MARGIN: f64 = 1.10;
+/// The frame without any patches stands as soon as its estimate is the
+/// smaller one. Both outcomes forced on 92 race points of 24 graphics
+/// images: with the plain estimate smaller the plain frame was also at
+/// least as good at 19-21 of 25 points (patches there cost 2.3-3.2 % at
+/// equal SSIMULACRA2 and Butteraugli, the worst miss of plain 0.4 %), and
+/// every plan that pays (to 30 %) estimates below 0.95 of the plain frame.
+pub(super) const UNPATCHED_BITS_MARGIN: f64 = 1.0;
 /// A lattice arm must stay under this share of the best tile/glyph plan's bits.
 pub(super) const LATTICE_BITS_MARGIN: f64 = 0.5;
 /// Tile patches are used only when they cover this share of the frame.

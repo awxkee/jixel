@@ -38,6 +38,7 @@ use crate::coder_scratch::CoderScratch;
 use crate::dct::fmla;
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
+use crate::simd::scaled_add::add_scaled_scalar;
 use crate::util::fast_hypot;
 
 const CHUNK: usize = 8;
@@ -177,9 +178,7 @@ fn trace(data: &[f32], w: usize, h: usize, seed: &[Point<f32>], scale: f32) -> O
                 }
                 let row = profile(data, w, h, q, n, sigma);
                 amps[k - 1] = polarity * amplitude(&row);
-                for j in 0..7 {
-                    average[j] += row[j] * RCP_CHUNK;
-                }
+                add_scaled_scalar(&mut average, &row, RCP_CHUNK);
                 end = q;
             }
             if !inside {

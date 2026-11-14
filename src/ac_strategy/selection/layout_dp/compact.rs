@@ -38,35 +38,47 @@ const AT_LEAST: u16 = 1;
 const FALLBACK: u16 = 2;
 const FIRST_TILE: u16 = 3;
 
+const PAGE_BITS: usize = 3;
+const PAGE_SIZE: usize = 1 << PAGE_BITS;
+const PAGE_MASK: usize = PAGE_SIZE - 1;
+
 #[derive(Default)]
-pub(super) struct CompactPlanner {
-    // Separate the f64 and u16 arrays to avoid six padding bytes per state.
+pub(crate) struct CompactPlanner {
+    // Eight neighboring logical states share a physical page. A tile with
+    // few visited states only allocates the corresponding pages of values.
+    // Keep costs and choices separate to avoid padding each state.
     costs: Vec<f64>,
     choices: Vec<u16>,
+    /// One-based physical page indices. Zero marks an untouched page.
+    pages: Vec<u16>,
     touched: Vec<u16>,
 }
 
 impl CompactPlanner {
     fn reset(&mut self, width: usize, height: usize) {
-        // Only clear slots actually used by the previous tile. The index is
-        // independent of the previous tile's dimensions once recorded here.
-        for i in self.touched.drain(..) {
-            self.choices[usize::from(i)] = UNSEEN;
+        // Reuse the packed value storage, but discard mappings from the last
+        // tile because even its dimensions may differ.
+        for page in self.touched.drain(..) {
+            self.pages[usize::from(page)] = 0;
         }
-        let len = (width * height + 1) << width;
-        if self.choices.len() < len {
-            self.costs.resize(len, 0.0);
-            self.choices.resize(len, UNSEEN);
+        let pages = ((width * height + 1) << width).div_ceil(PAGE_SIZE);
+        if self.pages.len() < pages {
+            self.pages.resize(pages, 0);
         }
     }
 
     fn get(&self, state: State, width: usize) -> Option<Memo> {
         let index = state.key(width);
-        match self.choices[index] {
+        let page = usize::from(self.pages[index >> PAGE_BITS]);
+        if page == 0 {
+            return None;
+        }
+        let slot = ((page - 1) << PAGE_BITS) | (index & PAGE_MASK);
+        match self.choices[slot] {
             UNSEEN => None,
-            AT_LEAST => Some(Memo::AtLeast(self.costs[index])),
+            AT_LEAST => Some(Memo::AtLeast(self.costs[slot])),
             choice => Some(Memo::Solved(Entry {
-                cost: self.costs[index],
+                cost: self.costs[slot],
                 choice: if choice == FALLBACK {
                     Choice::Fallback
                 } else {
@@ -77,10 +89,20 @@ impl CompactPlanner {
     }
 
     fn insert(&mut self, state: State, width: usize, value: Memo) {
-        let i = state.key(width);
-        if self.choices[i] == UNSEEN {
-            self.touched.push(i as u16);
+        let index = state.key(width);
+        let physical = &mut self.pages[index >> PAGE_BITS];
+        if *physical == 0 {
+            self.touched.push((index >> PAGE_BITS) as u16);
+            let len = self.touched.len() * PAGE_SIZE;
+            if self.choices.len() < len {
+                self.costs.resize(len, 0.0);
+                self.choices.resize(len, UNSEEN);
+            } else {
+                self.choices[len - PAGE_SIZE..len].fill(UNSEEN);
+            }
+            *physical = self.touched.len() as u16;
         }
+        let slot = ((usize::from(*physical) - 1) << PAGE_BITS) | (index & PAGE_MASK);
         let (cost, choice) = match value {
             Memo::AtLeast(cost) => (cost, AT_LEAST),
             Memo::Solved(entry) => (
@@ -92,8 +114,8 @@ impl CompactPlanner {
                 },
             ),
         };
-        self.costs[i] = cost;
-        self.choices[i] = choice;
+        self.costs[slot] = cost;
+        self.choices[slot] = choice;
     }
 }
 
@@ -111,8 +133,8 @@ impl State {
     }
 
     fn mask(c: Candidate, width: usize) -> usize {
-        let row = if c.width == 2 { 3 } else { 1 };
-        if c.height == 2 {
+        let row = if c.width() == 2 { 3 } else { 1 };
+        if c.height() == 2 {
             row | row << width
         } else {
             row
@@ -239,7 +261,7 @@ pub(super) fn plan(
     compact: &mut CompactPlanner,
     out: &mut Vec<usize>,
 ) -> f64 {
-    if candidates.iter().any(|c| c.width > 2 || c.height > 2) {
+    if candidates.iter().any(|c| c.width() > 2 || c.height() > 2) {
         return super::plan(candidates, width, height, s, out);
     }
     prepare_planner(candidates, width, height, s);
@@ -301,7 +323,7 @@ pub(super) fn prepare_square_bounds(
         if !c.cost.is_finite() {
             continue;
         }
-        let slots = match (c.width, c.height) {
+        let slots = match (c.width(), c.height()) {
             (1, 1) => &mut leaf,
             (2, 1) => &mut wide,
             (1, 2) => &mut tall,
@@ -312,7 +334,7 @@ pub(super) fn prepare_square_bounds(
             *slot = c.cost;
         }
     }
-    s.regions.resize(REGION_COUNT, EMPTY);
+    s.region_costs.resize(REGION_COUNT, f64::INFINITY);
     for y in 0..height.saturating_sub(1) {
         for x in 0..width.saturating_sub(1) {
             let i = y * SIDE + x;
@@ -320,10 +342,7 @@ pub(super) fn prepare_square_bounds(
             let right = improve(tall[i + 1], leaf[i + 1] + leaf[i + SIDE + 1]);
             let top = improve(wide[i], leaf[i] + leaf[i + 1]);
             let bottom = improve(wide[i + SIDE], leaf[i + SIDE] + leaf[i + SIDE + 1]);
-            s.regions[region_index(x, y, 2, 2)] = Entry {
-                cost: improve(left + right, top + bottom),
-                choice: Choice::None,
-            };
+            s.region_costs[region_index(x, y, 2, 2)] = improve(left + right, top + bottom);
         }
     }
 }
@@ -362,6 +381,33 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn memo_pages_reuse_storage_across_dimensions() {
+        let mut compact = CompactPlanner::default();
+        compact.reset(8, 8);
+        let first = State { cell: 0, filled: 0 };
+        let neighbor = State { cell: 0, filled: 2 };
+        let distant = State {
+            cell: 62,
+            filled: 2,
+        };
+        compact.insert(first, 8, Memo::AtLeast(7.0));
+        compact.insert(distant, 8, Memo::AtLeast(9.0));
+        assert_eq!(compact.costs.len(), 2 * PAGE_SIZE);
+        assert!(matches!(compact.get(first, 8), Some(Memo::AtLeast(7.0))));
+        assert!(matches!(compact.get(distant, 8), Some(Memo::AtLeast(9.0))));
+        assert!(compact.get(neighbor, 8).is_none());
+
+        compact.reset(3, 7);
+        compact.insert(neighbor, 3, Memo::AtLeast(11.0));
+        assert!(compact.get(first, 3).is_none());
+        assert!(matches!(
+            compact.get(neighbor, 3),
+            Some(Memo::AtLeast(11.0))
+        ));
+        assert_eq!(compact.costs.len(), 2 * PAGE_SIZE);
     }
 
     #[test]
@@ -448,16 +494,16 @@ mod tests {
                 for seed in 0..12 {
                     let c: Vec<_> = candidates(w, h, seed)
                         .into_iter()
-                        .filter(|c| c.width != 2 || c.height != 2)
+                        .filter(|c| c.width() != 2 || c.height() != 2)
                         .collect();
-                    prepare_regions(&c, w, h, &mut generic);
+                    prepare_regions(&c, w, h, SIDE, SIDE, &mut generic);
                     prepare_square_bounds(&c, w, h, &mut specialized);
                     for y in 0..h.saturating_sub(1) {
                         for x in 0..w.saturating_sub(1) {
                             let i = region_index(x, y, 2, 2);
                             assert_eq!(
-                                generic.regions[i].cost.to_bits(),
-                                specialized.regions[i].cost.to_bits(),
+                                generic.region_costs[i].to_bits(),
+                                specialized.region_costs[i].to_bits(),
                                 "{w}x{h} seed {seed} at {x},{y}"
                             );
                         }

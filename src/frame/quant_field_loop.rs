@@ -29,7 +29,9 @@
 
 //! ExtraSlow quant-field, transform-layout and chroma refinement against the decoder metric.
 
-use super::ac_groups::{PendingAcGroup, RefinedAcGroup, process_ac_group};
+use super::ac_groups::{
+    AcGroupCapture, PendingAcGroup, RefinedAcGroup, paste_group, process_ac_group,
+};
 use super::loop_arbiter::LoopArbiter;
 use super::loop_group_map::LoopGroupMap;
 use super::quantization::DistanceParams;
@@ -78,6 +80,7 @@ pub(super) fn run_quant_field_loop(
     qf_threshold: u32,
     prices: &crate::entropy::FrozenTokenPrices,
     want_recon: bool,
+    dc_polish: Option<&mut super::dc_polish::Handoff>,
     reselect: Option<Reselect<'_>>,
 ) -> Option<(Vec<RefinedAcGroup>, DistanceParams, Option<Image3F>)> {
     /// Marginals and slope come from plain quantization; the ratio of deficit
@@ -123,6 +126,7 @@ pub(super) fn run_quant_field_loop(
         /// Unrounded DC image values of each task's blocks.
         source_dc: Vec<Option<crate::group::SourceDc>>,
         starts: Vec<Vec<(u16, u16, u32)>>,
+        capture: AcGroupCapture,
         /// Per task, the memo evaluation `recon` was last synced with.
         synced: Vec<u32>,
         /// Trial evaluations take cached blocks' bits instead of their tokens.
@@ -152,6 +156,7 @@ pub(super) fn run_quant_field_loop(
         eval: &mut Eval,
     ) -> Vec<crate::ssimulacra2::Rect> {
         let eval_trial = eval.trial;
+        let capture_mode = eval.capture;
         let results = ctx
             .thread_pool
             .steal_map(scratch, tasks.len(), |i, scratch| {
@@ -182,7 +187,7 @@ pub(super) fn run_quant_field_loop(
                     order_alternatives,
                     false,
                     qf_threshold,
-                    true,
+                    capture_mode,
                     memo_slot.as_deref_mut(),
                 );
                 let (plane, starts) = capture.expect("recon capture");
@@ -263,6 +268,7 @@ pub(super) fn run_quant_field_loop(
         quant_dc: vec![None; ac_tasks.len()],
         source_dc: vec![None; ac_tasks.len()],
         starts: vec![Vec::new(); ac_tasks.len()],
+        capture: AcGroupCapture::Loop,
         synced: vec![0; ac_tasks.len()],
         trial: false,
         hit_bits: vec![0.0; ac_tasks.len()],
@@ -275,6 +281,7 @@ pub(super) fn run_quant_field_loop(
         quant_dc: e.quant_dc.clone(),
         source_dc: e.source_dc.clone(),
         starts: vec![Vec::new(); ac_tasks.len()],
+        capture: AcGroupCapture::Loop,
         synced: e.synced.clone(),
         trial: false,
         hit_bits: vec![0.0; ac_tasks.len()],
@@ -327,7 +334,7 @@ pub(super) fn run_quant_field_loop(
     // block means it was tuned with. Judging coefficient moves on the exact
     // DC error loses 2-3 % cvvdp at matched rate (8/8), unlike the quant-field
     // loop, which gains 1-3 % on every metric from it.
-    let legacy_dc = |e: &Eval, dp: &DistanceParams| -> Image3F {
+    let legacy_dc = |e: &Eval, dp: &DistanceParams, means: &Image3F| -> Image3F {
         use crate::quant_weights::INV_DC_QUANT;
         let mut out = Image3F::new(xb, yb);
         let steps: [f32; 3] =
@@ -344,19 +351,13 @@ pub(super) fn run_quant_field_loop(
             &mut out,
         );
         for c in 0..3 {
-            for by in 0..yb {
-                let rows = by * K_BLOCK_DIM..(by * K_BLOCK_DIM + K_BLOCK_DIM).min(h);
-                let n_rows = rows.len() as f32;
-                let row = out.plane_row_mut(c, by);
-                for (bx, v) in row[..xb].iter_mut().enumerate() {
-                    let cols = bx * K_BLOCK_DIM..(bx * K_BLOCK_DIM + K_BLOCK_DIM).min(w);
-                    let n = n_rows * cols.len() as f32;
-                    let sum: f32 = rows
-                        .clone()
-                        .map(|y| opsin.plane_row(c, y)[cols.clone()].iter().sum::<f32>())
-                        .sum();
-                    *v -= sum / n;
-                }
+            for (v, &mean) in out
+                .plane_mut(c)
+                .as_mut_slice()
+                .iter_mut()
+                .zip(means.plane_data(c))
+            {
+                *v -= mean;
             }
         }
         out
@@ -708,6 +709,7 @@ pub(super) fn run_quant_field_loop(
         .then(|| crate::cvvdp_arbiter::CvvdpArbiter::new(opsin))
         .flatten();
     let mut polish_cv_slope = 0f32;
+    let mut polish_cv_inputs = None;
     let mut cached_moves: Vec<(f32, usize, i8)> = Vec::new();
     let mut accepted_moves: Vec<(usize, i8)> = Vec::new();
     // Moves the exact arbiter already rejected are not tried again: later
@@ -816,7 +818,26 @@ pub(super) fn run_quant_field_loop(
                     [&plain, &fine].map(|e| judge.deficit_of(&e.recon, &decoded_dc(e, distp)))
                 });
             let pcv_pf = polish_cv.as_mut().map(|judge| {
-                [&plain, &fine].map(|e| judge.deficit_of(&e.recon, &legacy_dc(e, distp)))
+                // The shift trials and the settled polish share the same source.
+                let mut means = Image3F::new(xb, yb);
+                for c in 0..3 {
+                    for by in 0..yb {
+                        let rows = by * K_BLOCK_DIM..((by + 1) * K_BLOCK_DIM).min(h);
+                        let n_rows = rows.len() as f32;
+                        for (bx, mean) in means.plane_row_mut(c, by).iter_mut().enumerate() {
+                            let cols = bx * K_BLOCK_DIM..((bx + 1) * K_BLOCK_DIM).min(w);
+                            let n = n_rows * cols.len() as f32;
+                            let sum: f32 = rows
+                                .clone()
+                                .map(|y| opsin.plane_row(c, y)[cols.clone()].iter().sum::<f32>())
+                                .sum();
+                            *mean = sum / n;
+                        }
+                    }
+                }
+                let scores = [&plain, &fine]
+                    .map(|e| judge.deficit_of(&e.recon, &legacy_dc(e, distp, &means)));
+                (scores, means)
             });
             drop(fine);
             // The coarser shift covers half the groups (slope estimate only).
@@ -879,8 +900,8 @@ pub(super) fn run_quant_field_loop(
                 cv_slope = SLOPE_SCALE * 0.5 * (s_fine + s_coarse);
                 cv_flat = !(cv_slope.is_finite() && cv_slope > 0.0);
             }
-            if let (Some([cv_p, cv_f]), Some(judge)) = (pcv_pf, polish_cv.as_mut()) {
-                let cv_c = judge.deficit_of(&coarse.recon, &legacy_dc(&coarse, distp));
+            if let (Some(([cv_p, cv_f], means)), Some(mut judge)) = (pcv_pf, polish_cv.take()) {
+                let cv_c = judge.deficit_of(&coarse.recon, &legacy_dc(&coarse, distp, &means));
                 let s_fine = (cv_p - cv_f) / (r_f - r_p);
                 let s_coarse = if r_p - r_c > 1e-3 {
                     (cv_c - cv_p) / (r_p - r_c)
@@ -888,6 +909,12 @@ pub(super) fn run_quant_field_loop(
                     s_fine
                 };
                 polish_cv_slope = SLOPE_SCALE * 0.5 * (s_fine + s_coarse);
+                // Near transparency the shifts do not separate. With a usable
+                // exchange rate, retain the prepared source for polishing and
+                // release the full-frame comparison scratch now.
+                if polish_cv_slope.is_finite() && polish_cv_slope > 0.0 {
+                    polish_cv_inputs = Some((judge.into_reference(), means));
+                }
             }
             drop(coarse);
             // Near transparency ColorVideoVDP no longer separates the shifts;
@@ -1105,6 +1132,7 @@ pub(super) fn run_quant_field_loop(
     }
     drop(greedy_eval);
     drop(cur_map);
+    drop(polish_cv);
     // ---- 128-family placement arbitrated by the loop's target ----
     // Each 128x128 site tries the 128 layouts (rect halves, rect pairs, the
     // square) on top of the current frame, re-encoded exactly (block memo,
@@ -1496,7 +1524,7 @@ pub(super) fn run_quant_field_loop(
                     &[],
                     true,
                     qf_threshold,
-                    false,
+                    AcGroupCapture::None,
                     None,
                 );
                 source.expect("source dc")
@@ -1954,7 +1982,7 @@ pub(super) fn run_quant_field_loop(
                     &[],
                     true,
                     qf_threshold,
-                    false,
+                    AcGroupCapture::None,
                     None,
                 );
                 source.expect("source dc")
@@ -2095,154 +2123,181 @@ pub(super) fn run_quant_field_loop(
     // The settled frame's levels are revisited coefficient by coefficient
     // against the exact metric states; see `crate::coef_polish`.
     if polish_wanted && race_slope > 0.0 {
-        drop(polish_cv);
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, Mutex};
+
         drop(loop_state);
         drop(cur);
         let mut e = new_eval();
-        compact_memos(&all_tasks);
-        evaluate(
-            ctx,
-            scratch,
-            opsin,
-            dim,
-            &distp_out,
-            dc_datas,
-            ac_tasks,
-            group_coords,
-            num_passes,
-            coeff_shifts,
-            coeff_orders,
-            order_alternatives,
-            ytob_dc,
-            qf_threshold,
-            Some(prices),
-            &all_tasks,
-            memo,
-            &mut e,
-        );
-        let bits0 = frame_bits(&e);
-        let recon = std::mem::replace(&mut e.recon, Image3F::new(0, 0));
-        // Near transparency ColorVideoVDP does not separate the shifts (no
-        // exchange rate): SSIMULACRA2 alone decides.
-        let cv_dc = (polish_cv_slope.is_finite() && polish_cv_slope > 0.0)
-            .then(|| legacy_dc(&e, &distp_out));
-        let cv_lambda = polish_cv_slope * 100.0 / bits0;
-        let lambda_bits = race_slope * 100.0 / bits0;
-        drop(e);
-        // Polishing re-encodes without the loop memo. Release its coefficients,
-        // reconstruction and token arenas before building any metric states.
-        if let Some(memo) = memo {
-            for slot in memo {
-                *slot.lock().expect("block memo") = None;
+        e.capture = AcGroupCapture::Pixels;
+        let mut rate = prices.adaptive_rate();
+        // Once a batch's pixels and DC are synced, retain only its aggregate
+        // token counts for the frame rate. Apply the Shannon reduction once.
+        let batch_size = ctx.thread_pool.num_threads();
+        for tasks in all_tasks.chunks(batch_size) {
+            if let Some(memo) = memo {
+                for &task in tasks {
+                    if let Some(cache) = memo[task].lock().expect("block memo").as_mut() {
+                        cache.keep_primary_tokens();
+                        cache.compact_tokens();
+                    }
+                }
+            }
+            evaluate(
+                ctx,
+                scratch,
+                opsin,
+                dim,
+                &distp_out,
+                dc_datas,
+                ac_tasks,
+                group_coords,
+                num_passes,
+                coeff_shifts,
+                coeff_orders,
+                &[],
+                ytob_dc,
+                qf_threshold,
+                Some(prices),
+                tasks,
+                memo,
+                &mut e,
+            );
+            for &task in tasks {
+                let p = e.pending[task].take().expect("polish baseline tokens");
+                rate.add(p.tokens[0].as_slice());
+            }
+            if let Some(memo) = memo {
+                for &task in tasks {
+                    *memo[task].lock().expect("block memo") = None;
+                }
             }
         }
-        // The groups are polished in a fixed number of chunks, each against its
-        // own copy of the frame and of the metric states built from the same
-        // baseline, so the result depends on neither the thread count nor the
-        // scheduling. The chunk count is bounded by the states' memory.
-        const POLISH_STATE_BYTES_PER_PIXEL: usize = 256;
-        const POLISH_MEMORY_BUDGET: usize = 1 << 30;
-        const POLISH_MAX_CHUNKS: usize = 8;
-        let chunks = (POLISH_MEMORY_BUDGET / (POLISH_STATE_BYTES_PER_PIXEL * w * h).max(1))
-            .clamp(1, POLISH_MAX_CHUNKS)
-            .min(all_tasks.len())
-            .max(1);
-        let per_chunk = all_tasks.len().div_ceil(chunks);
-        use std::sync::atomic::Ordering;
+        let bits0 = rate.bits();
+        let recon = std::mem::replace(&mut e.recon, Image3F::new(0, 0));
+        let cv_inputs = polish_cv_inputs
+            .map(|(reference, means)| (reference, Arc::new(legacy_dc(&e, &distp_out, &means))));
+        let cv_lambda = polish_cv_slope * 100.0 / bits0;
+        let lambda_bits = race_slope * 100.0 / bits0;
+        if let Some(out) = dc_polish {
+            out.lambda_bits = lambda_bits;
+            out.cv_lambda = cv_lambda;
+        }
+        drop(e);
+        // Every AC group is polished on its own crop of the frame, from the
+        // same baseline: the judges' cost and memory do not grow with the
+        // frame, every worker has groups to take, and scheduling cannot
+        // affect decisions.
+        const POLISH_MARGIN: usize = 64;
         crate::coef_polish::POLISH_EPOCH.fetch_add(1, Ordering::Relaxed);
-        let recon_ref = &recon;
-        let reference_ref = &reference;
-        let cv_dc_ref = cv_dc.as_ref();
-        // The analysed source is shared; each chunk builds only its own
-        // incremental state over it.
-        let cv_prepared =
-            cv_dc_ref.and_then(|_| crate::cvvdp_arbiter::CvvdpArbiter::prepare(opsin));
-        let cv_prepared_ref = cv_prepared.as_ref();
         let area_budget = crate::ac_strategy::content_selection_enabled(ctx, distp.distance);
-        let build = move || -> Box<crate::coef_polish::CoefPolisher> {
-            let state = reference_ref.state(recon_ref);
-            let cv = cv_dc_ref.and_then(|dc| {
-                let mut judge = crate::cvvdp_arbiter::CvvdpArbiter::new_shared(
-                    opsin,
-                    cv_prepared_ref?.clone(),
-                )?;
-                judge.reset(recon_ref, dc);
-                Some(crate::coef_polish::CvJudge::new(
-                    judge,
-                    dc.clone(),
-                    cv_lambda,
-                ))
-            });
-            let mut polisher =
-                crate::coef_polish::CoefPolisher::new(recon_ref.clone(), state, lambda_bits, cv);
+        let build = |gx: usize, gy: usize| -> Option<Box<crate::coef_polish::CoefPolisher>> {
+            let margin = POLISH_MARGIN;
+            let x0 = (gx * K_GROUP_DIM).saturating_sub(margin);
+            let y0 = (gy * K_GROUP_DIM).saturating_sub(margin);
+            let x1 = ((gx + 1) * K_GROUP_DIM + margin).min(w);
+            let y1 = ((gy + 1) * K_GROUP_DIM + margin).min(h);
+            let source = super::dc_polish::crop(opsin, x0, y0, x1, y1);
+            let baseline = Arc::new(super::dc_polish::crop(&recon, x0, y0, x1, y1));
+            let state = crate::ssimulacra2::Ssimulacra2Reference::new(&source)?.state(&baseline);
+            // Both deficits are means over the judged pixels: a change
+            // weighs more in the crop than in the frame the exchange rates
+            // were measured on.
+            let share = (w * h) as f32 / ((x1 - x0) * (y1 - y0)) as f32;
+            let cv = match &cv_inputs {
+                Some((_, dc)) => {
+                    let dc = Arc::new(super::dc_polish::crop(
+                        dc,
+                        x0 / 8,
+                        y0 / 8,
+                        x1.div_ceil(8),
+                        y1.div_ceil(8),
+                    ));
+                    let mut judge = crate::cvvdp_arbiter::CvvdpArbiter::new(&source)?;
+                    judge.reset(&baseline, &dc);
+                    Some(crate::coef_polish::CvJudge::new(
+                        judge,
+                        dc,
+                        cv_lambda * share,
+                    ))
+                }
+                None => None,
+            };
+            let mut polisher = crate::coef_polish::CoefPolisher::new(
+                baseline,
+                state,
+                lambda_bits * share,
+                cv,
+                ctx.add_scaled,
+            );
+            polisher.set_origin((x0, y0));
             polisher.set_area_budget(area_budget);
-            Box::new(polisher)
+            Some(Box::new(polisher))
         };
-        let results = ctx.thread_pool.steal_map(scratch, chunks, |ci, scratch| {
-            scratch.ac_group.polisher = Some(build());
-            let mut polished = Vec::with_capacity(per_chunk);
-            for &t in all_tasks.iter().skip(ci * per_chunk).take(per_chunk) {
-                let (dc_idx, gx, gy) = ac_tasks[t];
-                let (dc_gx, dc_gy) = group_coords[dc_idx];
-                let (p, local, _, _, capture) = process_ac_group(
-                    ctx,
-                    scratch,
-                    opsin,
-                    dim,
-                    &distp_out,
-                    &dc_datas[dc_idx],
-                    num_passes,
-                    coeff_shifts,
-                    dc_gx,
-                    dc_gy,
-                    gx,
-                    gy,
-                    ytob_dc,
-                    Some(prices),
-                    coeff_orders,
-                    order_alternatives,
-                    false,
-                    qf_threshold,
-                    true,
-                    None,
-                );
-                polished.push((t, p, local, capture.map(|(image, _)| image)));
-            }
-            scratch.ac_group.polisher = None;
-            polished
-        });
+        // Publish each finished capture immediately. Only the active workers
+        // hold group images alongside the optional frame output.
+        let output_recon = want_recon.then(|| Mutex::new(None));
+        let work = ctx
+            .thread_pool
+            .steal_map(scratch, all_tasks.len(), |ti, scratch| {
+                let mut polished = Vec::with_capacity(1);
+                {
+                    let t = all_tasks[ti];
+                    let (dc_idx, gx, gy) = ac_tasks[t];
+                    let (dc_gx, dc_gy) = group_coords[dc_idx];
+                    let groups_per_dc = K_DC_GROUP_DIM / K_GROUP_DIM;
+                    scratch.ac_group.polisher =
+                        build(dc_gx * groups_per_dc + gx, dc_gy * groups_per_dc + gy);
+                    let (p, local, _, _, capture) = process_ac_group(
+                        ctx,
+                        scratch,
+                        opsin,
+                        dim,
+                        &distp_out,
+                        &dc_datas[dc_idx],
+                        num_passes,
+                        coeff_shifts,
+                        dc_gx,
+                        dc_gy,
+                        gx,
+                        gy,
+                        ytob_dc,
+                        Some(prices),
+                        coeff_orders,
+                        order_alternatives,
+                        false,
+                        qf_threshold,
+                        AcGroupCapture::Pixels,
+                        None,
+                    );
+                    if let (Some(target), Some((image, _))) = (&output_recon, capture) {
+                        let mut target = target.lock().unwrap();
+                        let target = target.get_or_insert_with(|| Image3F::new(w, h));
+                        paste_group(target, dim, p.group_idx, &image);
+                    }
+                    polished.push((t, p, local));
+                }
+                scratch.ac_group.polisher = None;
+                polished
+            });
         // Stale from now on: nothing else in this encode may polish.
         crate::coef_polish::POLISH_EPOCH.fetch_add(1, Ordering::Relaxed);
-        // Only tokens and DC survive the pass; no final frame reconstruction.
         let mut out = Eval {
-            recon: Image3F::new(0, 0),
+            recon: output_recon
+                .and_then(|recon| recon.into_inner().unwrap())
+                .unwrap_or_else(|| Image3F::new(0, 0)),
             pending: vec![None; ac_tasks.len()],
             quant_dc: vec![None; ac_tasks.len()],
             source_dc: vec![None; ac_tasks.len()],
             starts: Vec::new(),
+            capture: AcGroupCapture::None,
             synced: Vec::new(),
             trial: false,
             hit_bits: Vec::new(),
         };
-        // The polished groups' captures make up the frame reconstruction.
-        if want_recon {
-            out.recon = Image3F::new(w, h);
-        }
-        for (t, p, local, capture) in results.into_iter().flatten() {
+        for (t, p, local) in work.into_iter().flatten() {
             out.pending[t] = Some(p);
             out.quant_dc[t] = Some(local);
-            if let (true, Some(plane)) = (want_recon, capture) {
-                let (dc_idx, gx, gy) = ac_tasks[t];
-                let (dc_gx, dc_gy) = group_coords[dc_idx];
-                let x0 = dc_gx * K_DC_GROUP_DIM + gx * K_GROUP_DIM;
-                let y0 = dc_gy * K_DC_GROUP_DIM + gy * K_GROUP_DIM;
-                for c in 0..3 {
-                    for y in 0..plane.ysize() {
-                        let src = &plane.plane_row(c, y)[..plane.xsize()];
-                        out.recon.plane_row_mut(c, y0 + y)[x0..x0 + src.len()].copy_from_slice(src);
-                    }
-                }
-            }
         }
         cur = out;
     }

@@ -387,6 +387,11 @@ mod tests {
                     let estimate = estimate_ac_plain_bits(streams.iter().copied(), &code);
                     let prices = FrozenTokenPrices::new(&code);
                     let adaptive = prices.adaptive_bits(streams.iter().copied());
+                    let mut counted = prices.adaptive_rate();
+                    for &stream in streams.iter().rev() {
+                        counted.add(stream);
+                    }
+                    assert_eq!(counted.bits().to_bits(), adaptive.to_bits());
                     let mut writer = BitWriter::new();
                     write_entropy_code(&code.as_ref(), &mut scratch.huffman_pool, &mut writer);
                     for &stream in streams {

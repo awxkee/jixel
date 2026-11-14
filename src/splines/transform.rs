@@ -32,6 +32,8 @@
 //! four SIMD lanes and shares each cosine between them. Cosines are evaluated
 //! four frequencies at a time, with the original accumulation order preserved.
 
+use crate::simd::scaled_add::add_scaled_scalar;
+
 fn fast_cos(x: f32) -> f32 {
     use std::f32::consts::PI;
     let pi2 = PI * 2.0;
@@ -56,9 +58,7 @@ pub(super) fn continuous_idct_scalar(dct: &[[f32; 4]], t: f32) -> [f32; 4] {
     for (i, row) in dct.iter().enumerate() {
         let arg = std::f32::consts::PI / 32.0 * i as f32 * (t + 0.5);
         let cos = fast_cos(arg);
-        for (out, &v) in result.iter_mut().zip(row) {
-            *out += v * cos;
-        }
+        add_scaled_scalar(&mut result, row, cos);
     }
     result
 }
