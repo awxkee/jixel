@@ -29,7 +29,10 @@
 
 //! Global palette construction, index ordering, and cost estimation.
 
+use super::super::GroupLayout;
 use super::super::entropy::EntropyOfHistFn;
+use super::super::ma_learning::{rank_bits, rank_coarse};
+use super::super::ma_source::MA_LITE_SAMPLING;
 use super::super::ma_source::{MaChannel, MaPixels, MaSource, MaTransform};
 use super::super::rct::selected_rct_row_fn;
 use super::{visit_gray_colors, visit_palette_colors};
@@ -38,6 +41,7 @@ use crate::encode_image::AlphaPlane;
 use crate::entropy::{pack_signed, uint_encode};
 use crate::image::Image3Si;
 use crate::thread_pool::ThreadPool;
+use crate::weighted_predictor::WpParams;
 
 /// Largest global palette the learned-tree path tries (libjxl's default).
 const GLOBAL_PALETTE_MAX_COLORS: usize = 4096;
@@ -103,7 +107,42 @@ fn luma_key(c: &[i32; 4]) -> i64 {
 /// nearest-neighbor chain from the darkest color. Gradient-style predictors on the index image only work when
 /// spatially adjacent colors get adjacent indices, and which order does
 /// that is content-dependent.
-fn palette_order_candidates(colors: &[[i32; 4]], cooc: &[u32]) -> Vec<Vec<i32>> {
+///
+/// With `chroma_orders` (color palettes), two sorts on YCoCg components
+/// follow: (Co, Cg, Y) and (Y, Co, Cg). Anti-aliased flat art
+/// holds a few chroma pairs with many lumas each; a chroma-major order keeps
+/// every such ramp contiguous (a full encode under (Co, Cg, Y) was 7-16 %
+/// smaller than under the best order above on three flat illustrations).
+/// The cheap estimate mis-ranks them (+8 % when it picked one), so they are
+/// only candidates of the order race. Returns the orders and how many of them the
+/// estimate may pick.
+fn palette_order_candidates(
+    colors: &[[i32; 4]],
+    cooc: &[u32],
+    chroma_orders: bool,
+) -> (Vec<Vec<i32>>, usize) {
+    let mut orders = estimated_order_candidates(colors, cooc);
+    let estimated = orders.len();
+    if chroma_orders && colors.len() >= 3 {
+        let ycc: Vec<[i32; 3]> = colors
+            .iter()
+            .map(|c| {
+                let co = c[0] - c[2];
+                let t = c[2] + (co >> 1);
+                let cg = c[1] - t;
+                [t + (cg >> 1), co, cg]
+            })
+            .collect();
+        for key in [[1, 2, 0], [0, 1, 2]] {
+            let mut path: Vec<usize> = (0..colors.len()).collect();
+            path.sort_by_key(|&i| (colors[i][3], key.map(|k| ycc[i][k]), i));
+            orders.push(order_of_path(&path));
+        }
+    }
+    (orders, estimated)
+}
+
+fn estimated_order_candidates(colors: &[[i32; 4]], cooc: &[u32]) -> Vec<Vec<i32>> {
     let n = colors.len();
     let identity: Vec<i32> = (0..n as i32).collect();
     let mut orders = vec![identity];
@@ -623,6 +662,7 @@ impl std::hash::Hasher for ColorHasher {
 pub(super) type ColorMap<V> =
     std::collections::HashMap<[i32; 4], V, std::hash::BuildHasherDefault<ColorHasher>>;
 
+#[cfg(test)]
 pub(in crate::lossless) fn build_global_palette(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
@@ -632,6 +672,41 @@ pub(in crate::lossless) fn build_global_palette(
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Option<GlobalPalette> {
+    build_global_palettes(linear, alpha, num_color, xsize, ysize, None, pool, scratch)
+        .map(|(palette, _)| palette)
+}
+
+/// The order race's second order must lead the first by this factor in the
+/// coarse learn. Orders within it (photos of at most 256 colors, a second
+/// order differing in a few indices) gained 0.4 % of the race's bytes for
+/// 40 % of its second learns' time.
+const ORDER_RACE_COARSE_LEAD: f64 = 0.995;
+
+/// What the order race's coarse learns need of the frame.
+#[derive(Clone, Copy)]
+pub(in crate::lossless) struct OrderRace {
+    pub(in crate::lossless) min_symbol: u32,
+    pub(in crate::lossless) use_wp: bool,
+}
+
+/// The global palette under the order the cheap estimate ranks first and,
+/// with `race`, under the best other order by the coarse tree learn when
+/// that learn puts it ahead. The estimate picks an order coding 5-16 %
+/// larger than another candidate's on flat illustrations and line art, and
+/// the coarse learn alone picks wrong too (+2 % on a UI capture), so the
+/// caller learns both and compares their complete estimates. The coarse
+/// learns sample at the lite budget; the full one picked no better order.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::lossless) fn build_global_palettes(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    num_color: usize,
+    xsize: usize,
+    ysize: usize,
+    race: Option<OrderRace>,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Option<(GlobalPalette, Option<GlobalPalette>)> {
     let gray = num_color == 1;
     let num_c = num_color + usize::from(alpha.is_some());
     let npx = xsize * ysize;
@@ -729,13 +804,13 @@ pub(in crate::lossless) fn build_global_palette(
         *v = canonical_of_id[*v as usize] as u16;
     }
     let nb_colors = colors.len();
-    let orders = {
+    let (orders, estimated) = {
         let cooc = index_cooccurrence(&indices, xsize, ysize, nb_colors);
-        palette_order_candidates(&colors, &cooc)
+        palette_order_candidates(&colors, &cooc, race.is_some() && !gray)
     };
     let mut best_order = 0usize;
     let mut best_cost = f32::INFINITY;
-    for (k, order) in orders.iter().enumerate() {
+    for (k, order) in orders.iter().enumerate().take(estimated) {
         if orders[..k].contains(order) {
             continue;
         }
@@ -745,24 +820,57 @@ pub(in crate::lossless) fn build_global_palette(
             best_order = k;
         }
     }
-    let order = &orders[best_order];
-    // `order[canonical] = final index`.
-    for v in indices.iter_mut() {
-        *v = order[*v as usize] as u16;
-    }
-    let mut palette = vec![0i32; num_c * nb_colors];
-    for (canonical, color) in colors.iter().enumerate() {
-        let index = order[canonical] as usize;
-        for c in 0..num_c {
-            // A gray palette holds the value and, after it, the alpha.
-            let component = if gray && c == 1 { 3 } else { c };
-            palette[c * nb_colors + index] = color[component];
+    // The palette under `order` (`order[canonical] = final index`).
+    let under = |order: &[i32]| {
+        let mut palette = vec![0i32; num_c * nb_colors];
+        for (canonical, color) in colors.iter().enumerate() {
+            let index = order[canonical] as usize;
+            for c in 0..num_c {
+                // A gray palette holds the value and, after it, the alpha.
+                let component = if gray && c == 1 { 3 } else { c };
+                palette[c * nb_colors + index] = color[component];
+            }
+        }
+        GlobalPalette {
+            palette,
+            indices: indices.iter().map(|&v| order[v as usize] as u16).collect(),
+            nb_colors,
+            num_c,
+        }
+    };
+    let first = under(&orders[best_order]);
+    let Some(race) = race else {
+        return Some((first, None));
+    };
+    let mut coarse = |palette: &GlobalPalette| {
+        rank_coarse(
+            &palette.source(xsize, ysize),
+            xsize,
+            ysize,
+            race.min_symbol,
+            WpParams::DEFAULT,
+            race.use_wp,
+            GroupLayout::LARGE,
+            MA_LITE_SAMPLING,
+            pool,
+            scratch,
+        )
+        .map_or(f64::INFINITY, |stage| rank_bits(&stage))
+    };
+    let first_bits = coarse(&first);
+    let mut second: Option<(f64, GlobalPalette)> = None;
+    for (k, order) in orders.iter().enumerate() {
+        if k == best_order || orders[..k].contains(order) {
+            continue;
+        }
+        let palette = under(order);
+        let bits = coarse(&palette);
+        let to_beat = second
+            .as_ref()
+            .map_or(first_bits * ORDER_RACE_COARSE_LEAD, |(best, _)| *best);
+        if bits < to_beat {
+            second = Some((bits, palette));
         }
     }
-    Some(GlobalPalette {
-        palette,
-        indices,
-        nb_colors,
-        num_c,
-    })
+    Some((first, second.map(|(_, palette)| palette)))
 }

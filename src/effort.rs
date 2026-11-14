@@ -229,6 +229,10 @@ effort_gates! {
     /// ranking stage's sample set when it matches their own).
     tree_fresh_final_samples,
     tree_global_palette,
+    /// The global palette's index order by the cheap estimate races the
+    /// coarse learn's best other order: complete estimates under the first
+    /// layout, then complete frames when those are close.
+    palette_order_race,
     tree_group_palette,
     tree_ctx_v1,
     /// Gradient and photo-like rectangles of a screenshot as cropped frames
@@ -371,6 +375,7 @@ static MEDIUM_SLOW: Effort = Effort {
     tree_ctx_v1: false,
     tree_deep_final: false,
     tree_fresh_final_samples: false,
+    palette_order_race: false,
     patches_default: false,
     region_frames: false,
     ..SLOW

@@ -1778,6 +1778,14 @@ const HANDOVER_MAX_MISS: f64 = 3.0;
 /// blank screenshot it ran 40 times over the real encode.
 const HANDOVER_MAX_RATIO: f64 = 2.5;
 
+/// The smallest vector encode stands over the finer fallback while it is
+/// within this factor of the fallback's bytes: it holds SSIMULACRA2 86..90
+/// where the fallback starts near 81. A cat illustration at distance 2.9
+/// fell back to 88.9 kB at 82.5 from a vector encode of 84.8 kB at 86.3, and
+/// at distance 3 to 80.9 kB at 81.3; past that the fallback is a fifth
+/// smaller and stands.
+const HANDOVER_VECTOR_KEEP: f64 = 1.1;
+
 /// The fallback of art that has just left the vector arm. That arm holds
 /// SSIMULACRA2 86..90 over its whole range, far above the other arms at the
 /// distance where its budget runs out (a cat illustration: 86.3 at distance
@@ -1785,7 +1793,8 @@ const HANDOVER_MAX_RATIO: f64 = 2.5;
 /// largest one whose budget still covers the smallest vector encode) the
 /// other arms run finer than asked: at half the distance right at the
 /// handover, at the distance itself from twice the handover on. The same
-/// illustration: 81.3, 74.6, 69.9, 64.9 at distances 3, 3.5, 4, 4.5.
+/// illustration: 79.6, 74.6, 69.9, 64.9 at distances 3.1, 3.5, 4, 4.5. The
+/// vector encode itself is returned while [`HANDOVER_VECTOR_KEEP`] holds.
 /// `None` when the art is not within a factor of two of a handover.
 #[allow(clippy::too_many_arguments)]
 fn vector_handover(
@@ -1796,7 +1805,7 @@ fn vector_handover(
     search: &mut VectorSearch<'_, '_>,
     plan: crate::vector_layers::SplitPlan<'_, '_, 3>,
     steps: u32,
-    mut smallest: usize,
+    mut smallest: Vec<u8>,
     coarsest_coded: bool,
 ) -> Result<Option<Vec<u8>>, EncodeError> {
     if config.speed < Speed::Slow {
@@ -1811,20 +1820,24 @@ fn vector_handover(
     let coarsest = crate::vector_layers::coverage_steps(2.0 * config.distance).max(3);
     if !coarsest_coded
         && coarsest <= steps
-        && (smallest as f64) < HANDOVER_MAX_MISS * budget(config.distance)
+        && (smallest.len() as f64) < HANDOVER_MAX_MISS * budget(config.distance)
     {
         if coarsest < steps
             && let Some(split) = plan.split_for_retry(coarsest, search.prefer_flattened)
         {
             let bytes = encode_vector_layers(split, width, height, config)?.bytes;
-            smallest = smallest.min(bytes.len());
+            if bytes.len() < smallest.len() {
+                smallest = bytes;
+            }
         }
-        if let Some(bytes) = search.encode_snapped_floor(coarsest, width, height, config)? {
-            smallest = smallest.min(bytes.len());
+        if let Some(bytes) = search.encode_snapped_floor(coarsest, width, height, config)?
+            && bytes.len() < smallest.len()
+        {
+            smallest = bytes.to_vec();
         }
     }
     drop(plan);
-    let covers = |distance: f32| smallest as f64 <= budget(distance);
+    let covers = |distance: f32| smallest.len() as f64 <= budget(distance);
     let (mut lo, mut hi) = (config.distance / 2.0, config.distance);
     if !covers(lo) {
         return Ok(None);
@@ -1841,7 +1854,17 @@ fn vector_handover(
     let mut finer_config = config.clone();
     finer_config.distance = (config.distance * scale).max(MIN_DISTANCE);
     let (finer, _) = encode_image_arms(input, width, height, &finer_config, None)?;
-    Ok((smallest as f64 <= HANDOVER_MAX_RATIO * finer.len() as f64).then_some(finer))
+    if smallest.len() as f64 > HANDOVER_MAX_RATIO * finer.len() as f64 {
+        return Ok(None);
+    }
+    // The model picked the handover; real bytes decide what stands.
+    Ok(Some(
+        if smallest.len() as f64 <= HANDOVER_VECTOR_KEEP * finer.len() as f64 {
+            smallest
+        } else {
+            finer
+        },
+    ))
 }
 
 /// The whole-image arms (vector layers, ink stack, VarDCT) of a validated
@@ -2016,9 +2039,10 @@ fn vector_arm(
 /// The vector encode the budget admits, if any.
 struct VectorFit {
     fitted: Option<Vec<u8>>,
-    /// The smallest vector encode seen, and whether the coarsest edge
-    /// precision was among them (for [`vector_handover`]).
-    smallest: usize,
+    /// The smallest vector encode seen (empty when one was fitted), and
+    /// whether the coarsest edge precision was among them (for
+    /// [`vector_handover`]).
+    smallest: Vec<u8>,
     coarsest_coded: bool,
 }
 
@@ -2044,7 +2068,7 @@ fn fit_vector_to_budget(
     } = encoded;
     let mut fit = VectorFit {
         fitted: None,
-        smallest: bytes.len(),
+        smallest: Vec::new(),
         coarsest_coded: false,
     };
     // The budget judges the two-frame encode, as the model was fitted on it;
@@ -2053,10 +2077,10 @@ fn fit_vector_to_budget(
         fit.fitted = Some(bytes);
         return Ok(fit);
     }
+    fit.smallest = bytes;
     if base as f64 >= budget {
         return Ok(fit);
     }
-    drop(bytes);
     let room = ((budget - base as f64) / band.max(1) as f64
         * crate::vector_layers::band_bytes_ratio(steps))
     .max(0.0);
@@ -2072,8 +2096,10 @@ fn fit_vector_to_budget(
         // encodes decide (the plain split passed the gates, so the snapped
         // one is safe here).
         let best = encode_vector_floor(search, plan, floor, width, height, config)?;
-        if let Some(best) = &best {
-            fit.smallest = fit.smallest.min(best.len());
+        if let Some(best) = &best
+            && best.len() < fit.smallest.len()
+        {
+            fit.smallest.clone_from(best);
         }
         fit.coarsest_coded = true;
         fit.fitted = best.filter(|b| b.len() as f64 <= budget);
