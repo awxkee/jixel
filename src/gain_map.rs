@@ -348,6 +348,7 @@ pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainM
         near_lossless: 0,
         upsampling: false,
         lossy_modular: base.lossy_modular,
+        modular_vertical_first: base.modular_vertical_first,
         ink_layer: false,
         vector_layers: false,
         crop_frames: false,

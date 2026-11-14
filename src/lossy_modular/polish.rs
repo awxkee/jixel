@@ -80,6 +80,7 @@ pub(super) fn polish_frame(
     xyb: &Image3F,
     distance: f32,
     screen: bool,
+    vertical_first: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) {
@@ -92,7 +93,7 @@ pub(super) fn polish_frame(
         .and_then(|prepared| CvvdpArbiter::new_shared(xyb, prepared));
     let dc = zero_dc(xyb.xsize(), xyb.ysize());
     let mut point = |d: f32, scratch: &mut CoderScratch| {
-        let mut p = Pyramid::xyb(xyb, d, screen, pool)?;
+        let mut p = Pyramid::xyb(xyb, d, screen, vertical_first, pool)?;
         p.group_shift = pyramid.group_shift;
         let mut w = BitWriter::new();
         super::code::write_frame(&p, crate::Speed::Slow, pool, scratch, &mut w, None);
@@ -1013,7 +1014,7 @@ mod tests {
         let pool = ThreadPool::new(1);
         for (w, h) in [(67, 45), (41, 90)] {
             let src = source(w, h, &mut seed);
-            let p = Pyramid::xyb(&src, 3.0, false, &pool).unwrap();
+            let p = Pyramid::xyb(&src, 3.0, false, false, &pool).unwrap();
             let mut base = Baseline::new(&p, &src, true).unwrap();
             for level in base.chains.iter_mut().flat_map(|c| c.lv.iter_mut()) {
                 // Include all context boundaries, both signs and escapes.
@@ -1048,7 +1049,7 @@ mod tests {
         for (w, h) in [(67, 45), (41, 90), (130, 64)] {
             let src = source(w, h, &mut seed);
             let pool = ThreadPool::new(1);
-            let mut p = Pyramid::xyb(&src, 3.0, false, &pool).unwrap();
+            let mut p = Pyramid::xyb(&src, 3.0, false, false, &pool).unwrap();
             let base = Baseline::new(&p, &src, true).unwrap();
             let planes = decoded_planes(&p);
             for (c, chain) in base.chains.iter().enumerate() {
@@ -1097,7 +1098,7 @@ mod tests {
         let mut seed = 9u64;
         let src = source(96, 70, &mut seed);
         let pool = ThreadPool::new(1);
-        let p = Pyramid::xyb(&src, 2.0, false, &pool).unwrap();
+        let p = Pyramid::xyb(&src, 2.0, false, false, &pool).unwrap();
         let base = Baseline::new(&p, &src, true).unwrap();
         for chain in &base.chains {
             let (mut lv, mut outs) = (chain.lv.clone(), chain.outs.clone());
@@ -1122,7 +1123,7 @@ mod tests {
         let reference = Ssimulacra2Reference::new(&src).unwrap();
         let polished = |threads: usize| {
             let pool = ThreadPool::new(threads);
-            let mut p = Pyramid::xyb(&src, 3.0, false, &pool).unwrap();
+            let mut p = Pyramid::xyb(&src, 3.0, false, false, &pool).unwrap();
             let before: Vec<Vec<i32>> = p.channels.iter().map(|c| c.data.clone()).collect();
             polish(&mut p, &src, &reference, 1e-4, None, true, &pool).unwrap();
             let after: Vec<Vec<i32>> = p.channels.iter().map(|c| c.data.clone()).collect();
@@ -1142,7 +1143,7 @@ mod tests {
         // propagation through the fixed chroma pre-squeeze.
         for (w, h) in [(67, 45), (41, 91)] {
             let src = source(w, h, &mut seed);
-            let mut p = Pyramid::xyb(&src, 3.0, false, &pool).unwrap();
+            let mut p = Pyramid::xyb(&src, 3.0, false, false, &pool).unwrap();
             let base = Baseline::new(&p, &src, true).unwrap();
             let mut chains = base.chains.clone();
             let mut recon = base.recon.clone();
@@ -1207,7 +1208,7 @@ mod tests {
         let mut seed = 37;
         let src = source(35, 33, &mut seed);
         let pool = ThreadPool::new(1);
-        let mut p = Pyramid::xyb(&src, 3.0, false, &pool).unwrap();
+        let mut p = Pyramid::xyb(&src, 3.0, false, false, &pool).unwrap();
         let base = Baseline::new(&p, &src, true).unwrap();
         let fixed: Vec<_> = base
             .chains
