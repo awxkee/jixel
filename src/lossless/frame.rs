@@ -76,6 +76,13 @@ const REGION_SPLIT_MARGIN: f64 = 0.99;
 /// total time.
 const GLYPH_REGULAR_COARSE_MARGIN: f64 = 1.10;
 
+/// A patched pair that codes below this share of its own first-stage
+/// estimate shows the estimate missing what the complete learn finds, and
+/// the regular frame's estimate is then no closer: the regular frame is
+/// encoded up to [`GLYPH_REGULAR_UNSURE_MARGIN`] instead.
+const GLYPH_UNSURE_CODED_SHARE: f64 = 0.55;
+const GLYPH_REGULAR_UNSURE_MARGIN: f64 = 1.25;
+
 pub(super) fn keep_smaller_writer(best: &mut Option<BitWriter>, candidate: BitWriter) {
     if best
         .as_ref()
@@ -389,7 +396,15 @@ impl FrameCoder<'_, '_> {
         // the regular frame (a complete second encode) is written only when
         // the first-stage estimates leave it a chance; the dense local-tree
         // learn is spent on the patched frame only.
-        if is_glyph_plan && self.regular_competes(linear, alpha, &plan, atlas_bits) {
+        if is_glyph_plan
+            && self.regular_competes(
+                linear,
+                alpha,
+                &plan,
+                atlas_bits,
+                patched_writer.bits_written(),
+            )
+        {
             self.core(
                 linear,
                 alpha,
@@ -449,14 +464,16 @@ impl FrameCoder<'_, '_> {
 
     /// The regular frame's first-stage estimate is within
     /// [`GLYPH_REGULAR_COARSE_MARGIN`] of the patched pair's (base estimate
-    /// plus the atlas frame and dictionary); `true` when either estimate is
-    /// missing.
+    /// plus the atlas frame and dictionary), or within
+    /// [`GLYPH_REGULAR_UNSURE_MARGIN`] when the pair's `patched_bits` show
+    /// the estimates unreliable; `true` when either estimate is missing.
     fn regular_competes(
         &mut self,
         linear: &Image3Si,
         alpha: Option<&AlphaPlane>,
         plan: &LosslessPatches,
         atlas_bits: usize,
+        patched_bits: usize,
     ) -> bool {
         let regular_est = self.coarse_bits(linear, alpha);
         let base_est = self.coarse_bits(&plan.base, alpha);
@@ -471,7 +488,12 @@ impl FrameCoder<'_, '_> {
             &mut dictionary,
         );
         let patched = base + (atlas_bits + dictionary.bits_written()) as f64;
-        regular <= patched * GLYPH_REGULAR_COARSE_MARGIN
+        let margin = if (patched_bits as f64) < patched * GLYPH_UNSURE_CODED_SHARE {
+            GLYPH_REGULAR_UNSURE_MARGIN
+        } else {
+            GLYPH_REGULAR_COARSE_MARGIN
+        };
+        regular <= patched * margin
     }
 }
 

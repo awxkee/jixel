@@ -53,13 +53,14 @@ use crate::lossless::ma_learning::{
     rank_bits, rank_coarse, rank_presets,
 };
 use crate::lossless::ma_source::{
-    CoarseLearn, DENSE_FINAL_MIN_BITS_PER_VALUE, MA_COARSE_TARGET_SAMPLES, MA_DENSE_SAMPLING,
-    MA_FULL_SAMPLING, MA_LITE_SAMPLING, MaSource, PALETTE_LAYOUT_MARGIN, PER_GROUP_MARGIN,
-    RANK_MIN_VALUES, RGB_SINGLE_LAYOUT_MIN_VALUES, mixed_ma_source, rgb_ma_source,
-    source_values_of,
+    CoarseLearn, DENSE_FINAL_MIN_BITS_PER_VALUE, LearnedCandidate, MA_COARSE_TARGET_SAMPLES,
+    MA_DENSE_SAMPLING, MA_FULL_SAMPLING, MA_LITE_SAMPLING, MaSource, PALETTE_LAYOUT_MARGIN,
+    PER_GROUP_MARGIN, RANK_MIN_VALUES, RGB_SINGLE_LAYOUT_MIN_VALUES, mixed_ma_source,
+    rgb_ma_source, source_values_of,
 };
 use crate::lossless::palette::{
-    self, GlobalPalette, PALETTE_COARSE_MARGIN, PALETTE_FINAL_MARGIN, build_global_palette,
+    self, GlobalPalette, OrderRace, PALETTE_COARSE_MARGIN, PALETTE_FINAL_MARGIN,
+    build_global_palettes,
 };
 use crate::lossless::rct::rct_planes;
 use crate::patches::ModularFrameKind;
@@ -109,18 +110,32 @@ pub(super) fn learn_tree_candidates(
     let effort = frame.effort;
 
     // 5a: the global palette, when the frame has one.
-    let palette = if effort.tree_global_palette {
-        build_global_palette(
+    let palettes = if effort.tree_global_palette {
+        build_global_palettes(
             frame.ycocg,
             frame.alpha,
             frame.num_color,
             frame.xsize,
             frame.ysize,
+            // Vector-layer frames race the order at their Medium effort too:
+            // a base of 500-1000 colors under the estimate's order is what
+            // loses the layered arm its race against the VarDCT stack (31
+            // illustrations and comics, 7 distances: two gain 14.5 % and
+            // 25.3 % at equal SSIMULACRA2, none loses over 0.6 %).
+            (effort.palette_order_race || matches!(frame.tree_search, TreeSearch::Vector))
+                .then_some(OrderRace {
+                    min_symbol: frame.min_symbol,
+                    use_wp: frame.use_wp,
+                }),
             pool,
             scratch,
         )
     } else {
         None
+    };
+    let (palette, raced_palette) = match palettes {
+        Some((palette, raced)) => (Some(palette), raced),
+        None => (None, None),
     };
 
     // 5b: which sources to learn, under which presets.
@@ -151,6 +166,7 @@ pub(super) fn learn_tree_candidates(
             color,
             &mut sources,
             palette,
+            raced_palette.as_ref(),
             &layouts,
             best,
             pool,
@@ -171,6 +187,15 @@ pub(super) fn learn_tree_candidates(
         skip_alternatives: tournament.skip_alternatives,
     }
 }
+
+/// In the palette order race, an order whose complete estimate under the
+/// first layout trails the other order's by more than this is neither
+/// learned further nor written. The estimate ratio of two orders follows
+/// their coded ratio within 3 % on frames above
+/// [`ORDER_RACE_BOTH_MAX_BITS`] (34 raced frames of 134 graphics, photos
+/// and screenshots).
+const ORDER_RACE_MARGIN: f64 = 1.02;
+const ORDER_RACE_BOTH_MAX_BITS: f64 = 65536.0;
 
 /// The co-occurrence-ordered per-group palettes replace the color-sorted
 /// ones only when their first-stage estimate leads by this factor.
@@ -639,6 +664,7 @@ impl Tournament {
         color: &mut ColorTransform<'_>,
         sources: &mut SourcePlan,
         palette: &GlobalPalette,
+        raced: Option<&GlobalPalette>,
         layouts: &LayoutPlan,
         best: &mut SmallestFrame,
         pool: &ThreadPool,
@@ -646,12 +672,92 @@ impl Tournament {
     ) {
         let first_stage = sources.palette_stage.take();
         let source = palette.source(frame.xsize, frame.ysize);
-        let Some((layout, cand, coarse)) = learn_best_layout(
+        let Some(raced) = raced else {
+            if let Some((layout, cand, coarse)) = self.learn_palette_layouts(
+                frame,
+                sources,
+                &source,
+                &layouts.all,
+                first_stage,
+                pool,
+                scratch,
+            ) {
+                self.write_palette(
+                    frame, color, sources, &source, layout, &cand, best, pool, scratch,
+                );
+                self.best_source_coarse = self.best_source_coarse.min(coarse);
+            }
+            return;
+        };
+        // The order race: both orders learn the first layout, and an order
+        // whose complete estimate there trails the other's by more than
+        // `ORDER_RACE_MARGIN` stops; the rest learn the other layouts and
+        // are written.
+        let raced_source = raced.source(frame.xsize, frame.ysize);
+        let (head, tail) = layouts.all.split_at(1);
+        let mut learns = [(&source, first_stage), (&raced_source, None)].map(|(source, stage)| {
+            let learn =
+                self.learn_palette_layouts(frame, sources, source, head, stage, pool, scratch);
+            (source, learn)
+        });
+        let est_of = |learn: &Option<(GroupLayout, LearnedCandidate, f64)>| {
+            learn
+                .as_ref()
+                .map_or(f64::INFINITY, |(_, cand, _)| cand.est_real)
+        };
+        let lead = est_of(&learns[0].1).min(est_of(&learns[1].1));
+        // Estimates of a few kilobytes miss by more than the margin, and
+        // such frames cost nothing to write twice.
+        let limit = if lead <= ORDER_RACE_BOTH_MAX_BITS {
+            f64::INFINITY
+        } else {
+            lead * ORDER_RACE_MARGIN
+        };
+        let final_limit = self.rgb_final * PALETTE_FINAL_MARGIN * PALETTE_LAYOUT_MARGIN;
+        for (source, learn) in learns.iter_mut() {
+            let Some((mut layout, mut cand, mut coarse)) = learn.take() else {
+                continue;
+            };
+            if cand.est_real > limit {
+                self.best_source_coarse = self.best_source_coarse.min(coarse);
+                continue;
+            }
+            if !tail.is_empty()
+                && cand.est_real <= final_limit
+                && let Some((tail_layout, tail_cand, tail_coarse)) =
+                    self.learn_palette_layouts(frame, sources, source, tail, None, pool, scratch)
+            {
+                coarse = coarse.min(tail_coarse);
+                if tail_cand.est_real < cand.est_real {
+                    (layout, cand) = (tail_layout, tail_cand);
+                }
+            }
+            self.write_palette(
+                frame, color, sources, source, layout, &cand, best, pool, scratch,
+            );
+            self.best_source_coarse = self.best_source_coarse.min(coarse);
+        }
+    }
+
+    /// The palette source's learn under `layouts`, pruned against the RGB
+    /// tree's estimates.
+    #[allow(clippy::too_many_arguments)]
+    fn learn_palette_layouts(
+        &self,
+        frame: &CoreFrame<'_>,
+        sources: &SourcePlan,
+        source: &MaSource<'_>,
+        layouts: &[GroupLayout],
+        first_stage: Option<CoarseLearn>,
+        pool: &ThreadPool,
+        scratch: &mut CoderScratch,
+    ) -> Option<(GroupLayout, LearnedCandidate, f64)> {
+        learn_best_layout(
             frame.settings.speed,
-            &source,
+            source,
             frame.xsize,
             frame.ysize,
-            &layouts.all,
+            layouts,
             frame.min_symbol,
             sources.palette_wp,
             frame.use_wp,
@@ -663,38 +769,52 @@ impl Tournament {
             first_stage,
             pool,
             scratch,
-        ) else {
+        )
+    }
+
+    /// Writes the learned palette frame and offers it to `best`. The frame
+    /// write (tokenize, code, sections) is the palette candidate's most
+    /// expensive step after the learn; a final estimate clearly behind the
+    /// RGB frame's cannot win the size comparison.
+    #[allow(clippy::too_many_arguments)]
+    fn write_palette(
+        &mut self,
+        frame: &CoreFrame<'_>,
+        color: &mut ColorTransform<'_>,
+        sources: &SourcePlan,
+        source: &MaSource<'_>,
+        layout: GroupLayout,
+        cand: &LearnedCandidate,
+        best: &mut SmallestFrame,
+        pool: &ThreadPool,
+        scratch: &mut CoderScratch,
+    ) {
+        if cand.est_real > self.rgb_final * PALETTE_FINAL_MARGIN {
             return;
-        };
-        // The frame write (tokenize, code, sections) is the palette
-        // candidate's most expensive step after the learn; a final estimate
-        // clearly behind the RGB frame's cannot win the size comparison.
-        if cand.est_real <= self.rgb_final * PALETTE_FINAL_MARGIN {
-            let mut candidate = BitWriter::new();
-            let estimated_savings = write_learned_tree_frame(
-                frame.settings.speed,
-                &source,
-                frame.alpha.is_some(),
-                frame.kind,
-                frame.xsize,
-                frame.ysize,
-                layout,
-                frame.min_symbol,
-                pool,
-                scratch,
-                sources.palette_wp,
-                frame.use_wp,
-                &cand,
-                frame.tree_search,
-                &mut candidate,
-            );
-            if learned_tree_is_decisive(estimated_savings) {
-                self.decisive = true;
-                color.release_planes();
-            }
-            best.offer(candidate);
         }
-        self.best_source_coarse = self.best_source_coarse.min(coarse);
+        let mut candidate = BitWriter::new();
+        let estimated_savings = write_learned_tree_frame(
+            frame.settings.speed,
+            source,
+            frame.alpha.is_some(),
+            frame.kind,
+            frame.xsize,
+            frame.ysize,
+            layout,
+            frame.min_symbol,
+            pool,
+            scratch,
+            sources.palette_wp,
+            frame.use_wp,
+            cand,
+            frame.tree_search,
+            &mut candidate,
+        );
+        if learned_tree_is_decisive(estimated_savings) {
+            self.decisive = true;
+            color.release_planes();
+        }
+        best.offer(candidate);
     }
 
     /// 5e: per-group palettes. Screen content is a mosaic of low-color
