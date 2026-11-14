@@ -31,7 +31,7 @@
 //! join the DC entropy code, so the AC-group streams carry no tree or
 //! histograms of their own.
 
-use super::dc_tokens::{DcTreeChoice, write_tree_tokens};
+use super::dc_tokens::{DcTreeChoice, ModularTreeNode as Node, parse_tree, write_tree_tokens};
 use super::extra_channels::{ExtraPalette, ExtraSections};
 use super::{ImageDim, K_GROUP_DIM};
 use crate::bit_writer::BitWriter;
@@ -44,45 +44,6 @@ use std::collections::VecDeque;
 const TREE_CTX_SPLITVAL: u32 = 0;
 const TREE_CTX_PROPERTY: u32 = 1;
 const PROP_STREAM: u32 = 1;
-
-#[derive(Clone, Copy)]
-enum Node {
-    /// PROPERTY and SPLITVAL token values; `prop > val` routes to `gt`.
-    Split {
-        prop: u32,
-        val: u32,
-        gt: usize,
-        le: usize,
-    },
-    /// PREDICTOR, OFFSET, MULTIPLIER_LOG and MULTIPLIER_BITS token values.
-    Leaf([u32; 4]),
-}
-
-/// Decode a BFS tree token stream into nodes (children in BFS order).
-fn parse_tree(tokens: &[Token]) -> Vec<Node> {
-    let mut nodes = Vec::new();
-    let mut declared = 1usize;
-    let mut i = 0usize;
-    while nodes.len() < declared {
-        let prop = tokens[i].value;
-        if prop == 0 {
-            let leaf = std::array::from_fn(|k| tokens[i + 1 + k].value);
-            nodes.push(Node::Leaf(leaf));
-            i += 5;
-        } else {
-            nodes.push(Node::Split {
-                prop,
-                val: tokens[i + 1].value,
-                gt: declared,
-                le: declared + 1,
-            });
-            declared += 2;
-            i += 2;
-        }
-    }
-    debug_assert_eq!(i, tokens.len());
-    nodes
-}
 
 /// `stream > threshold ? gt : le` over two trees, BFS-emitted. Returns the
 /// tokens, each tree's leaf-context map (its own context -> merged context)
