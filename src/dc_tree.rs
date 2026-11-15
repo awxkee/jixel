@@ -30,6 +30,7 @@
 //! Learned per-image DC context tree.
 
 use crate::entropy::{Token, f_log2, pack_signed, uint_encode};
+use crate::shared_sort::SharedSort;
 use crate::static_entropy_codes::K_CONTEXT_TREE_TOKENS;
 
 const PRED_WEIGHTED: u32 = 6;
@@ -994,7 +995,7 @@ fn refine_leaf(
         })
         .filter(|&b| b > bins.start && b < bins.end)
         .collect();
-    candidates.sort_unstable();
+    candidates.shared_sort();
     candidates.dedup();
 
     let base_cost = base.cost();

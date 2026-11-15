@@ -85,6 +85,7 @@ use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::entropy::f_log2;
 use crate::image::Image3F;
+use crate::shared_sort::SharedSort;
 use crate::thread_pool::ThreadPool;
 use pyramid::Pyramid;
 
@@ -382,7 +383,7 @@ fn squeezed_extra_bits(p: &Pyramid, num_color: usize) -> f64 {
 /// its left neighbor under W == N / N == NW contexts.
 pub(crate) fn palette_index_bits(levels: &[i32], xsize: usize, ysize: usize) -> f64 {
     let mut entries = levels.to_vec();
-    entries.sort_unstable();
+    entries.shared_sort();
     entries.dedup();
     let indices: Vec<i32> = levels
         .iter()

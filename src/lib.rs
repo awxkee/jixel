@@ -102,6 +102,7 @@ mod patches;
 mod path_order;
 mod quant_weights;
 mod region_frames;
+mod shared_sort;
 mod simd;
 #[cfg(feature = "splines")]
 mod splines;

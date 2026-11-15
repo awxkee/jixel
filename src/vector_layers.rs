@@ -34,6 +34,7 @@
 //! on uniform neighborhoods for the palette, then each non-palette pixel is
 //! unblended between two neighboring region colors.
 
+use crate::shared_sort::SharedSort;
 use crate::util::{heap_array, round_i32};
 
 /// A palette color must fill at least this many uniform pixels.
@@ -454,7 +455,7 @@ fn rgb_palette(px: &[[u8; 3]], width: usize, height: usize) -> Option<Vec<[u8; 3
     if palette.is_empty() {
         return None;
     }
-    palette.sort_unstable_by_key(|&(c, count)| (std::cmp::Reverse(count), c));
+    palette.shared_sort_unstable_by_key(|&(c, count)| (std::cmp::Reverse(count), c));
     palette.truncate(MAX_PALETTE);
     drop(counts);
     Some(palette.into_iter().map(|(color, _)| color).collect())
@@ -547,7 +548,7 @@ fn rgba_palette(
     if palette.is_empty() {
         return None;
     }
-    palette.sort_unstable_by_key(|&(c, count)| (std::cmp::Reverse(count), c));
+    palette.shared_sort_unstable_by_key(|&(c, count)| (std::cmp::Reverse(count), c));
     palette.truncate(MAX_PALETTE);
     let ground = palette
         .iter()

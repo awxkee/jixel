@@ -42,6 +42,7 @@ use crate::image::Image3F;
 use crate::patches::{
     EpfPatchAtlases, GlyphAtlasLuma, MODULAR_PATCH_REF_ID, PATCH_REF_ID, VarDctFrameKind,
 };
+use crate::shared_sort::SharedSort;
 use crate::util::EncodeError;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -541,7 +542,7 @@ pub(super) fn prepare_vardct_variant(
                     MODULAR_ATLAS_LATTICE_SCALE,
                     tile_colors,
                 );
-                tile_colors.sort_unstable();
+                tile_colors.shared_sort();
                 let unique_colors = || {
                     tile_colors.iter().enumerate().filter_map(|(i, &color)| {
                         (i == 0 || tile_colors[i - 1] != color).then_some(color)
@@ -621,7 +622,7 @@ pub(super) fn prepare_vardct_variant(
                 references.extend(modular_refs);
             } else {
                 vardct_idx.append(&mut modular_idx);
-                vardct_idx.sort_unstable();
+                vardct_idx.shared_sort();
             }
         }
 

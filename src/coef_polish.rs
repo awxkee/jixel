@@ -52,6 +52,7 @@ use crate::encoding_context::EncodingContext;
 use crate::entropy::{FrozenTokenPrices, Token, pack_signed};
 use crate::group::{DequantBias, SMALL_LEVELS};
 use crate::image::Image3F;
+use crate::shared_sort::SharedSort;
 use crate::simd::scaled_add::AddScaledFn;
 use crate::ssimulacra2::{Rect, Ssimulacra2Checkpoint, Ssimulacra2State};
 use std::sync::Arc;
@@ -1019,7 +1020,7 @@ impl CoefPolisher {
                 }
             }
             let scored = &mut scored[..nscored];
-            scored.sort_by(|x, y| x.0.total_cmp(&y.0));
+            scored.shared_sort_by(|x, y| x.0.total_cmp(&y.0));
             let mut best: Option<(PolishMove, usize)> = None;
             for &(_, i) in scored.iter().take(cv_tries) {
                 let m = singles[i];
@@ -1463,8 +1464,8 @@ mod tests {
                 }
                 assert_eq!(sums[0].to_bits(), sums[1].to_bits());
             }
-            full_times.sort_by(f64::total_cmp);
-            cached_times.sort_by(f64::total_cmp);
+            full_times.shared_sort_by(f64::total_cmp);
+            cached_times.shared_sort_by(f64::total_cmp);
             println!(
                 "size={} proposals={} full_ms={:.3} cached_ms={:.3} speedup={:.3}x",
                 block.len(),
@@ -1712,7 +1713,7 @@ mod tests {
                 .collect();
             let mut expected = options.clone();
             if expected.len() > PRICE_CAP {
-                expected.sort_by(|a, b| a.dd.total_cmp(&b.dd));
+                expected.shared_sort_by(|a, b| a.dd.total_cmp(&b.dd));
                 expected.truncate(PRICE_CAP);
             }
             rank_options(&mut options);
@@ -1773,7 +1774,7 @@ mod tests {
                 })
                 .collect();
             let mut sorted = input.clone();
-            sorted.sort_by(|a, b| a.proxy.total_cmp(&b.proxy));
+            sorted.shared_sort_by(|a, b| a.proxy.total_cmp(&b.proxy));
             for cap in 1..=PER_CHANNEL {
                 let mut kept = [PolishMove::default(); PER_CHANNEL];
                 let mut len = 0;

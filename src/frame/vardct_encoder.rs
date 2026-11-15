@@ -66,6 +66,7 @@ use crate::entropy::write_token;
 use crate::image::Image3F;
 use crate::noise::GrainPass;
 use crate::patches::VarDctFrameKind;
+use crate::shared_sort::SharedSort;
 use crate::util::EncodeError;
 use std::borrow::Cow;
 use std::sync::Mutex;
@@ -1951,7 +1952,7 @@ fn encode_frame_core_inner(
                             .flatten()
                             .collect();
                         // The first passing candidate sets the size window.
-                        coded.sort_by_key(|&(bits, index, ..)| (bits, index));
+                        coded.shared_sort_by_key(|&(bits, index, ..)| (bits, index));
                         coded
                     };
                     // The finer residuals only matter when nothing at the

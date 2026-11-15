@@ -32,6 +32,7 @@
 //! once so the encoder writes one VarDCT base and one modular ink frame.
 
 use crate::adaptive_quant::dirty_log2p1f;
+use crate::shared_sort::SharedSort;
 use crate::thread_pool::ThreadPool;
 use crate::util::round_i32;
 
@@ -227,7 +228,7 @@ impl<'a> InkCandidates<'a> {
             plan.share -= global as f32 / sample_count as f32;
         }
         ranked.retain(|plan| plan.share > 0.005);
-        ranked.sort_by(|a, b| a.local.cmp(&b.local).then(b.share.total_cmp(&a.share)));
+        ranked.shared_sort_by(|a, b| a.local.cmp(&b.local).then(b.share.total_cmp(&a.share)));
         if let Some(first) = ranked.first_mut() {
             let support = first.share;
             if support >= MIN_DOMINANT_SHARE {
@@ -1061,7 +1062,7 @@ fn ink_modes(samples: &[[f32; 3]]) -> Vec<([u8; 3], f32)> {
         }
     }
     let mut order: Vec<_> = (0..4096).filter(|&k| counts[k] != 0).collect();
-    order.sort_unstable_by_key(|&k| (std::cmp::Reverse(counts[k]), k));
+    order.shared_sort_unstable_by_key(|&k| (std::cmp::Reverse(counts[k]), k));
     order
         .into_iter()
         .take(24)

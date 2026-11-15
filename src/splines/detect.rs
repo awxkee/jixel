@@ -32,6 +32,7 @@ use super::filter::FilterPlan;
 use crate::coder_scratch::CoderScratch;
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
+use crate::shared_sort::SharedSort;
 use crate::util::fast_hypot;
 
 static SCALES: [f32; 4] = [0.7, 1.0, 1.5, 2.2];
@@ -358,7 +359,7 @@ fn seed_key(index: u32, strength: f32) -> u64 {
 fn sort_seeds(order: &mut Vec<u64>) {
     if order.len() < 2048 {
         // Ignore the pixel index: equal-strength seeds retain their input order.
-        order.sort_by_key(|entry| entry >> 32);
+        order.shared_sort_by_key(|entry| entry >> 32);
         return;
     }
     let mut tmp = vec![0; order.len()];
@@ -664,14 +665,14 @@ fn trace_components(
             .collect();
         // Raster pixel index resolves equal-strength ties exactly as the global
         // stable sort. Discovery order inside the component need not be raster.
-        seeds.sort_unstable();
+        seeds.shared_sort();
         components.push((nodes.len(), seeds));
     }
     drop(order);
     if components.is_empty() {
         return Vec::new();
     }
-    components.sort_unstable_by_key(|(size, _)| std::cmp::Reverse(*size));
+    components.shared_sort_unstable_by_key(|(size, _)| std::cmp::Reverse(*size));
     let jobs = components.len().min(ctx.thread_pool.num_threads() * 4);
     let mut batches = vec![Vec::new(); jobs];
     for (i, (_, mut seeds)) in components.into_iter().enumerate() {
@@ -695,7 +696,7 @@ fn trace_components(
         chains
     });
     let mut chains: Vec<_> = results.into_iter().flatten().collect();
-    chains.sort_unstable_by_key(|(entry, _)| *entry);
+    chains.shared_sort_unstable_by_key(|(entry, _)| *entry);
     chains.into_iter().map(|(_, chain)| chain).collect()
 }
 
@@ -956,7 +957,8 @@ mod tests {
                 .iter()
                 .map(|&i| seed_key(i, strengths[i as usize]))
                 .collect();
-            expected.sort_by(|&a, &b| strengths[b as usize].total_cmp(&strengths[a as usize]));
+            expected
+                .shared_sort_by(|&a, &b| strengths[b as usize].total_cmp(&strengths[a as usize]));
             sort_seeds(&mut order);
             assert_eq!(
                 order.iter().map(|&i| i as u32).collect::<Vec<_>>(),

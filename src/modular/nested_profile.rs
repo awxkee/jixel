@@ -44,6 +44,7 @@ use crate::lossless::kit::{
     write_tree_lz77,
 };
 use crate::lossless::{GradientScratch, pack_gradient_row};
+use crate::shared_sort::SharedSort;
 use std::ops::Range;
 
 const GROUP_DIM: usize = super::GROUP_DIM;
@@ -146,7 +147,7 @@ fn make_plan(u: &[i32], v: &[i32], regular: bool) -> Option<Plan> {
 
     let mut table = Vec::with_capacity(width + height - 1);
     table.extend(u.array_windows().chain(v.array_windows()).map(difference));
-    table.sort_unstable();
+    table.shared_sort();
     table.dedup();
     let deltas = table.len();
     if deltas > MAX_DELTAS {

@@ -33,6 +33,7 @@
 
 use crate::coder_scratch::CoderScratch;
 use crate::entropy::{pack_signed, uint_encode};
+use crate::shared_sort::SharedSort;
 use crate::thread_pool::ThreadPool;
 use std::cmp::Reverse;
 use std::sync::Mutex;
@@ -216,7 +217,7 @@ pub(crate) fn order_sets(
             // Prices are fixed for this round. Independent searches can start
             // with the largest sets and still update results in their own slots.
             let mut tasks: Vec<_> = tasks.collect();
-            tasks.sort_unstable_by_key(|(r, _)| Reverse(sets[*r].len()));
+            tasks.shared_sort_unstable_by_key(|(r, _)| Reverse(sets[*r].len()));
             pool.steal_for_each_mut_with_threads(
                 scratch,
                 &mut tasks,
@@ -417,9 +418,9 @@ fn neighbor_lists(points: &[Pos]) -> NeighborLists {
     }
 
     let mut by_row: Vec<usize> = (0..n).collect();
-    by_row.sort_unstable_by_key(|&i| (points[i].1, points[i].0));
+    by_row.shared_sort_unstable_by_key(|&i| (points[i].1, points[i].0));
     let mut by_col: Vec<usize> = (0..n).collect();
-    by_col.sort_unstable_by_key(|&i| (points[i].0, points[i].1));
+    by_col.shared_sort_unstable_by_key(|&i| (points[i].0, points[i].1));
     let mut extra = vec![Vec::new(); n];
     for order in [&by_row, &by_col] {
         for k in 0..n {
@@ -784,7 +785,7 @@ mod tests {
             let points = scatter(7, seed);
             let path = held_karp(&points, &cost);
             let mut sorted = path.clone();
-            sorted.sort_unstable();
+            sorted.shared_sort();
             assert_eq!(sorted, (0..7).collect::<Vec<_>>());
             assert!((cost.of(&points, &path) - brute_force(&points, &cost)).abs() < 1e-3);
         }
@@ -802,7 +803,7 @@ mod tests {
             let initial: Vec<usize> = (0..points.len()).collect();
             let path = order(&points, &cost, initial.clone(), &mut None);
             let mut sorted = path.clone();
-            sorted.sort_unstable();
+            sorted.shared_sort();
             assert_eq!(sorted, initial);
             assert!(cost.of(&points, &path) < cost.of(&points, &initial));
         }

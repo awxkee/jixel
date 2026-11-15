@@ -31,6 +31,7 @@
 
 use super::{ImageDim, K_DC_GROUP_DIM, K_GROUP_DIM};
 use crate::bit_writer::BitWriter;
+use crate::shared_sort::SharedSort;
 use crate::util::fast_hypot_f64;
 
 /// Section sizes in codestream order, after the optional permutation
@@ -144,7 +145,7 @@ pub(super) fn group_section_order(
                 (band, radius, angle, g)
             })
             .collect();
-        keys.sort_by(|a, b| {
+        keys.shared_sort_by(|a, b| {
             a.0.cmp(&b.0)
                 .then(a.1.total_cmp(&b.1))
                 .then(a.2.total_cmp(&b.2))
@@ -194,6 +195,7 @@ fn group_order_key(
 
 #[cfg(test)]
 mod tests {
+    use crate::shared_sort::SharedSort;
 
     #[test]
     fn section_size_matches_serialization_at_padding_and_toc_boundaries() {
@@ -233,7 +235,7 @@ mod tests {
         let n = dim.num_groups;
         assert_eq!(order.len(), 3 + 2 * n);
         let mut sorted = order.clone();
-        sorted.sort_unstable();
+        sorted.shared_sort();
         assert!(sorted.iter().enumerate().all(|(i, &v)| i == v));
         assert_eq!(&order[..3], &[0, 1, 2]);
         // The four groups around the center lead each pass, starting top right.
@@ -252,10 +254,10 @@ mod tests {
         let order = super::group_section_order(&dim, 1, crate::GroupOrder::Diagonals);
         let groups: Vec<usize> = order[3..].iter().map(|&s| s - 3).collect();
         let mut x: Vec<usize> = groups[..12].to_vec();
-        x.sort_unstable();
+        x.shared_sort();
         assert_eq!(x, [9, 10, 13, 14, 19, 20, 26, 27, 28, 29, 33, 38]);
         let mut sorted = groups.clone();
-        sorted.sort_unstable();
+        sorted.shared_sort();
         assert!(sorted.iter().enumerate().all(|(i, &v)| i == v));
     }
 }

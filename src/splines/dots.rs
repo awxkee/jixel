@@ -48,6 +48,7 @@ use crate::adaptive_quant::{dirty_log2f, fast_exp2};
 use crate::coder_scratch::CoderScratch;
 use crate::image::Image3F;
 use crate::patches::{DOT_PATCH_REF_ID, PatchReference};
+use crate::shared_sort::SharedSort;
 use crate::thread_pool::ThreadPool;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -402,7 +403,7 @@ pub(super) fn dot_candidates(
         .into_iter()
         .flatten()
         .collect();
-    fitted.sort_unstable_by_key(|&(index, _, _)| (!peaks[index].0.abs().to_bits(), index));
+    fitted.shared_sort_unstable_by_key(|&(index, _, _)| (!peaks[index].0.abs().to_bits(), index));
     // Star fields keep loosely fitted bright dots: neighbors and nebulae
     // share a star's fit window. Elsewhere, such dots are non-Gaussian blobs
     // the block model over-prices, and only compact fits compete.
@@ -858,7 +859,7 @@ pub(super) fn build_dot_patches_with_templates<'a>(
                 *x -= radius as usize;
                 *y -= radius as usize;
             }
-            positions.sort_unstable_by_key(|&(x, y)| (y, x));
+            positions.shared_sort_unstable_by_key(|&(x, y)| (y, x));
             (side, template, positions)
         })
         .collect();

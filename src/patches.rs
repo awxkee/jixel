@@ -29,6 +29,7 @@
 use crate::coder_scratch::CoderScratch;
 use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, Image3Si};
+use crate::shared_sort::SharedSort;
 use crate::thread_pool::ThreadPool;
 use std::collections::HashMap;
 
@@ -514,7 +515,7 @@ pub(crate) fn find_lossy_patch_groups_sized(
     // Preserve the selected source at index zero; order the remaining
     // occurrences spatially after concatenating exact groups.
     for g in &mut groups {
-        g[1..].sort_unstable_by_key(|&(x, y)| (y, x));
+        g[1..].shared_sort_unstable_by_key(|&(x, y)| (y, x));
     }
     Some(groups)
 }
@@ -774,7 +775,7 @@ fn morton_similarity_order(means: &[[f32; 3]]) -> Vec<usize> {
         result
     };
     let mut spatial: Vec<usize> = (0..n).collect();
-    spatial.sort_unstable_by_key(|&i| (key(i), i));
+    spatial.shared_sort_unstable_by_key(|&i| (key(i), i));
     let mut slot = vec![0; n];
     for (s, &i) in spatial.iter().enumerate() {
         slot[i] = s;
@@ -1355,7 +1356,7 @@ pub(crate) fn find_lossless_glyph_patches(linear: &Image3Si) -> Option<LosslessP
     // order, which differs between processes, so ties are broken by the
     // group's first occurrence (unique per group) to keep the atlas layout
     // and the dictionary deterministic.
-    groups.sort_by_key(|g| {
+    groups.shared_sort_by_key(|g| {
         let s = g.shape;
         (
             std::cmp::Reverse(s.h),
@@ -1418,7 +1419,7 @@ pub(crate) fn find_lossless_glyph_patches(linear: &Image3Si) -> Option<LosslessP
         // Row-major occurrence order keeps the dictionary's position deltas
         // small (dy mostly 0, dx the glyph pitch).
         let mut positions = g.positions;
-        positions.sort_unstable_by_key(|&(x, y)| (y, x));
+        positions.shared_sort_unstable_by_key(|&(x, y)| (y, x));
         references.push(PatchReference {
             atlas_x: ax,
             atlas_y: ay,
@@ -1502,7 +1503,7 @@ impl LossyGlyphPatches<Option<Image3F>> {
                     }
                 }
             }
-            r.positions.sort_unstable_by_key(|&(x, y)| (y, x));
+            r.positions.shared_sort_unstable_by_key(|&(x, y)| (y, x));
         }
         LossyGlyphPatches {
             atlas,
@@ -1926,7 +1927,7 @@ pub(crate) fn plan_lossy_glyph_patches(
     }
     // Most valuable first; the atlas is one 1024-pixel modular group, so the
     // tail is dropped when the shapes do not fit.
-    groups.sort_by_key(|g| {
+    groups.shared_sort_by_key(|g| {
         let s = &shapes[g[0]];
         (std::cmp::Reverse(g.len() * s.w * s.h), s.y0, s.x0)
     });
@@ -1948,7 +1949,7 @@ pub(crate) fn plan_lossy_glyph_patches(
     if (covered as f64) < GLYPH_MIN_COVER * (width * height) as f64 {
         no_exact_plan!();
     }
-    groups.sort_by_key(|g| {
+    groups.shared_sort_by_key(|g| {
         let s = &shapes[g[0]];
         (
             std::cmp::Reverse(s.h),
@@ -2102,7 +2103,7 @@ impl TemplatePlan<'_> {
             .map(|g| {
                 hashes.clear();
                 hashes.extend(g.iter().map(|&i| self.shapes[i].hash));
-                hashes.sort_unstable();
+                hashes.shared_sort();
                 hashes.dedup();
                 let s = &self.shapes[g[0]];
                 (hashes.len() - 1) * s.w * s.h
@@ -2151,7 +2152,7 @@ fn plan_glyph_templates<'a>(
         let by_strength =
             |a: &(f32, usize), b: &(f32, usize)| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1));
         strength.select_nth_unstable_by(keep - 1, by_strength);
-        strength[..keep - 1].sort_unstable_by(by_strength);
+        strength[..keep - 1].shared_sort_unstable_by(by_strength);
         let mut fd = [0.0f32; 3];
         for &(_, idx) in &strength[..keep] {
             let d = delta(idx, s.bg);
@@ -2300,7 +2301,7 @@ fn build_glyph_templates(
         occurrences,
         mut groups,
     } = plan;
-    groups.sort_by_key(|g| {
+    groups.shared_sort_by_key(|g| {
         let GlyphShape { x0, y0, w, h, .. } = shapes[g[0]];
         (
             std::cmp::Reverse(h),
@@ -2388,7 +2389,7 @@ fn build_glyph_templates(
                 }
             }
         }
-        positions.sort_unstable_by_key(|&(x, y)| (y, x));
+        positions.shared_sort_unstable_by_key(|&(x, y)| (y, x));
         references.push(PatchReference {
             atlas_x: ax,
             atlas_y: ay,
@@ -2413,7 +2414,7 @@ fn build_glyph_templates(
 
 // Both patch searches use this ordering; share the comparator's sort code.
 fn sort_patch_groups(groups: &mut [Vec<(usize, usize)>]) {
-    groups.sort_by_key(|g| (std::cmp::Reverse(g.len()), g[0]));
+    groups.shared_sort_by_key(|g| (std::cmp::Reverse(g.len()), g[0]));
 }
 
 #[cfg(test)]
@@ -2660,7 +2661,7 @@ mod tests {
                 assert_eq!(order[0], 0);
                 assert_eq!(order, morton_similarity_order(&points));
                 let mut sorted = order;
-                sorted.sort_unstable();
+                sorted.shared_sort();
                 assert_eq!(sorted, (0..n).collect::<Vec<_>>());
             }
         }
@@ -3120,7 +3121,7 @@ mod tests {
             .iter()
             .map(|r| r.positions.len())
             .collect();
-        counts.sort_unstable();
+        counts.shared_sort();
         assert_eq!(counts, [4, 6]);
         assert_glyph_plan_reconstructs(&img, &repeated);
         // Under the repeated marks the base is the background again, to within
@@ -3398,7 +3399,7 @@ mod tests {
         }
         let mut packed: Vec<(usize, usize)> = refs.iter().map(|r| r.positions[0]).collect();
         let layout = packed.clone();
-        packed.sort_unstable();
+        packed.shared_sort();
         assert_eq!(packed, first);
         // Within one process the map is seeded once, so repeats here only guard
         // the sort itself; the raster-order assertion above is what pins the

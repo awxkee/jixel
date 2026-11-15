@@ -35,6 +35,7 @@ mod jbrd;
 mod parse;
 mod uhdr;
 
+use crate::shared_sort::SharedSort;
 #[allow(unused_imports)]
 pub(crate) use parse::{JpegError, parse_jpeg};
 use std::num::NonZeroUsize;
@@ -97,7 +98,7 @@ fn extract_icc(jpg: &JpegData) -> Option<JpegIcc> {
         .iter()
         .enumerate()
         .all(|(i, &(seq, _, _))| usize::from(seq) == i + 1);
-    chunks.sort_by_key(|&(seq, _, _)| seq);
+    chunks.shared_sort_by_key(|&(seq, _, _)| seq);
     if chunks
         .iter()
         .enumerate()

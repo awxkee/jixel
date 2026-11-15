@@ -45,6 +45,7 @@ use crate::coding::CodingTransform;
 use crate::image::Image3F;
 use crate::lossless::kit::GroupLayout;
 use crate::patches::PatchReference;
+use crate::shared_sort::SharedSort;
 use crate::squeeze::{
     Channel, SqueezeStep, apply_step_forward, default_squeeze_steps, lossy_squeeze_steps,
     lossy_squeeze_steps_chroma, squeeze_steps_levels,
@@ -358,7 +359,7 @@ impl Pyramid {
             .sum();
         let c = p.channels.len() - n_pre - 1;
         let mut entries = p.channels[c].data.clone();
-        entries.sort_unstable();
+        entries.shared_sort();
         entries.dedup();
         // The entries are coded divided by their common step (257 for 8-bit
         // levels on the 16-bit lattice) under a leaf multiplier. Deep levels

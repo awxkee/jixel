@@ -38,6 +38,7 @@ use super::filter::FilterPlan;
 use crate::coder_scratch::CoderScratch;
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
+use crate::shared_sort::SharedSort;
 
 const HIGH: f32 = 0.012;
 const LOW: f32 = 0.004;
@@ -347,7 +348,7 @@ pub(super) fn detect(
     }
     drop(smooth);
     drop(magnitude);
-    seeds.sort_unstable();
+    seeds.shared_sort();
     let mut visited = vec![false; pixels.len()];
     // Kept chain pieces as (strength, first index, range in `members`); only the
     // strongest are turned into contours. Most seeds in texture end after a
@@ -416,7 +417,7 @@ pub(super) fn detect(
     }
     // Favor persistent supported edges, rather than very short high-contrast
     // fragments. The full discovery pass is linear apart from seed sorting.
-    pieces.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    pieces.shared_sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     pieces.truncate(max_contours);
     pieces
         .into_iter()

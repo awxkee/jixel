@@ -36,6 +36,7 @@ use crate::coder_scratch::CoderScratch;
 use crate::entropy::{Token, pack_signed};
 use crate::patches::{ModularFrameKind, NUM_PATCH_CONTEXTS, PATCH_REF_ID, PatchReference};
 use crate::path_order;
+use crate::shared_sort::SharedSort;
 
 pub(crate) fn write_u64(value: u64, w: &mut BitWriter) {
     match value {
@@ -540,7 +541,7 @@ fn occurrences_commute(reference: &PatchReference) -> bool {
         return true;
     }
     let mut boxes = reference.positions.clone();
-    boxes.sort_unstable_by_key(|&(x, y)| (y, x));
+    boxes.shared_sort_unstable_by_key(|&(x, y)| (y, x));
     for (k, &(x, y)) in boxes.iter().enumerate() {
         for &(ox, oy) in &boxes[k + 1..] {
             if oy >= y + reference.height {
@@ -682,8 +683,8 @@ mod tests {
         assert_ne!(reordered[1].positions, free.positions);
         let mut a = reordered[1].positions.clone();
         let mut b = free.positions.clone();
-        a.sort_unstable();
-        b.sort_unstable();
+        a.shared_sort();
+        b.shared_sort();
         assert_eq!(a, b);
     }
 

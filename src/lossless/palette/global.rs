@@ -40,6 +40,7 @@ use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
 use crate::entropy::{pack_signed, uint_encode};
 use crate::image::Image3Si;
+use crate::shared_sort::SharedSort;
 use crate::thread_pool::ThreadPool;
 use crate::weighted_predictor::WpParams;
 
@@ -135,7 +136,7 @@ fn palette_order_candidates(
             .collect();
         for key in [[1, 2, 0], [0, 1, 2]] {
             let mut path: Vec<usize> = (0..colors.len()).collect();
-            path.sort_by_key(|&i| (colors[i][3], key.map(|k| ycc[i][k]), i));
+            path.shared_sort_by_key(|&i| (colors[i][3], key.map(|k| ycc[i][k]), i));
             orders.push(order_of_path(&path));
         }
     }
@@ -192,7 +193,7 @@ fn estimated_order_candidates(colors: &[[i32; 4]], cooc: &[u32]) -> Vec<Vec<i32>
         .map(|c| comp(c).iter().zip(axis).map(|(v, x)| v * x).sum())
         .collect();
     let mut by_axis: Vec<usize> = (0..n).collect();
-    by_axis.sort_by(|&a, &b| projection[a].total_cmp(&projection[b]).then(a.cmp(&b)));
+    by_axis.shared_sort_by(|&a, &b| projection[a].total_cmp(&projection[b]).then(a.cmp(&b)));
     let mut pca = vec![0i32; n];
     for (index, &canonical) in by_axis.iter().enumerate() {
         pca[canonical] = index as i32;
@@ -789,7 +790,7 @@ pub(in crate::lossless) fn build_global_palettes(
         // Canonical order (luma) gives one index image; every other candidate
         // order is a permutation of it, scored in place.
         let mut canonical_ids: Vec<usize> = (0..nb_colors).collect();
-        canonical_ids.sort_unstable_by_key(|&id| {
+        canonical_ids.shared_sort_unstable_by_key(|&id| {
             let c = &first_seen[id];
             (c[3], luma_key(c), c[0], c[1], c[2])
         });

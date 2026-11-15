@@ -37,6 +37,7 @@
 
 use crate::bit_writer::BitWriter;
 use crate::image::Image3F;
+use crate::shared_sort::SharedSort;
 
 #[derive(Clone, Copy)]
 pub(crate) struct NoiseKernels {
@@ -758,7 +759,7 @@ fn texture_score(patch: &[f32; 64]) -> f32 {
 }
 
 pub(crate) fn texture_score_from_sads(mut sads: [f32; 20]) -> f32 {
-    sads.sort_unstable_by(f32::total_cmp);
+    sads.shared_sort_unstable_by(f32::total_cmp);
     let keep = sads.len() / 2;
     sads[..keep].iter().sum::<f32>() / keep as f32
 }
@@ -1149,7 +1150,7 @@ mod tests {
                 }
                 times.push(start.elapsed().as_secs_f64() * 1e9 / (100 * patches.len()) as f64);
             }
-            times.sort_by(f64::total_cmp);
+            times.shared_sort_by(f64::total_cmp);
             eprintln!("Laplacian {name}: {:.2} ns/patch", times[3]);
         }
     }
@@ -1281,9 +1282,9 @@ mod tests {
                 reference_times.push(start.elapsed().as_secs_f64() * 1000.0);
                 black_box(image);
             }
-            estimate_times.sort_by(f64::total_cmp);
-            denoise_times.sort_by(f64::total_cmp);
-            reference_times.sort_by(f64::total_cmp);
+            estimate_times.shared_sort_by(f64::total_cmp);
+            denoise_times.shared_sort_by(f64::total_cmp);
+            reference_times.shared_sort_by(f64::total_cmp);
             eprintln!(
                 "noise {w}x{h}: estimate {:.3} ms, denoise {:.3} ms, original {:.3} ms ({:.2}x)",
                 estimate_times[2],
@@ -1300,7 +1301,7 @@ mod tests {
                 parallel_times.push(start.elapsed().as_secs_f64() * 1000.0);
                 black_box(image);
             }
-            parallel_times.sort_by(f64::total_cmp);
+            parallel_times.shared_sort_by(f64::total_cmp);
             eprintln!(
                 "noise {w}x{h}: denoise 4 workers {:.3} ms",
                 parallel_times[2]
@@ -1333,8 +1334,8 @@ mod tests {
                 ));
                 scalar_laplacian_times.push(start.elapsed().as_secs_f64() * 1000.0);
             }
-            grainy_times.sort_by(f64::total_cmp);
-            scalar_laplacian_times.sort_by(f64::total_cmp);
+            grainy_times.shared_sort_by(f64::total_cmp);
+            scalar_laplacian_times.shared_sort_by(f64::total_cmp);
             eprintln!(
                 "grain {w}x{h}: full estimate {:.3} ms, scalar Laplacian {:.3} ms",
                 grainy_times[2], scalar_laplacian_times[2]
