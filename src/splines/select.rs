@@ -50,6 +50,7 @@ use crate::encoding_context::EncodingContext;
 use crate::entropy::uint_encode;
 use crate::image::Image3F;
 use crate::shared_sort::SharedSort;
+use crate::thread_pool::ThreadPool;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
 
@@ -465,6 +466,33 @@ impl Trial {
         }
     }
 
+    /// `draw` with the tiles of a long curve spread over the pool. Each tile
+    /// writes its own block, in the same sample order.
+    fn draw_pooled(
+        &mut self,
+        pool: &ThreadPool,
+        scratch: &mut CoderScratch,
+        plan: &TiledSpline,
+        sign: f32,
+    ) {
+        const CHUNK: usize = 16;
+        if pool.num_threads() == 1 || plan.tiles.len() < 4 * CHUNK {
+            return self.draw(plan, sign);
+        }
+        let mut blocks = self.blocks.iter_mut();
+        let mut pairs: Vec<_> = plan
+            .tiles
+            .iter()
+            .map(|tile| (tile, blocks.find(|block| block.cell == tile.cell).unwrap()))
+            .collect();
+        let mut chunks: Vec<_> = pairs.chunks_mut(CHUNK).collect();
+        pool.steal_for_each_mut(scratch, &mut chunks, |_, chunk, _| {
+            for (tile, block) in chunk.iter_mut() {
+                plan.draw_tile(tile, &mut block.pixels, sign);
+            }
+        });
+    }
+
     fn delta(
         &mut self,
         model: &BlockModel,
@@ -738,16 +766,16 @@ fn prune_selected(
         // rounded pixels until an accepted proposal changes the residual.
         let restored_trial = restored.get_or_insert_with(|| {
             let mut trial = Trial::new(current, &[incumbent]);
-            trial.draw(incumbent, 1.0);
+            trial.draw_pooled(&model.ctx.thread_pool, scratch, incumbent, 1.0);
             trial
         });
         let trials = model
             .ctx
             .thread_pool
-            .steal_map(scratch, proposals.len(), |i, _| {
+            .steal_map(scratch, proposals.len(), |i, scratch| {
                 let (_, proposal, bits) = proposals[i].as_ref()?;
                 let mut trial = Trial::replacement(current, restored_trial, proposal);
-                trial.draw(proposal, -1.0);
+                trial.draw_pooled(&model.ctx.thread_pool, scratch, proposal, -1.0);
                 let delta = trial.delta(model, current, quant_field, &cache, forbidden)?;
                 let extra = bits - *incumbent_bits;
                 (delta + crate::ac_strategy::RD_LAMBDA * margin(model.distance) * extra < 0.0)
@@ -886,6 +914,51 @@ fn encode_dot_plan(
     atlas
 }
 
+/// Replaces each dot's proposal pixels by its quantized template in `image`:
+/// `pair[0]` is added back and `pair[1]` subtracted, pair after pair. Row
+/// bands run concurrently, each visiting its dots in the given order, so
+/// every pixel sees the serial sequence of additions.
+fn swap_dot_pixels(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    image: &mut Image3F,
+    pairs: &[[RenderPlan; 2]],
+) {
+    const BAND_ROWS: usize = 64;
+    const MIN_PARALLEL_DOTS: usize = 1024;
+    let (w, h) = (image.xsize(), image.ysize());
+    if ctx.thread_pool.num_threads() == 1 || pairs.len() < MIN_PARALLEL_DOTS {
+        for [proposal, quantized] in pairs {
+            proposal.draw(image, 1.0);
+            quantized.draw(image, -1.0);
+        }
+        return;
+    }
+    let bands = image.row_bands_mut(h.div_ceil(BAND_ROWS));
+    let rows = bands[0][0].len() / w;
+    let mut members = vec![Vec::new(); bands.len()];
+    for (k, pair) in pairs.iter().enumerate() {
+        let mut span: Option<(usize, usize)> = None;
+        for (_, y0, _, y1) in pair.iter().filter_map(|plan| plan.bounds) {
+            span = Some(span.map_or((y0, y1), |(a, b)| (a.min(y0), b.max(y1))));
+        }
+        if let Some((y0, y1)) = span {
+            for members in &mut members[y0 / rows..=y1 / rows] {
+                members.push(k);
+            }
+        }
+    }
+    let mut jobs: Vec<_> = bands.into_iter().zip(members).collect();
+    ctx.thread_pool
+        .steal_for_each_mut(scratch, &mut jobs, |band, (planes, members), _| {
+            for &k in members.iter() {
+                let [proposal, quantized] = &pairs[k];
+                proposal.draw_dot_band(planes, band * rows, 1.0);
+                quantized.draw_dot_band(planes, band * rows, -1.0);
+            }
+        });
+}
+
 /// Charges the selected dots their real atlas and dictionary bits, shared per
 /// template. Placements on unprofitable templates can reuse a paying template
 /// before being removed. Rechecks the retained residual against the original
@@ -951,13 +1024,22 @@ fn prune_dot_templates(
             &losing
         };
         if dropped.is_empty() || round == 8 {
-            let mut atlas = encode_dot_plan(ctx, scratch, &plan);
-            atlas_bits = atlas.bits_written() as f32;
             // Zero padding can help Modular prediction, so race the trimmed
             // layout only once for the final set instead of assuming it wins.
             let trimmed = dots::build_dot_patches_with_templates(set(), templates, true);
-            let trimmed_atlas = encode_dot_plan(ctx, scratch, &trimmed);
-            let trimmed_dictionary = encode_dot_dictionary(ctx, scratch, &trimmed.references);
+            // The three encodes are independent: run them side by side.
+            let mut encodes = ctx
+                .thread_pool
+                .steal_map(scratch, 3, |job, scratch| match job {
+                    0 => encode_dot_plan(ctx, scratch, &plan),
+                    1 => encode_dot_plan(ctx, scratch, &trimmed),
+                    _ => encode_dot_dictionary(ctx, scratch, &trimmed.references),
+                })
+                .into_iter();
+            let mut atlas = encodes.next().unwrap();
+            let trimmed_atlas = encodes.next().unwrap();
+            let trimmed_dictionary = encodes.next().unwrap();
+            atlas_bits = atlas.bits_written() as f32;
             let trimmed_dictionary_bits = trimmed_dictionary.bits_written() as f32;
             let trimmed_bits = trimmed_atlas.bits_written() as f32;
             if trimmed_bits + trimmed_dictionary_bits < atlas_bits + dictionary_bits {
@@ -969,17 +1051,22 @@ fn prune_dot_templates(
             }
             let blocks_w = w.div_ceil(8);
             let mut touched = vec![false; blocks_w * h.div_ceil(8)];
+            let mut swaps = Vec::with_capacity(idx.len());
             for &i in &idx {
                 let sp = &kept[i];
                 let template = &templates[&dots::template_key(sp)];
-                RenderPlan::dot(ctx, sp, template.clone(), w, h).draw(current, 1.0);
-                RenderPlan::quantized_dot(ctx, sp, template.clone(), w, h).draw(current, -1.0);
+                swaps.push([
+                    RenderPlan::dot(ctx, sp, template.clone(), w, h),
+                    RenderPlan::quantized_dot(ctx, sp, template.clone(), w, h),
+                ]);
                 let x0 = (sp.points[0].x - template.radius) as usize;
                 let y0 = (sp.points[0].y - template.radius) as usize;
                 for by in y0 / 8..=(y0 + template.side - 1) / 8 {
                     touched[by * blocks_w..][x0 / 8..=(x0 + template.side - 1) / 8].fill(true);
                 }
             }
+            swap_dot_pixels(ctx, scratch, current, &swaps);
+            drop(swaps);
             let mut gain = -(atlas_bits + dictionary_bits);
             // This final check can cover most of a star field. Price disjoint
             // block bands concurrently, then sum in raster order so worker
@@ -1093,6 +1180,7 @@ fn prune_dot_templates(
 /// render and must pay for its extra coefficients in the residual RD model.
 fn refine_selected_widths(
     model: &BlockModel,
+    scratch: &mut CoderScratch,
     current: &mut Image3F,
     quant_field: &[f32],
     kept: &mut [QuantizedSpline],
@@ -1134,12 +1222,12 @@ fn refine_selected_widths(
                 let restored = restored.get_or_insert_with(|| {
                     cache_blocks(model, current, quant_field, &mut cache, &incumbent);
                     let mut trial = Trial::new(current, &[&incumbent]);
-                    trial.draw(&incumbent, 1.0);
+                    trial.draw_pooled(&model.ctx.thread_pool, scratch, &incumbent, 1.0);
                     trial
                 });
                 cache_blocks(model, current, quant_field, &mut cache, &plan);
                 let mut trial = Trial::replacement(current, restored, &plan);
-                trial.draw(&plan, -1.0);
+                trial.draw_pooled(&model.ctx.thread_pool, scratch, &plan, -1.0);
                 let Some(delta) = trial.delta(model, current, quant_field, &cache, forbidden)
                 else {
                     continue;
@@ -1519,10 +1607,19 @@ pub(super) fn rd_select(
     let dot_start = n_dots.map(|n| {
         dirty_log2f((w * h) as f32 / n.max(1) as f32).clamp(4.0, 16.0) + DOT_POSITION_BITS
     });
-    let keys: Vec<_> = candidates
-        .iter()
-        .filter(|c| c.dot)
-        .flat_map(|c| c.alts.iter().map(dots::template_key))
+    const KEY_CHUNK: usize = 4096;
+    let keys: Vec<_> = ctx
+        .thread_pool
+        .steal_map(scratch, candidates.len().div_ceil(KEY_CHUNK), |chunk, _| {
+            candidates[chunk * KEY_CHUNK..]
+                .iter()
+                .take(KEY_CHUNK)
+                .filter(|c| c.dot)
+                .flat_map(|c| c.alts.iter().map(dots::template_key))
+                .collect::<BTreeSet<_>>()
+        })
+        .into_iter()
+        .flatten()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -2178,6 +2275,7 @@ pub(super) fn rd_select(
         );
         refine_selected_widths(
             &model,
+            scratch,
             &mut current,
             quant_field,
             &mut kept,
@@ -2371,7 +2469,15 @@ mod tests {
         let quant = vec![8.0; w.div_ceil(8) * h.div_ceil(8)];
         let prices = CostModel::prior(1.0);
         let mut kept = vec![initial.clone()];
-        refine_selected_widths(&model, &mut residual, &quant, &mut kept, &prices, None);
+        refine_selected_widths(
+            &model,
+            &mut CoderScratch::default(),
+            &mut residual,
+            &quant,
+            &mut kept,
+            &prices,
+            None,
+        );
         assert_eq!(kept[0].dct[3], truth.dct[3]);
         assert_eq!(kept[0].dct[..3], initial.dct[..3]);
         assert_eq!(kept[0].points, initial.points);
@@ -2385,6 +2491,7 @@ mod tests {
         let mut forbidden_splines = vec![initial.clone()];
         refine_selected_widths(
             &model,
+            &mut CoderScratch::default(),
             &mut forbidden_residual,
             &quant,
             &mut forbidden_splines,
@@ -3380,6 +3487,7 @@ mod tests {
         );
         refine_selected_widths(
             &model,
+            scratch,
             &mut current,
             quant_field,
             &mut kept,

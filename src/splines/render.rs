@@ -296,6 +296,31 @@ impl RenderPlan {
         }
     }
 
+    /// `draw` of a dot clipped to the rows of `band`, whose planes start at
+    /// image row `first`. Rows are drawn whole, so each pixel sees the same
+    /// additions as in `draw`.
+    pub(crate) fn draw_dot_band(&self, band: &mut [&mut [f32]; 3], first: usize, sign: f32) {
+        let Some(dot) = &self.dot else {
+            return;
+        };
+        let (x0, y0, x1, y1) = self.bounds.unwrap();
+        let rows = band[0].len() / self.width;
+        for y in y0.max(first)..(y1 + 1).min(first + rows) {
+            let at = (y - first) * self.width;
+            let [rx, ry, rb] = band;
+            dot.row(
+                y,
+                x0,
+                [
+                    &mut rx[at + x0..=at + x1],
+                    &mut ry[at + x0..=at + x1],
+                    &mut rb[at + x0..=at + x1],
+                ],
+                sign,
+            );
+        }
+    }
+
     pub(crate) fn tiled(self) -> TiledSpline {
         let blocks_w = self.width.div_ceil(8);
         if self.dot.is_some() {

@@ -147,9 +147,11 @@ pub(crate) fn order_sets(
     const PRICE_ROUNDS: usize = 2;
     const NEIGHBOR_CACHE_BYTES: usize = 4 * 1024 * 1024;
     // Large dot dictionaries have several expensive sets. Limit the number
-    // of simultaneous searches to bound their transient workspace.
+    // of simultaneous searches over sets above `SMALL_SET_POINTS` to bound
+    // their transient workspace.
     const MAX_SEARCH_THREADS: usize = 4;
     const PARALLEL_SET_POINTS: usize = 512;
+    const SMALL_SET_POINTS: usize = 16_384;
     let mut workers = workers.filter(|(pool, _)| {
         pool.num_threads() > 1
             && sets
@@ -218,12 +220,18 @@ pub(crate) fn order_sets(
             // with the largest sets and still update results in their own slots.
             let mut tasks: Vec<_> = tasks.collect();
             tasks.shared_sort_unstable_by_key(|(r, _)| Reverse(sets[*r].len()));
-            pool.steal_for_each_mut_with_threads(
-                scratch,
-                &mut tasks,
-                MAX_SEARCH_THREADS,
-                |_, (r, (path, cached)), _| search(*r, path, cached),
-            );
+            // Only the large sets carry a workspace worth bounding; the many
+            // small ones of a dot dictionary use every worker.
+            let large = tasks.partition_point(|(r, _)| sets[*r].len() > SMALL_SET_POINTS);
+            let (large, small) = tasks.split_at_mut(large);
+            for (tasks, threads) in [(large, MAX_SEARCH_THREADS), (small, pool.num_threads())] {
+                pool.steal_for_each_mut_with_threads(
+                    scratch,
+                    tasks,
+                    threads,
+                    |_, (r, (path, cached)), _| search(*r, path, cached),
+                );
+            }
         } else {
             for (r, (path, cached)) in tasks {
                 search(r, path, cached);
@@ -719,11 +727,16 @@ impl<'a> LocalSearch<'a> {
                 if best.0 > MIN_GAIN {
                     let (_, at, reversed, left, right) = best;
                     self.touch([prev, next, Some(first), Some(last), left, right]);
-                    let mut segment: Vec<usize> = self.path.drain(i..end).collect();
-                    if reversed {
-                        segment.reverse();
+                    // Remove [i, end) and reinsert it at `at` of the reduced
+                    // path: only the points in between move.
+                    if at >= i {
+                        self.path[i..at + len].rotate_left(len);
+                    } else {
+                        self.path[at..end].rotate_right(len);
                     }
-                    self.path.splice(at..at, segment);
+                    if reversed {
+                        self.path[at..at + len].reverse();
+                    }
                     self.reindex(i.min(at), end.max(at + len));
                     improved = true;
                 }
