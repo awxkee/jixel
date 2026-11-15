@@ -29,6 +29,7 @@
 
 use super::DCT_BLOCK_SIZE;
 use crate::entropy::Token;
+use crate::shared_sort::SharedSort;
 
 pub(super) const PERMUTATION_CONTEXTS: usize = 8;
 
@@ -61,7 +62,7 @@ pub(super) fn compute_order(
         let zeros = num_blocks - nonzero[slot];
         (zeros as f64 * inv + 0.1) as u64
     };
-    slots.sort_by(|&a, &b| bucket(a).cmp(&bucket(b)).then(a.cmp(&b)));
+    slots.shared_sort_by(|&a, &b| bucket(a).cmp(&bucket(b)).then(a.cmp(&b)));
 
     let mut order = [0u8; DCT_BLOCK_SIZE];
     for (k, slot) in (0..skip).chain(slots).enumerate() {

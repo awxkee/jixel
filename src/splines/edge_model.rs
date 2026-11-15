@@ -51,6 +51,7 @@ use crate::entropy::{Token, f_log2};
 use crate::group::{SourceDc, dc_from_coefficients, write_ac_group};
 use crate::image::{Image3B, Image3F, Image3S, Plane, Rect};
 use crate::quant_weights::INV_DC_QUANT;
+use crate::shared_sort::SharedSort;
 use std::sync::OnceLock;
 
 /// The actual quantization parameters used for the current native layout.
@@ -223,7 +224,7 @@ impl<'a> NativeModel<'a> {
                     .expect("edge support outside the native frame")
             })
             .collect();
-        selected.sort_unstable();
+        selected.shared_sort();
         selected.dedup();
         selected
     }

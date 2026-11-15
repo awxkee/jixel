@@ -46,6 +46,7 @@ use super::{
 use crate::coder_scratch::CoderScratch;
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
+use crate::shared_sort::SharedSort;
 use crate::util::fast_hypot;
 
 static SIGMA_LATTICE: [i32; 8] = [1, 2, 3, 4, 5, 6, 8, 10];
@@ -1462,7 +1463,7 @@ fn quick_primary(
     }
     let predicted = SCALE_TO_SIGMA.0 * chain.scale + SCALE_TO_SIGMA.1;
     let mut seeds = SIGMA_LATTICE;
-    seeds.sort_by(|&a, &b| {
+    seeds.shared_sort_by(|&a, &b| {
         (a as f32 * sigma_step() - predicted)
             .abs()
             .total_cmp(&(b as f32 * sigma_step() - predicted).abs())
@@ -1651,7 +1652,7 @@ fn fit_extension(
     }
     let predicted = SCALE_TO_SIGMA.0 * chain.scale + SCALE_TO_SIGMA.1;
     let mut widths = SIGMA_LATTICE;
-    widths.sort_by(|&a, &b| {
+    widths.shared_sort_by(|&a, &b| {
         (a as f32 * sigma_step() - predicted)
             .abs()
             .total_cmp(&(b as f32 * sigma_step() - predicted).abs())
@@ -1747,7 +1748,7 @@ fn long_line_spacing(chain: &Chain) -> f32 {
 fn long_line_widths(chain: &Chain) -> [i32; LONG_LINE_WIDTHS.len()] {
     let predicted = SCALE_TO_SIGMA.0 * chain.scale + SCALE_TO_SIGMA.1;
     let mut widths = LONG_LINE_WIDTHS;
-    widths.sort_by(|&a, &b| {
+    widths.shared_sort_by(|&a, &b| {
         (a as f32 * sigma_step() - predicted)
             .abs()
             .total_cmp(&(b as f32 * sigma_step() - predicted).abs())

@@ -34,6 +34,11 @@ use crate::adaptive_quant::dirty_log2f;
 use crate::entropy::{ALPHABET_SIZE, OwnedEntropyCode, TokenSlice};
 use crate::thread_pool::ThreadPool;
 
+/// Price of a symbol the code never saw or cannot express: the estimate
+/// stays finite and the caller's exact coding decides.
+const UNSEEN_ANS_BITS: f32 = crate::entropy::ANS_LOG_TAB_SIZE as f32;
+const UNSEEN_PREFIX_BITS: u8 = 15;
+
 pub(crate) fn estimate_ac_plain_bits<'a, I>(streams: I, code: &OwnedEntropyCode) -> u64
 where
     I: IntoIterator,
@@ -59,7 +64,7 @@ fn estimate_ac_plain_bits_shared(
                     .iter()
                     .map(|&f| {
                         if f == 0 {
-                            crate::entropy::ANS_LOG_TAB_SIZE as f32
+                            UNSEEN_ANS_BITS
                         } else {
                             crate::entropy::ANS_LOG_TAB_SIZE as f32 - dirty_log2f(f as f32)
                         }
@@ -75,7 +80,13 @@ fn estimate_ac_plain_bits_shared(
                 let cl = code.context_map[t.context as usize] as usize;
                 let (sym, nbits, _) =
                     crate::entropy::uint_encode_with_config(t.value, code.hybrid_uint_configs[cl]);
-                bits += cost[cl][sym as usize] as f64 + nbits as f64;
+                // A token priced under another stream's code can need a
+                // symbol past its alphabet; it pays the unseen-symbol price.
+                let symbol_bits = cost[cl]
+                    .get(sym as usize)
+                    .copied()
+                    .unwrap_or(UNSEEN_ANS_BITS);
+                bits += symbol_bits as f64 + nbits as f64;
             });
         }
         return bits as u64;
@@ -91,7 +102,11 @@ fn estimate_ac_plain_bits_shared(
             let depth = if prefix.single_symbol {
                 0
             } else {
-                prefix.depths[sym as usize]
+                prefix
+                    .depths
+                    .get(sym as usize)
+                    .copied()
+                    .unwrap_or(UNSEEN_PREFIX_BITS)
             };
             bits += depth as u64 + nbits as u64;
         });
@@ -132,7 +147,11 @@ pub(crate) fn estimate_ac_plain_bits_pooled(
                 let depth = if prefix.single_symbol {
                     0
                 } else {
-                    prefix.depths[sym as usize]
+                    prefix
+                        .depths
+                        .get(sym as usize)
+                        .copied()
+                        .unwrap_or(UNSEEN_PREFIX_BITS)
                 };
                 bits += depth as u64 + nbits as u64;
             });
@@ -149,7 +168,11 @@ pub(crate) fn estimate_ac_plain_bits_pooled(
             let cl = code.context_map[t.context as usize] as usize;
             let (sym, nbits, _) =
                 crate::entropy::uint_encode_with_config(t.value, code.hybrid_uint_configs[cl]);
-            counts[cl * ALPHABET_SIZE + sym as usize] += 1;
+            if (sym as usize) < ALPHABET_SIZE {
+                counts[cl * ALPHABET_SIZE + sym as usize] += 1;
+            } else {
+                raw_bits += UNSEEN_ANS_BITS as u64;
+            }
             raw_bits += u64::from(nbits);
         });
         (counts, raw_bits)

@@ -34,6 +34,7 @@
 
 use crate::encode_image::AlphaPlane;
 use crate::patches::{MODULAR_PATCH_REF_ID, PatchReference};
+use crate::shared_sort::SharedSort;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -142,7 +143,7 @@ fn find_with_signature(
         .collect();
     // Spend the bounded dictionary on the most reused masks. The data tie
     // break makes selection independent of HashMap's randomized iteration.
-    selected.sort_unstable_by(|&a, &b| {
+    selected.shared_sort_unstable_by(|&a, &b| {
         groups[b]
             .copies
             .len()
@@ -160,7 +161,8 @@ fn find_with_signature(
 
     // Lexicographic atlas order matches the one-channel palette convention
     // and keeps neighboring coverage patterns spatially predictable.
-    selected.sort_unstable_by(|&a, &b| tile_cmp(data, width, groups[a].first, groups[b].first));
+    selected
+        .shared_sort_unstable_by(|&a, &b| tile_cmp(data, width, groups[a].first, groups[b].first));
     let columns = selected.len().min(ATLAS_COLUMNS);
     let atlas_width = columns * TILE;
     let atlas_height = selected.len().div_ceil(columns) * TILE;

@@ -35,6 +35,7 @@
 
 use crate::encode_image::AlphaPlane;
 use crate::image::Image3Si;
+use crate::shared_sort::SharedSort;
 use std::collections::HashMap;
 
 /// Classification tile.
@@ -213,9 +214,9 @@ pub(crate) fn plan(linear: &Image3Si, alpha: Option<&AlphaPlane>) -> Option<Vec<
             })
         })
         .collect();
-    regions.sort_by_key(|r| std::cmp::Reverse(r.width * r.height));
+    regions.shared_sort_by_key(|r| std::cmp::Reverse(r.width * r.height));
     regions.truncate(MAX_REGIONS);
-    regions.sort_by_key(|r| (r.y0, r.x0));
+    regions.shared_sort_by_key(|r| (r.y0, r.x0));
     let covered: usize = regions.iter().map(|r| r.width * r.height).sum();
     (!regions.is_empty() && covered as f32 <= MAX_REGION_SHARE * (w * h) as f32).then_some(regions)
 }
@@ -246,7 +247,7 @@ fn merge_overlapping(rects: &mut Vec<Rect>) {
             }
         }
     }
-    rects.sort_unstable();
+    rects.shared_sort();
 }
 
 /// The bounding box of the rare pixels inside `rect`.

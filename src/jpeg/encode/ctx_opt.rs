@@ -39,6 +39,7 @@ use crate::ac_context::{K_NON_ZERO_BUCKETS, K_ZERO_DENSITY_CONTEXT_COUNT, non_ze
 use crate::coder_scratch::CoderScratch;
 use crate::entropy::{f_log2, pack_signed, uint_encode};
 use crate::fast_divide::DividerU64;
+use crate::shared_sort::SharedSort;
 use crate::thread_pool::ThreadPool;
 
 /// Default HybridUint tokens per zero-density context; larger ones saturate.
@@ -215,7 +216,7 @@ fn collect_stats(
                 raw.push(base | (zdc as u32 * TOKENS + token));
             });
         });
-        raw.sort_unstable();
+        raw.shared_sort();
         run_lengths(raw.into_iter().map(|v| (v, 1)))
     });
     // Counting sort by key; each key's few runs then merge by symbol.
@@ -238,7 +239,7 @@ fn collect_stats(
     stats.key_start.push(0);
     for k in 0..num_keys {
         let runs = &mut by_key[key_start[k] as usize..key_start[k + 1] as usize];
-        runs.sort_unstable_by_key(|&(s, _)| s);
+        runs.shared_sort_unstable_by_key(|&(s, _)| s);
         let first = stats.syms.len();
         for &(sym, n) in runs.iter() {
             if stats.syms.len() > first && stats.syms.last() == Some(&sym) {
@@ -318,7 +319,7 @@ impl Accum {
 
     /// Sparse sorted copy of the current histogram set.
     fn take_sparse(&mut self) -> Hist {
-        self.touched_h.sort_unstable();
+        self.touched_h.shared_sort();
         let entries = self
             .touched_h
             .iter()

@@ -61,6 +61,7 @@ use crate::lossless::kit::{
     selected_grad_pack_interior_fn, tokenize_plane_rows, write_lz_section, write_toc_entry,
     write_tree_lz77,
 };
+use crate::shared_sort::SharedSort;
 use crate::thread_pool::ThreadPool;
 use std::collections::VecDeque;
 
@@ -516,7 +517,7 @@ impl Steps {
     fn new(u: &[i32], v: &[i32]) -> Option<Self> {
         let distinct = |axis: &[i32], sign: i32| {
             let mut values: Vec<i32> = axis.array_windows().map(|pair| sign * step(pair)).collect();
-            values.sort_unstable();
+            values.shared_sort();
             values.dedup();
             values
         };

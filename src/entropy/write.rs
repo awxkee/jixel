@@ -42,6 +42,7 @@ use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::entropy::{TokenSlice, f_log2};
 use crate::lz77_ac::{LZ77_MIN_LENGTH, LZ77_MIN_SYMBOL, lz77_length_encode};
+use crate::shared_sort::SharedSort;
 use crate::thread_pool::ThreadPool;
 
 pub(crate) const ANS_ENABLED: bool = true;
@@ -582,7 +583,7 @@ fn select_expanded_config(
         }
     }
     // Stable proxy ties follow the split/msb/lsb enumeration order.
-    candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+    candidates.shared_sort_by(|a, b| a.0.total_cmp(&b.0));
     let cost = |candidate: &(f64, HybridUintConfig, [u32; ALPHABET_SIZE], u64)| {
         let counts = candidate.2.map(|c| c.saturating_mul(scale as u32));
         let base = optimize_ans_histogram(&counts);
@@ -1270,7 +1271,7 @@ fn propose_ans_cluster_refinement(
         .filter_map(|(context, histogram)| (histogram.total_count != 0).then_some(context))
         .collect();
     if populated_contexts.len() > MAX_ANS_RELOCATION_CONTEXTS {
-        populated_contexts.sort_unstable_by_key(|&context| {
+        populated_contexts.shared_sort_unstable_by_key(|&context| {
             std::cmp::Reverse(context_histograms[context].total_count)
         });
         populated_contexts.truncate(MAX_ANS_RELOCATION_CONTEXTS);
@@ -3223,7 +3224,7 @@ pub(crate) fn write_context_map(
     } else {
         vec![0, 1]
     };
-    order.sort_by(|&a, &b| estimates[a].total_cmp(&estimates[b]).then(a.cmp(&b)));
+    order.shared_sort_by(|&a, &b| estimates[a].total_cmp(&estimates[b]).then(a.cmp(&b)));
     // Small maps are cheap enough to serialize every way; large ones try the
     // runner-up only when the estimates are close.
     let small = entries.len() <= 256;

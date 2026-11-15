@@ -42,6 +42,7 @@ use crate::coder_scratch::CoderScratch;
 use crate::dc_group_data::DcGroupData;
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
+use crate::shared_sort::SharedSort;
 
 // The scalar first-pass model cannot predict the later learned-price RDOQ or
 // final entropy contexts exactly. Require a rate reserve before spending any
@@ -327,7 +328,7 @@ pub(crate) fn select_edges(
                 .iter()
                 .flat_map(|plan| plan.tiles.iter().map(|tile| tile.cell))
                 .collect();
-            cells.sort_unstable();
+            cells.shared_sort();
             cells.dedup();
             let transforms = model.transforms(&cells);
             if costs.is_empty() {
@@ -509,7 +510,7 @@ mod tests {
             .iter()
             .flat_map(|plan| plan.tiles.iter().map(|tile| tile.cell))
             .collect();
-        cells.sort_unstable();
+        cells.shared_sort();
         cells.dedup();
         let saved = Snapshot::new(&image, &cells);
         for _ in 0..3 {

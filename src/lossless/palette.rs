@@ -90,6 +90,7 @@ use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
 use crate::image::Image3Si;
 use crate::patches::ModularFrameKind;
+use crate::shared_sort::SharedSort;
 use global::ColorMap;
 
 /// Serialize a single Palette transform (mirrors `Transform::VisitFields` for
@@ -291,7 +292,7 @@ pub(super) fn try_encode_palette_single_group(
 
         // 2) Sorted palette + color->index map.
         let mut colors: Vec<[i32; 4]> = seen.keys().copied().collect();
-        colors.sort_unstable();
+        colors.shared_sort();
         let mut idx_of = ColorMap::<i32>::with_capacity_and_hasher(nb_colors, Default::default());
         for (i, c) in colors.iter().enumerate() {
             idx_of.insert(*c, i as i32);

@@ -26,6 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::shared_sort::SharedSort;
 use std::collections::HashMap;
 
 use crate::bit_writer::BitWriter;
@@ -1380,7 +1381,7 @@ fn encode_icc_tokens(enc: &[u8], huffman_pool: &mut Vec<HuffmanNode>) -> BitWrit
             Some((w.bits_written(), config))
         })
         .collect();
-    ranked.sort_by_key(|r| r.0);
+    ranked.shared_sort_by_key(|r| r.0);
     let mut configs: Vec<HybridUintConfig> = ranked.iter().take(2).map(|r| r.1).collect();
 
     let mut prices = evaluate_parse(

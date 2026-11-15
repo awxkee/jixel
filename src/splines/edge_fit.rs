@@ -42,6 +42,7 @@ use crate::coder_scratch::CoderScratch;
 use crate::encoding_context::EncodingContext;
 use crate::entropy::pack_signed;
 use crate::image::Image3F;
+use crate::shared_sort::SharedSort;
 use crate::util::fast_hypot;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -260,7 +261,7 @@ fn dp_controls(
             let q = Point::new(fx + dx, fy + dy);
             ((q.x as f32 - p.x).powi(2) + (q.y as f32 - p.y).powi(2), q)
         });
-        options.sort_by(|a, b| {
+        options.shared_sort_by(|a, b| {
             a.0.total_cmp(&b.0)
                 .then_with(|| (a.1.y, a.1.x).cmp(&(b.1.y, b.1.x)))
         });
@@ -690,7 +691,8 @@ pub(super) fn find_pairs(
         .enumerate()
         .filter_map(|(i, g)| g.map(|g| (i, g)))
         .collect();
-    selected.sort_by(|(ia, a), (ib, b)| b.score.total_cmp(&a.score).then_with(|| ia.cmp(ib)));
+    selected
+        .shared_sort_by(|(ia, a), (ib, b)| b.score.total_cmp(&a.score).then_with(|| ia.cmp(ib)));
     selected.truncate(MAX_PAIRS);
     ctx.thread_pool
         .steal_map(scratch, selected.len(), |i, _| {

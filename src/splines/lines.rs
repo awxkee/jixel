@@ -36,6 +36,7 @@
 
 use super::detect::{Chain, MIN_CHAIN_LEN};
 use super::{Point, SplinesContext, sample_curve};
+use crate::shared_sort::SharedSort;
 use crate::util::fast_hypot;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -135,7 +136,7 @@ fn join(kernels: &SplinesContext, chains: &[Chain], members: &[usize]) -> Chain 
         members.iter().flat_map(|&m| chains[m].points.iter()),
     );
     let mut order = members.to_vec();
-    order.sort_by(|&a, &b| {
+    order.shared_sort_by(|&a, &b| {
         let mid = |m: usize| line.along(chains[m].points[chains[m].points.len() / 2]);
         mid(a).total_cmp(&mid(b))
     });
@@ -255,7 +256,7 @@ impl EndpointIndex {
         out.clear();
         self.collect(0, line, lo, hi, out);
         // Original fragment rank resolves equal-gap ties, independent of tree order.
-        out.sort_unstable();
+        out.shared_sort();
         out.dedup();
     }
 
@@ -326,7 +327,7 @@ pub(super) fn find_long_lines(kernels: &SplinesContext, chains: &[Chain]) -> Lon
         .enumerate()
         .filter_map(|(i, c)| straight_fragment(kernels, i, c))
         .collect();
-    fragments.sort_by_key(|f| std::cmp::Reverse(chains[f.index].points.len()));
+    fragments.shared_sort_by_key(|f| std::cmp::Reverse(chains[f.index].points.len()));
     let index = EndpointIndex::new(chains, &fragments);
     let mut candidates = Vec::new();
     let mut used = vec![false; chains.len()];
@@ -658,7 +659,7 @@ mod tests {
             .enumerate()
             .filter_map(|(i, c)| straight_fragment(kernels, i, c))
             .collect();
-        fragments.sort_by_key(|f| std::cmp::Reverse(chains[f.index].points.len()));
+        fragments.shared_sort_by_key(|f| std::cmp::Reverse(chains[f.index].points.len()));
         let mut used = vec![false; chains.len()];
         let mut lines = Vec::new();
         for seed in 0..fragments.len() {

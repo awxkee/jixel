@@ -8,6 +8,7 @@ use super::{
 use crate::adaptive_quant::dirty_log2f;
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
+use crate::shared_sort::SharedSort;
 use crate::simd::scaled_add::{AddScaledFn, add_scaled_scalar};
 use std::sync::Arc;
 
@@ -363,7 +364,7 @@ impl RenderPlan {
         }
         // The sample index is a secondary key: each pixel sees additions in
         // decoder order even though different blocks can be rendered separately.
-        coverage.sort_unstable();
+        coverage.shared_sort();
         let mut tiles: Vec<Tile> = Vec::new();
         let mut sample_indices = Vec::with_capacity(coverage.len());
         for (cell, index) in coverage {
@@ -629,7 +630,7 @@ mod tests {
                     }
                 }
             }
-            expected.sort_unstable();
+            expected.shared_sort();
             if let Some((x0, y0, x1, y1)) = plan.bounds {
                 let cells = (x1 / 8 - x0 / 8 + 1) * (y1 / 8 - y0 / 8 + 1);
                 assert_eq!(cells > expected.len(), sparse);

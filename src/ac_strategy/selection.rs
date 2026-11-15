@@ -33,6 +33,7 @@ use super::*;
 use crate::adaptive_quant::{dirty_log2f, fast_exp2};
 use crate::entropy::pack_signed;
 use crate::frame::ac_metadata_context;
+use crate::shared_sort::SharedSort;
 
 mod layout_dp;
 mod leaf_first;
@@ -226,7 +227,7 @@ fn record_upgrade32_candidates(
             })
         })
         .collect();
-    candidates.sort_by(|a, b| {
+    candidates.shared_sort_by(|a, b| {
         a.relative_cost
             .total_cmp(&b.relative_cost)
             .then_with(|| (a.by, a.bx, a.strategy).cmp(&(b.by, b.bx, b.strategy)))
@@ -3334,7 +3335,7 @@ fn footprint_is_self_contained(
 }
 
 fn cap_medium_upgrade_candidates(indices: &mut Vec<usize>, candidates: &[MergeUpgradeCandidate]) {
-    indices.sort_by(|&a, &b| {
+    indices.shared_sort_by(|&a, &b| {
         let (a, b) = (candidates[a], candidates[b]);
         (a.by / 4, a.bx / 4)
             .cmp(&(b.by / 4, b.bx / 4))

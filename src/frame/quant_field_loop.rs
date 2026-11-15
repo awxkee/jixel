@@ -44,6 +44,7 @@ use crate::dc_group_data::{DcGroupData, STRATEGY_DCT};
 use crate::encoding_context::EncodingContext;
 use crate::entropy::TokenSlice;
 use crate::image::{Image3F, Image3S};
+use crate::shared_sort::SharedSort;
 use crate::util::EncodeError;
 
 /// Closed-loop quant-field refinement (ExtraSlow). Every group is re-quantized
@@ -946,7 +947,7 @@ pub(super) fn run_quant_field_loop(
                     moves.push((net, t, 1));
                 }
             }
-            moves.sort_by(|a, b| b.0.total_cmp(&a.0));
+            moves.shared_sort_by(|a, b| b.0.total_cmp(&a.0));
             moves.truncate(((MAX_MOVE_FRACTION * n_tiles as f32) as usize).max(1));
             cached_slope = slope;
             cached_moves = moves.clone();
@@ -1498,7 +1499,7 @@ pub(super) fn run_quant_field_loop(
         // which depends on the layout (a large transform's DC comes from its
         // lowest frequencies): recapture it under the accepted sites.
         let mut refresh: Vec<usize> = accepted_sites.iter().map(|a| a.0).collect();
-        refresh.sort_unstable();
+        refresh.shared_sort();
         refresh.dedup();
         let sources = ctx
             .thread_pool
@@ -1814,10 +1815,10 @@ pub(super) fn run_quant_field_loop(
                     let Some(mut current) = site_parts(st, site) else {
                         return Vec::new();
                     };
-                    current.sort_unstable();
+                    current.shared_sort();
                     let differs = |v: &Parts| {
                         let mut k = v.clone();
-                        k.sort_unstable();
+                        k.shared_sort();
                         k != current
                     };
                     match &site.proposal {
@@ -1956,7 +1957,7 @@ pub(super) fn run_quant_field_loop(
         // The chroma DC passes after the loop read the retained source DC,
         // which depends on the layout: recapture it under the accepted sites.
         let mut refresh: Vec<usize> = accepted_sites.iter().map(|a| a.0).collect();
-        refresh.sort_unstable();
+        refresh.shared_sort();
         refresh.dedup();
         let sources = ctx
             .thread_pool

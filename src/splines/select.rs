@@ -49,6 +49,7 @@ use crate::dct::DctInput;
 use crate::encoding_context::EncodingContext;
 use crate::entropy::uint_encode;
 use crate::image::Image3F;
+use crate::shared_sort::SharedSort;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
 
@@ -405,7 +406,7 @@ impl Trial {
             .iter()
             .flat_map(|p| p.tiles.iter().map(|t| t.cell))
             .collect();
-        cells.sort_unstable();
+        cells.shared_sort();
         cells.dedup();
         let blocks = cells
             .into_iter()
@@ -600,7 +601,7 @@ fn cache_blocks_parallel<'p>(
         }
         return;
     }
-    cells.sort_unstable();
+    cells.shared_sort();
     let mut jobs = Vec::with_capacity(cells.len().div_ceil(CHUNK));
     let mut start = 0;
     let mut tail = cache;
@@ -1387,7 +1388,7 @@ fn decide_groups(
                 members.push(i);
             }
         }
-        members.sort_unstable();
+        members.shared_sort();
         let member_points: Vec<Point<f32>> = members
             .iter()
             .flat_map(|&i| curves[i].as_ref().unwrap().positions.iter().copied())
@@ -1489,7 +1490,7 @@ fn decide_groups(
             origin.remove(i);
         }
     }
-    removed.sort_unstable();
+    removed.shared_sort();
     removed
 }
 

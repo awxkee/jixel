@@ -49,6 +49,7 @@ use crate::encode_image::AlphaPlane;
 use crate::entropy::Token;
 use crate::image::Image3Si;
 use crate::patches::ModularFrameKind;
+use crate::shared_sort::SharedSort;
 use crate::thread_pool::ThreadPool;
 use crate::xyb::quantize_xyb_channels;
 
@@ -167,7 +168,7 @@ pub(crate) fn encode_modular_xyb_atlas_ints(
     let mut tokens: Vec<Token> = Vec::new();
     let (preds, nb_chans): (Vec<u32>, usize) = if use_palette {
         let mut colors: Vec<[i32; 3]> = seen.keys().copied().collect();
-        colors.sort_unstable();
+        colors.shared_sort();
         let nb_colors = colors.len();
         let mut idx_of: HashMap<[i32; 3], u32> = HashMap::with_capacity(nb_colors);
         for (i, c) in colors.iter().enumerate() {

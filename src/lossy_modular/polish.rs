@@ -47,6 +47,7 @@ use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::cvvdp_arbiter::{CvvdpArbiter, CvvdpCheckpoint};
 use crate::image::Image3F;
+use crate::shared_sort::SharedSort;
 use crate::squeeze::{Channel, apply_step_inverse, smooth_tendency};
 use crate::ssimulacra2::{Rect, Ssimulacra2Checkpoint, Ssimulacra2Reference};
 use crate::thread_pool::ThreadPool;
@@ -456,7 +457,7 @@ fn propagate(
             let (line, pos) = below.avg_pos(idx);
             scratch.add(line, pos);
         }
-        scratch.lines.sort_unstable();
+        scratch.lines.shared_sort();
         start = log.len();
         let lv = &levels[j];
         let (lo, hi) = outs.split_at_mut(j + 1);
@@ -834,7 +835,7 @@ fn polish_band(
                             list.select_nth_unstable_by(PER_TILE, order);
                             list.truncate(PER_TILE);
                         }
-                        list.sort_unstable_by(order);
+                        list.shared_sort_unstable_by(order);
                         for &(_, line, i, target) in list.iter() {
                             let chain = &mut chains[ci];
                             let (cx, cy) = chain.lv[j].l.res_xy(line, i);
@@ -997,7 +998,7 @@ mod tests {
                 range.0 = range.0.min(pos.saturating_sub(1));
                 range.1 = range.1.max(pos);
             }
-            scratch.lines.sort_unstable();
+            scratch.lines.shared_sort();
             let actual: Vec<_> = scratch
                 .lines
                 .iter()

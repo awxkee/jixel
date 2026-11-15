@@ -38,6 +38,7 @@ use crate::coder_scratch::CoderScratch;
 use crate::dct::fmla;
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
+use crate::shared_sort::SharedSort;
 use crate::simd::scaled_add::add_scaled_scalar;
 use crate::util::fast_hypot;
 
@@ -299,7 +300,7 @@ pub(super) fn find_extensions(
         .into_iter()
         .flatten()
         .collect();
-    proposals.sort_by(|a, b| b.novel.cmp(&a.novel).then(b.supported.cmp(&a.supported)));
+    proposals.shared_sort_by(|a, b| b.novel.cmp(&a.novel).then(b.supported.cmp(&a.supported)));
     let mut out = Vec::new();
     for proposal in proposals {
         let novel = novelty(

@@ -40,6 +40,7 @@ use super::{
     JpegComponentScanInfo, JpegData, JpegHuffmanCode, JpegQuantTable, JpegScanInfo, MAX_COMPONENTS,
     NATURAL_ORDER,
 };
+use crate::shared_sort::SharedSort;
 
 /// Reasons a JPEG may be rejected for transcoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,7 +446,7 @@ impl ArithmeticFrame {
             c.quant_idx = index as u32;
             used[i] = index;
         }
-        used.sort_unstable();
+        used.shared_sort();
         let mut slots = 0u8;
         let unique_slots = jpg.quant.iter().all(|q| {
             let bit = 1 << q.index;
