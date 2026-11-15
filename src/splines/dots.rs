@@ -426,7 +426,7 @@ pub(super) fn dot_candidates(
             (!candidate.alts.is_empty()).then_some(candidate)
         })
         .collect();
-    finish_alts(&mut out, w, h);
+    finish_alts(pool, scratch, &mut out, w, h);
     out
 }
 
@@ -603,7 +603,13 @@ fn fit_peaks(
 
 /// Every fitted color also competes with gray and with the most common
 /// fitted color: the colors templates are most likely to share.
-fn finish_alts(out: &mut Vec<Candidate>, w: usize, h: usize) {
+fn finish_alts(
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    out: &mut Vec<Candidate>,
+    w: usize,
+    h: usize,
+) {
     let mut counts: BTreeMap<(bool, i32, i32), usize> = BTreeMap::new();
     for c in out.iter() {
         let sp = &c.alts[c.alts.len() / 2];
@@ -624,27 +630,34 @@ fn finish_alts(out: &mut Vec<Candidate>, w: usize, h: usize) {
         let (x0, y0, side) = dot_box(sp);
         x0 >= 0 && y0 >= 0 && x0 as usize + side <= w && y0 as usize + side <= h
     };
-    for c in out.iter_mut() {
-        let common = common[usize::from(c.alts[0].dct[3][0] < 0)];
-        let shared = if common == (0, 0) {
-            vec![common]
-        } else {
-            vec![common, (0, 0)]
-        };
-        for sp in std::mem::take(&mut c.alts) {
-            let color = (sp.dct[0][0], sp.dct[2][0]);
-            if !shared.contains(&color) && inside(&sp) {
-                c.alts.push(sp.clone());
-            }
-            for &color in &shared {
-                let mut alt = sp.clone();
-                (alt.dct[0][0], alt.dct[2][0]) = color;
-                if inside(&alt) {
-                    c.alts.push(alt);
+    const CHUNK: usize = 512;
+    let mut chunks: Vec<&mut [Candidate]> = out.chunks_mut(CHUNK).collect();
+    pool.steal_for_each_mut(scratch, &mut chunks, |_, chunk, _| {
+        for c in chunk.iter_mut() {
+            let common = common[usize::from(c.alts[0].dct[3][0] < 0)];
+            let shared: &[(i32, i32)] = if common == (0, 0) {
+                &[(0, 0)]
+            } else {
+                &[common, (0, 0)]
+            };
+            let fitted = std::mem::take(&mut c.alts);
+            c.alts.reserve(fitted.len() * (shared.len() + 1));
+            for sp in fitted {
+                let color = (sp.dct[0][0], sp.dct[2][0]);
+                if !shared.contains(&color) && inside(&sp) {
+                    c.alts.push(sp.clone());
+                }
+                for &color in shared {
+                    let mut alt = sp.clone();
+                    (alt.dct[0][0], alt.dct[2][0]) = color;
+                    if inside(&alt) {
+                        c.alts.push(alt);
+                    }
                 }
             }
         }
-    }
+    });
+    drop(chunks);
     out.retain(|c| !c.alts.is_empty());
 }
 
