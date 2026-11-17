@@ -135,7 +135,6 @@ pub(crate) fn sse_and_rate_sse_impl<const BIASED: bool, const SAVE_LEVELS: bool>
     let all_active_i = _mm_cmpeq_epi32(izero, izero);
 
     // round-to-nearest-even via SSE4.1
-    const RND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
 
     for (y, (coeffs, inv_matrix)) in coeff
         .chunks_exact(width)
@@ -169,7 +168,8 @@ pub(crate) fn sse_and_rate_sse_impl<const BIASED: bool, const SAVE_LEVELS: bool>
             // keep = |a| >= threshold
             let keep = _mm_cmpge_ps(absa, thrv);
 
-            let rounded = _mm_round_ps::<RND>(a);
+            // Ties away from zero, as the scalar kernel and the coding quantizer.
+            let rounded = super::inflated_cost::round_ties_away(a);
             let q = _mm_and_ps(rounded, keep);
 
             let d = if BIASED {
@@ -283,7 +283,6 @@ pub(crate) fn sse_and_rate_sse_impl_reference<const BIASED: bool, const SAVE_LEV
     let all_active_i = _mm_cmpeq_epi32(izero, izero);
 
     // round-to-nearest-even via SSE4.1
-    const RND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
 
     for (y, (coeffs, inv_matrix)) in coeff
         .chunks_exact(width)
@@ -317,7 +316,8 @@ pub(crate) fn sse_and_rate_sse_impl_reference<const BIASED: bool, const SAVE_LEV
             // keep = |a| >= threshold
             let keep = _mm_cmpge_ps(absa, thrv);
 
-            let rounded = _mm_round_ps::<RND>(a);
+            // Ties away from zero, as the scalar kernel and the coding quantizer.
+            let rounded = super::inflated_cost::round_ties_away(a);
             let q = _mm_and_ps(rounded, keep);
 
             let d = if BIASED {

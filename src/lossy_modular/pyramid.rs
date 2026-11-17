@@ -95,6 +95,62 @@ pub(crate) struct Pyramid {
     pub(crate) crop: Option<([usize; 2], bool)>,
 }
 
+/// Luma step multipliers by squeeze level (shift sum 1..=6, coarser levels
+/// reuse the last) at full soft-focus strength: finer on the two finest
+/// levels, coarser from there.
+const SOFT_FOCUS_LUMA_BANDS: [f32; 6] = [0.82, 0.86, 1.20, 1.32, 1.30, 1.20];
+
+/// Detail ratios ([`fine_detail_ratio`]) of full and of zero strength, and
+/// the full strength. Fit on 80 photos under forced lossy modular (Slow,
+/// d1-5): SS2 -0.68 % / butteraugli -0.18 % BD, motion blur -1.65 / -0.65;
+/// 20 held-out DIV2K -0.54 / -0.10.
+const SOFT_FOCUS_RATIO: [f32; 2] = [0.40, 0.80];
+const SOFT_FOCUS_MAX: f32 = 0.75;
+/// Distance multiplier at strength 1 that keeps the bytes and score of a
+/// distance where they were.
+const SOFT_FOCUS_DISTANCE: f32 = 0.90;
+
+/// Mean |Haar detail| of luma at the finest level over the one three levels
+/// coarser: low on soft-focus and motion-blurred photos.
+fn fine_detail_ratio(xyb: &Image3F) -> Option<f32> {
+    let (mut w, mut h) = (xyb.xsize(), xyb.ysize());
+    if w < 64 || h < 64 {
+        return None;
+    }
+    let mut cur: Vec<f32> = (0..h)
+        .flat_map(|y| xyb.plane_row(1, y)[..w].iter().copied())
+        .collect();
+    let mut energy = [0f64; 4];
+    for e in &mut energy {
+        let (nw, nh) = (w / 2, h / 2);
+        let mut next = vec![0f32; nw * nh];
+        let mut sum = 0f64;
+        for (y, out) in next.chunks_exact_mut(nw).enumerate() {
+            let (r0, r1) = (&cur[2 * y * w..][..w], &cur[(2 * y + 1) * w..][..w]);
+            let mut row = 0f32;
+            for (x, o) in out.iter_mut().enumerate() {
+                let (a, b, c, d) = (r0[2 * x], r0[2 * x + 1], r1[2 * x], r1[2 * x + 1]);
+                row += (a - b).abs() + (c - d).abs() + 0.5 * (a + b - c - d).abs();
+                *o = 0.25 * (a + b + c + d);
+            }
+            sum += f64::from(row);
+        }
+        *e = sum / (3 * nw * nh) as f64;
+        (cur, w, h) = (next, nw, nh);
+    }
+    (energy[3] > 0.0).then(|| (energy[0] / energy[3]) as f32)
+}
+
+/// How far the luma steps move toward [`SOFT_FOCUS_LUMA_BANDS`], 0..=1.
+fn soft_focus_strength(xyb: &Image3F) -> f32 {
+    let Some(ratio) = fine_detail_ratio(xyb) else {
+        return 0.0;
+    };
+    SOFT_FOCUS_MAX
+        * ((SOFT_FOCUS_RATIO[1] - ratio) / (SOFT_FOCUS_RATIO[1] - SOFT_FOCUS_RATIO[0]))
+            .clamp(0.0, 1.0)
+}
+
 impl Pyramid {
     /// The XYB image at the calibrated `distance`, on the screen-content rows
     /// when `screen`. None when the image is too small to squeeze.
@@ -106,12 +162,27 @@ impl Pyramid {
     ) -> Option<Self> {
         let steps = lossy_squeeze_steps(xyb.xsize(), xyb.ysize(), 3);
         let row_mul = if screen { SCREEN_ROW_MUL } else { [1.0; 3] };
+        // Soft-focus photos take finer steps on the finest luma levels and
+        // coarser ones below, at a distance that keeps the frame's size.
+        let strength = if screen {
+            0.0
+        } else {
+            soft_focus_strength(xyb)
+        };
+        let luma_bands = SOFT_FOCUS_LUMA_BANDS.map(|b| b.powf(strength));
+        let step_distance = distance * SOFT_FOCUS_DISTANCE.powf(strength);
         let pyramid = Self::xyb_with(
             xyb,
             steps,
             Deadzone::COLOR,
             pool,
-            |color, hshift, vshift| xyb_step(color, hshift, vshift, distance, row_mul),
+            |color, hshift, vshift| {
+                let mut row_mul = row_mul;
+                if color == 0 {
+                    row_mul[0] *= luma_bands[(hshift + vshift - 1).clamp(0, 5) as usize];
+                }
+                xyb_step(color, hshift, vshift, step_distance, row_mul)
+            },
         )?;
         Some(Self {
             epf: Layout::Xyb.epf(distance),

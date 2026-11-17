@@ -35,9 +35,9 @@ use super::ma_sampling::{MaRefPlane, ma_channel_sample_count, sample_channel_ma}
 use super::ma_source::{
     CoarseLearn, LearnedCandidate, MA_COARSE_MAX_LEAVES, MA_COARSE_TARGET_SAMPLES,
     MA_DEEPEN_MIN_SAVINGS, MA_FINAL_SPLIT_COST_BITS, MA_LITE_CANDIDATES, MA_LITE_MAX_LEAVES,
-    MA_MIN_NODE_SAMPLES, MA_PRUNE_LEAF_BITS, MA_PRUNE_MIN_NODE_SAMPLES, MA_PRUNE_SPLIT_COST_BITS,
-    MA_SIDE_PREDS, MA_SPLIT_COST_BITS, MA_WIDE_SIDE_PREDS, MaSource, MaTransform, ac_stream_id,
-    with_ma_pixels,
+    MA_MIN_NODE_SAMPLES, MA_NO_WP_CHANNELS, MA_PRUNE_LEAF_BITS, MA_PRUNE_MIN_NODE_SAMPLES,
+    MA_PRUNE_SPLIT_COST_BITS, MA_SIDE_PREDS, MA_SPLIT_COST_BITS, MA_WIDE_SIDE_PREDS, MaSource,
+    MaTransform, ac_stream_id, with_ma_pixels,
 };
 use super::tree::emit_learned_tree;
 use crate::coder_scratch::CoderScratch;
@@ -244,6 +244,8 @@ pub(super) fn ma_learn_params(
         max_candidates,
         modal_offsets,
         prune_leaf_bits: 0.0,
+        channel_first: true,
+        no_wp_channels: MA_NO_WP_CHANNELS,
     }
 }
 

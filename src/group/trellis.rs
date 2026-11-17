@@ -255,6 +255,106 @@ impl RdoqSearch {
 /// Paths the beam keeps per coefficient.
 const RDOQ_BEAM_WIDTH: usize = 3;
 
+/// The banded trellis's last step: the cost of each reachable nonzero count
+/// before its count token, and the count it picked. Every row above it is
+/// independent of the nonzero context predicted from the neighbors, so the
+/// same block, field and prices under another context only re-pick the count;
+/// the same count backtracks to the same levels.
+#[derive(Clone, Copy)]
+pub(super) struct TrellisTail {
+    /// Caller's key of the inputs the tail was computed from; `u32::MAX`
+    /// when there is none (another search, or a skipped block).
+    pub(super) key: u32,
+    /// Fingerprint of the trellis inputs besides the context
+    /// ([`TrellisTail::inputs`]).
+    pub(super) inputs: u64,
+    first: u16,
+    len: u8,
+    best: u16,
+    tails: [f32; RDOQ_BAND_STRIDE / 2],
+}
+
+impl Default for TrellisTail {
+    fn default() -> Self {
+        Self {
+            key: u32::MAX,
+            inputs: 0,
+            first: 0,
+            len: 0,
+            best: 0,
+            tails: [f32::INFINITY; RDOQ_BAND_STRIDE / 2],
+        }
+    }
+}
+
+impl TrellisTail {
+    /// Fingerprint of a block's trellis inputs that the caller's key does not
+    /// carry: transform, quantizer scale, lambda, restore penalty, distance
+    /// and the levels entering the trellis. A tail re-picks only under equal
+    /// inputs.
+    pub(super) fn inputs(
+        raw_strategy: u8,
+        q_scaled: f32,
+        lambda: f32,
+        restore_penalty: f32,
+        distance: f32,
+        levels: &[i32],
+    ) -> u64 {
+        const K: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mix = |h: u64, v: u64| (h ^ v).wrapping_mul(K).rotate_left(29);
+        let mut h = mix(0, u64::from(raw_strategy) | (levels.len() as u64) << 8);
+        h = mix(
+            h,
+            u64::from(q_scaled.to_bits()) | u64::from(lambda.to_bits()) << 32,
+        );
+        h = mix(
+            h,
+            u64::from(restore_penalty.to_bits()) | u64::from(distance.to_bits()) << 32,
+        );
+        for pair in levels.chunks(2) {
+            let v = pair
+                .iter()
+                .fold(0u64, |v, &q| v << 32 | u64::from(q as u32));
+            h = mix(h, v);
+        }
+        h
+    }
+
+    /// Whether `rdoq_block` with context `predicted` would backtrack from the
+    /// same count, i.e. leave exactly the levels it left for this tail.
+    pub(super) fn same_pick(
+        &self,
+        inputs: u64,
+        prices: &FrozenTokenPrices,
+        c: usize,
+        strategy_code: u8,
+        qf_hi: bool,
+        predicted: u8,
+        lambda: f32,
+    ) -> bool {
+        if self.key == u32::MAX || self.inputs != inputs {
+            return false;
+        }
+        let block_ctx = fine_block_context(c, strategy_code, qf_hi);
+        let nzero_ctx = fine_non_zero_context(predicted as u32, block_ctx);
+        // The banded trellis's final loop, over the stored row.
+        let mut best_remaining = 0;
+        let mut best_cost = f32::INFINITY;
+        for (i, &tail) in self.tails[..usize::from(self.len)].iter().enumerate() {
+            let remaining = usize::from(self.first) + i;
+            if !tail.is_finite() {
+                continue;
+            }
+            let cost = tail + lambda * prices.token_bits(Token::new(nzero_ctx, remaining as u32));
+            if cost < best_cost {
+                best_cost = cost;
+                best_remaining = remaining;
+            }
+        }
+        best_remaining == usize::from(self.best)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn rdoq_block(
     channel_weight: f32,
@@ -277,7 +377,12 @@ pub(super) fn rdoq_block(
     restore_penalty: f32,
     search: RdoqSearch,
     scratch: &mut RdoqScratch,
+    tail: Option<&mut TrellisTail>,
 ) {
+    let mut tail = tail;
+    if let Some(t) = tail.as_deref_mut() {
+        *t = TrellisTail::default();
+    }
     let covered_blocks = cx * cy;
     let (window_cap, restore_len) = rdoq_window_len(covered_blocks);
     if search == RdoqSearch::Beam {
@@ -362,6 +467,7 @@ pub(super) fn rdoq_block(
                 restore_penalty,
                 choices,
                 costs,
+                tail,
             )
         };
     }
@@ -778,6 +884,7 @@ fn rdoq_block_banded<const FACTORED: bool, const SINGLE_BLOCK: bool>(
     restore_penalty: f32,
     choices: &mut [u8],
     costs: &mut [[f32; RDOQ_BAND_STRIDE]; 2],
+    tail: Option<&mut TrellisTail>,
 ) {
     const MAX_NZERO_DELTA: usize = RDOQ_MAX_NZERO_DELTA;
     const BAND_STRIDE: usize = RDOQ_BAND_STRIDE;
@@ -1158,6 +1265,20 @@ fn rdoq_block_banded<const FACTORED: bool, const SINGLE_BLOCK: bool>(
             best_remaining = remaining;
         }
     }
+    if let Some(out) = tail {
+        // The row the loop above read: each count's tail at its initial prev.
+        let len = next_max - next_min + 1;
+        debug_assert!(len <= out.tails.len());
+        for (i, slot) in out.tails[..len].iter_mut().enumerate() {
+            let remaining = next_min + i;
+            *slot = next[i * 2 + usize::from(remaining <= block.len() / 16)];
+        }
+        out.first = next_min as u16;
+        out.len = len as u8;
+        out.best = best_remaining as u16;
+        // Valid until the caller keys it.
+        out.key = 0;
+    }
 
     let mut remaining = best_remaining;
     let mut prev = usize::from(remaining <= block.len() / 16);
@@ -1407,6 +1528,7 @@ mod tests {
                 2.,
                 choices.as_mut_slice(),
                 &mut costs,
+                None,
             );
         };
         // Small enough for Miri, but spans both row kernels, the full
@@ -1644,6 +1766,7 @@ mod tests {
                     1.0,
                     search,
                     scratch,
+                    None,
                 );
             };
             run(&mut expected, &mut fresh);
@@ -1664,6 +1787,7 @@ mod tests {
             "exercise finite trellis paths, including changed blocks"
         );
     }
+
     #[test]
     fn rdoq_window_policy() {
         for covered in [1, 2, 4, 8, 16, 32, 64] {
@@ -1785,6 +1909,7 @@ mod tests {
                         [1., 2.][case / shapes.len() % 2],
                         choices,
                         costs,
+                        None,
                     );
                 };
                 run(false, &mut expected, choices0.as_mut_slice(), &mut costs0);
@@ -1912,6 +2037,7 @@ mod tests {
                         [1., 2.][case % 2],
                         choices,
                         costs,
+                        None,
                     );
                 };
                 let mut expected = original.clone();
@@ -1999,6 +2125,7 @@ mod tests {
                     2.,
                     choices,
                     costs,
+                    None,
                 );
             };
             run(false, &mut expected, choices0.as_mut_slice(), &mut costs0);

@@ -84,8 +84,9 @@ pub(crate) use entropy::{counts_bit_cost_neon, entropy_of_hist_neon};
 pub(crate) use frame::chroma_gradient_sums_neon;
 pub(crate) use haar::haar_rows_neon;
 pub(crate) use inflated_cost::{
-    combine_error_neon, recon_chroma_phase_neon, recon_dist_and_rate_neon, recon_luma_phase_neon,
-    rgb_hue_chroma_edge_loss_neon, ssim_deficit_neon,
+    RECON_QUANTIZE_ERROR_NEON, combine_error_neon, recon_chroma_phase_neon,
+    recon_dist_and_rate_neon, recon_luma_phase_neon, rgb_hue_chroma_edge_loss_neon,
+    ssim_deficit_neon,
 };
 pub(crate) use ink_layer::{luma_row_neon, ridge_row_neon};
 pub(crate) use lossless_grad::grad_pack_interior;

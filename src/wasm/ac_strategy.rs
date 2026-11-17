@@ -144,7 +144,8 @@ pub(crate) fn sse_and_rate_wasm_impl<const BIASED: bool, const SAVE_LEVELS: bool
             let mv = unsafe { v128_load(inv_matrix.as_ptr().add(x).cast()) };
             let a = f32x4_mul(f32x4_mul(mv, qs), cv);
             let keep = f32x4_ge(f32x4_abs(a), f32x4_splat(threshold));
-            let q = v128_and(f32x4_nearest(a), keep);
+            // Ties away from zero, as the scalar kernel and the coding quantizer.
+            let q = v128_and(super::inflated_cost::round_ties_away(a), keep);
             let d = if BIASED {
                 f32x4_sub(a, wasm_dequantized_level_f32(q, bias))
             } else {
@@ -305,8 +306,8 @@ pub(crate) fn sse_and_rate_wasm_impl_reference<const BIASED: bool, const SAVE_LE
             // keep = |a| >= threshold
             let keep = f32x4_ge(absa, thrv);
 
-            // round-to-nearest, ties-to-even
-            let rounded = f32x4_nearest(a);
+            // round to nearest, ties away from zero (as the scalar kernel)
+            let rounded = super::inflated_cost::round_ties_away(a);
 
             // zero rounded where not kept
             let q = v128_and(rounded, keep);

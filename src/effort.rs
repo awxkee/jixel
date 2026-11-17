@@ -256,6 +256,9 @@ effort_gates! {
     /// 16x16 transform layouts (DCT8 quad, DCT16, rectangle pairs) re-chosen by
     /// the closed loop's exact SSIMULACRA2 arbiter.
     layout_loop,
+    /// The same loop also re-chooses aligned 32x32 sites among their family:
+    /// DCT32, the 32x16 and 16x32 pairs, and quads of DCT16, 32x8 or 8x32.
+    layout_loop_32,
     /// Race frequency-derived coefficient orders against natural scans using
     /// serialized permutation headers and final entropy-coded AC streams.
     coeff_order_entropy_race,
@@ -387,6 +390,7 @@ static SLOW: Effort = Effort {
     lm_residual_polish: false,
     dct128_loop: false,
     layout_loop: false,
+    layout_loop_32: false,
     coeff_order_entropy_race: false,
     dc_cfl_weighted: false,
     rdoq_fresh_prices: false,

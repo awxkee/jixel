@@ -349,11 +349,7 @@ pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn, biased
                     let i = y * width + x;
                     let threshold = if x >= half { thr[yfix + 1] } else { thr[yfix] };
                     let a = inv[i] * q_scaled * coeff[i];
-                    let q = if a.abs() >= threshold {
-                        a.round_ties_even()
-                    } else {
-                        0.0
-                    };
+                    let q = if a.abs() >= threshold { a.round() } else { 0.0 };
                     let d = if biased { a - bias.level_f32(q) } else { a - q };
                     expected_sse += d * d;
                     if q != 0.0 {
@@ -1117,6 +1113,32 @@ pub(crate) fn select_recon_chroma_phase_fn() -> ReconChromaPhaseFn {
     recon_chroma_phase_default
 }
 
+/// The biased, rate-free quantizer error (`recon_quantize_scalar::<true,
+/// false>`) on the best bit-exact SIMD kernel of this machine.
+pub(crate) fn recon_quantize_error_fn() -> ReconQuantizeFn {
+    static SELECTED: OnceLock<ReconQuantizeFn> = OnceLock::new();
+    *SELECTED.get_or_init(|| {
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            return crate::neon::RECON_QUANTIZE_ERROR_NEON;
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            return crate::avx::RECON_QUANTIZE_ERROR_AVX2;
+        }
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+        if std::is_x86_feature_detected!("sse4.1") {
+            return crate::sse::recon_quantize_error_sse41;
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+        {
+            return crate::wasm::recon_quantize_error_wasm;
+        }
+        #[allow(unreachable_code)]
+        recon_quantize_scalar::<true, false>
+    })
+}
+
 fn default_kernels<'a>(
     input: &ReconDistInput<'_>,
     error: &'a ReconErrorKernels,
@@ -1125,7 +1147,7 @@ fn default_kernels<'a>(
         quantize: if input.quantization.compute_rate {
             recon_quantize_scalar::<true, true>
         } else {
-            recon_quantize_scalar::<true, false>
+            recon_quantize_error_fn()
         },
         ssim: ssim_deficit_dispatch_kernel,
         prepare: prepare_reconstruction_scalar,
@@ -1162,7 +1184,7 @@ fn recon_dist_and_rate_default(
             quantize: if input.quantization.compute_rate {
                 recon_quantize_scalar::<true, true>
             } else {
-                recon_quantize_scalar::<true, false>
+                recon_quantize_error_fn()
             },
             ssim: ssim_deficit_dispatch_kernel,
             prepare: prepare_reconstruction_scalar,
@@ -2560,6 +2582,123 @@ mod tests {
                         (actual - expected).abs() <= tolerance,
                         "len={len}, index={index}, factor={factor}: actual={actual}, expected={expected}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rate_free_quantize_error_kernels_match_scalar_bits() {
+        let mut kernels: Vec<(&str, super::ReconQuantizeFn)> =
+            vec![("selected", super::recon_quantize_error_fn())];
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        kernels.push(("neon", crate::neon::RECON_QUANTIZE_ERROR_NEON));
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            kernels.push(("avx2", crate::avx::RECON_QUANTIZE_ERROR_AVX2));
+        }
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+        if std::is_x86_feature_detected!("sse4.1") {
+            kernels.push(("sse4.1", crate::sse::recon_quantize_error_sse41));
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+        kernels.push(("wasm", crate::wasm::recon_quantize_error_wasm));
+        let special = [
+            0.0,
+            -0.0,
+            0.5,
+            -0.5,
+            1.5,
+            -2.5,
+            1.0,
+            -1.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        let mut rng = 29u32;
+        for (width, height, cx, cy) in [
+            (8, 8, 1, 1),
+            (16, 8, 2, 1),
+            (8, 16, 1, 2),
+            (16, 16, 2, 2),
+            (32, 8, 4, 1),
+            (8, 32, 1, 4),
+            (32, 32, 4, 4),
+            (64, 64, 8, 8),
+        ] {
+            let n = width * height;
+            for case in 0..48 {
+                let coeff: Vec<f32> = (0..n)
+                    .map(|_| {
+                        rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                        let unit = (rng >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
+                        match case % 5 {
+                            0 => unit * 2.0,
+                            1 => unit * 0.2,
+                            2 => unit * 200.0,
+                            // Exact half-integer levels after scaling by 1.
+                            3 => ((rng >> 8) % 64) as f32 * 0.5 - 16.0,
+                            _ => special[rng as usize % special.len()],
+                        }
+                    })
+                    .collect();
+                let (inv, scale): (Vec<f32>, f32) = if case % 5 == 3 {
+                    (vec![1.0; n], 1.0)
+                } else {
+                    (
+                        (0..n).map(|i| 0.01 + (i % 7) as f32 * 0.15).collect(),
+                        [0.01, 0.5, 1.0, 7.0, 80.0][case % 5],
+                    )
+                };
+                let forward: Vec<f32> = inv.iter().map(|v| 1.0 / v).collect();
+                let thresholds = [[0.0, 0.42, 0.57, 0.91], [0.5, 0.5, 0.6, 0.7]][case % 2];
+                let bias = crate::group::DequantBias::DEFAULT[case % 3];
+                let mut expected = vec![-123.0; n];
+                super::recon_quantize_scalar::<true, false>(
+                    &coeff,
+                    &inv,
+                    &forward,
+                    scale,
+                    bias,
+                    &thresholds,
+                    width,
+                    height,
+                    width / 2,
+                    cx,
+                    cy,
+                    &mut expected,
+                    super::rate_log2_lut(),
+                    &[],
+                );
+                for &(name, kernel) in &kernels {
+                    let mut actual = vec![-123.0; n];
+                    // SAFETY: each kernel was listed only where its features exist.
+                    unsafe {
+                        kernel(
+                            &coeff,
+                            &inv,
+                            &forward,
+                            scale,
+                            bias,
+                            &thresholds,
+                            width,
+                            height,
+                            width / 2,
+                            cx,
+                            cy,
+                            &mut actual,
+                            super::rate_log2_lut(),
+                            &[],
+                        );
+                    }
+                    // NaN sign and payload are unspecified; every other bit must match.
+                    for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                        assert!(
+                            a.to_bits() == e.to_bits() || (a.is_nan() && e.is_nan()),
+                            "{name} {width}x{height} case {case} at {i}: {a} vs {e}"
+                        );
+                    }
                 }
             }
         }

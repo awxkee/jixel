@@ -115,6 +115,11 @@ pub(super) const MA_FINAL_SPLIT_COST_BITS: f32 = 50.0;
 /// is hard.
 pub(super) const MA_MAX_LEAVES: usize = LZ77_MAX_CONTEXTS - 1;
 
+/// Channels of a learned lossless tree that go without the Weighted
+/// Predictor (`MaLearnParams::no_wp_channels`). `0b110`, the two chroma
+/// channels of an RCT source.
+pub(super) const MA_NO_WP_CHANNELS: u32 = 0;
+
 /// Minimum samples in a node before it must become a leaf.
 pub(crate) const MA_MIN_NODE_SAMPLES: usize = 128;
 

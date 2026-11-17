@@ -316,3 +316,93 @@ pub(crate) fn combine_error_sse41(
         combined_remainder.copy_from_slice(&combined[..combined_remainder.len()]);
     }
 }
+
+/// `f32::round` (ties away from zero) on every lane, signed zeros included.
+#[inline]
+#[target_feature(enable = "sse4.1")]
+pub(super) fn round_ties_away(x: __m128) -> __m128 {
+    let sign = _mm_and_ps(x, _mm_set1_ps(-0.0));
+    let truncated = _mm_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(x);
+    let fraction = _mm_andnot_ps(_mm_set1_ps(-0.0), _mm_sub_ps(x, truncated));
+    let adjust = _mm_cmpge_ps(fraction, _mm_set1_ps(0.5));
+    let signed_one = _mm_or_ps(_mm_set1_ps(1.0), sign);
+    _mm_or_ps(_mm_add_ps(truncated, _mm_and_ps(signed_one, adjust)), sign)
+}
+
+/// The biased, rate-free coefficient error of `recon_quantize_scalar`, bit
+/// for bit: levels round ties away from zero as the scalar quantizer does.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "sse4.1")]
+pub(crate) fn recon_quantize_error_sse41(
+    coeff: &[f32],
+    inv: &[f32],
+    matrix: &[f32],
+    quant_scale: f32,
+    bias: crate::group::DequantBias,
+    thresholds: &[f32; 4],
+    width: usize,
+    height: usize,
+    half: usize,
+    cx: usize,
+    cy: usize,
+    coeff_error: &mut [f32],
+    _rate_log2_lut: &crate::inflated_cost::RateLog2Lut,
+    _scan_pos: &[u32],
+) -> f32 {
+    let n = width
+        .checked_mul(height)
+        .expect("coefficient size overflow");
+    assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
+    assert!(coeff.len() >= n && inv.len() >= n && matrix.len() >= n && coeff_error.len() >= n);
+    let scale = _mm_set1_ps(quant_scale);
+    let inv_scale = _mm_set1_ps(1.0 / quant_scale);
+    let sign = _mm_set1_ps(-0.0);
+    let lane_ids = _mm_setr_epi32(0, 1, 2, 3);
+    for (y, (((coeff_row, inv_row), matrix_row), error_row)) in coeff
+        .chunks_exact(width)
+        .zip(inv.chunks_exact(width))
+        .zip(matrix.chunks_exact(width))
+        .zip(coeff_error.chunks_exact_mut(width))
+        .take(height)
+        .enumerate()
+    {
+        let yfix = if y >= height / 2 { 2 } else { 0 };
+        for (chunk_x, (((coeff4, inv4), matrix4), error4)) in coeff_row
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(inv_row.as_chunks::<4>().0.iter())
+            .zip(matrix_row.as_chunks::<4>().0.iter())
+            .zip(error_row.as_chunks_mut::<4>().0.iter_mut())
+            .enumerate()
+        {
+            let x = chunk_x * 4;
+            let threshold = _mm_set1_ps(if x >= half {
+                thresholds[yfix + 1]
+            } else {
+                thresholds[yfix]
+            });
+            let coeff_v = unsafe { _mm_loadu_ps(coeff4.as_ptr()) };
+            let inv_v = unsafe { _mm_loadu_ps(inv4.as_ptr()) };
+            let scaled = _mm_mul_ps(_mm_mul_ps(inv_v, scale), coeff_v);
+            let keep = _mm_cmpge_ps(_mm_andnot_ps(sign, scaled), threshold);
+            let quantized = _mm_and_ps(round_ties_away(scaled), keep);
+            let dequantized = super::ac_strategy::sse_dequantized_level_f32(quantized, bias);
+            let matrix_v = unsafe { _mm_loadu_ps(matrix4.as_ptr()) };
+            let error = _mm_mul_ps(
+                _mm_sub_ps(scaled, dequantized),
+                _mm_mul_ps(matrix_v, inv_scale),
+            );
+            let active = if y < cy && x < cx {
+                _mm_castsi128_ps(_mm_cmpgt_epi32(
+                    _mm_add_epi32(_mm_set1_epi32(x as i32), lane_ids),
+                    _mm_set1_epi32(cx as i32 - 1),
+                ))
+            } else {
+                _mm_castsi128_ps(_mm_set1_epi32(-1))
+            };
+            unsafe { _mm_storeu_ps(error4.as_mut_ptr(), _mm_and_ps(error, active)) };
+        }
+    }
+    0.0
+}

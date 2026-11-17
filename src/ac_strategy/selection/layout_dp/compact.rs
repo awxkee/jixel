@@ -264,6 +264,17 @@ pub(super) fn plan(
     if candidates.iter().any(|c| c.width() > 2 || c.height() > 2) {
         return super::plan(candidates, width, height, s, out);
     }
+    plan_staged(s, |s| plan_once(candidates, width, height, s, compact, out))
+}
+
+fn plan_once(
+    candidates: &[Candidate],
+    width: usize,
+    height: usize,
+    s: &mut PlannerScratch,
+    compact: &mut CompactPlanner,
+    out: &mut Vec<usize>,
+) -> f64 {
     prepare_planner(candidates, width, height, s);
     compact.reset(width, height);
     let mut state = State { cell: 0, filled: 0 };

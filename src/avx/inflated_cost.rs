@@ -398,6 +398,26 @@ fn avx_dequantized_level_f32(q: __m256, bias: crate::group::DequantBias) -> __m2
     _mm256_and_ps(dq, nz)
 }
 
+/// `f32::round` (ties away from zero) on every lane, signed zeros included.
+#[inline]
+#[target_feature(enable = "avx2")]
+pub(crate) fn round_ties_away(x: __m256) -> __m256 {
+    let sign = _mm256_and_ps(x, _mm256_set1_ps(-0.0));
+    let truncated = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(x);
+    let fraction = _mm256_andnot_ps(_mm256_set1_ps(-0.0), _mm256_sub_ps(x, truncated));
+    let adjust = _mm256_cmp_ps::<_CMP_GE_OQ>(fraction, _mm256_set1_ps(0.5));
+    let signed_one = _mm256_or_ps(_mm256_set1_ps(1.0), sign);
+    _mm256_or_ps(
+        _mm256_add_ps(truncated, _mm256_and_ps(signed_one, adjust)),
+        sign,
+    )
+}
+
+/// The biased, rate-free coefficient error of `recon_quantize_scalar`, bit
+/// for bit (the coefficient model's luma error before rebasing CfL).
+pub(crate) const RECON_QUANTIZE_ERROR_AVX2: crate::inflated_cost::ReconQuantizeFn =
+    recon_quantize_avx2::<true, false>;
+
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2,fma")]
 fn recon_quantize_avx2<const BIASED: bool, const COMPUTE_RATE: bool>(
@@ -427,7 +447,6 @@ fn recon_quantize_avx2<const BIASED: bool, const COMPUTE_RATE: bool>(
     let sign = _mm256_set1_ps(-0.0);
     let lane_ids = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     let all = _mm256_set1_epi32(-1);
-    const ROUND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
     let mut nonzero_acc = _mm256_setzero_si256();
     let mut magnitude_bits = _mm256_setzero_ps();
     let mut scan_acc = _mm256_setzero_si256();
@@ -470,7 +489,7 @@ fn recon_quantize_avx2<const BIASED: bool, const COMPUTE_RATE: bool>(
             let scaled = _mm256_mul_ps(denominator, coeff_v);
             let absolute = _mm256_andnot_ps(sign, scaled);
             let keep = _mm256_cmp_ps::<_CMP_GE_OQ>(absolute, threshold);
-            let quantized = _mm256_and_ps(_mm256_round_ps::<ROUND>(scaled), keep);
+            let quantized = _mm256_and_ps(round_ties_away(scaled), keep);
             let active_i = if y < cy && x < cx {
                 let lane_x = _mm256_add_epi32(_mm256_set1_epi32(x as i32), lane_ids);
                 _mm256_cmpgt_epi32(lane_x, _mm256_set1_epi32(cx as i32 - 1))
@@ -605,7 +624,6 @@ fn recon_quantize_avx2_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
     let sign = _mm256_set1_ps(-0.0);
     let lane_ids = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     let all = _mm256_set1_epi32(-1);
-    const ROUND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
     let mut nonzero = 0usize;
     let mut magnitude_bits = _mm256_setzero_ps();
     let mut scan_acc = _mm256_setzero_si256();
@@ -648,7 +666,7 @@ fn recon_quantize_avx2_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
             let scaled = _mm256_mul_ps(denominator, coeff_v);
             let absolute = _mm256_andnot_ps(sign, scaled);
             let keep = _mm256_cmp_ps::<_CMP_GE_OQ>(absolute, threshold);
-            let quantized = _mm256_and_ps(_mm256_round_ps::<ROUND>(scaled), keep);
+            let quantized = _mm256_and_ps(round_ties_away(scaled), keep);
             let dequantized = if BIASED {
                 avx_dequantized_level_f32(quantized, bias)
             } else {

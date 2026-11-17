@@ -320,6 +320,8 @@ struct PlannerScratch {
     packing_valid: bool,
     dominated: Vec<bool>,
     tableau: Vec<f64>,
+    /// Solve the packing LP by column generation (see `plan_staged`).
+    fast_lp: bool,
     budget: usize,
 }
 
@@ -439,6 +441,22 @@ fn prepare_regions(
     }
 }
 
+// Minimum over four independent lanes; +inf for an empty slice.
+fn column_minimum(values: &[f64]) -> f64 {
+    let (quads, tail) = values.as_chunks::<4>();
+    let mut minima = [f64::INFINITY; 4];
+    for quad in quads {
+        for (minimum, &value) in minima.iter_mut().zip(quad) {
+            *minimum = minimum.min(value);
+        }
+    }
+    let mut minimum = minima.into_iter().fold(f64::INFINITY, f64::min);
+    for &value in tail {
+        minimum = minimum.min(value);
+    }
+    minimum
+}
+
 fn entering_column(objective: &[f64], column_ids: &[u16]) -> Option<usize> {
     const LIMIT: f64 = -1e-10;
     let (quads, tail) = objective.as_chunks::<4>();
@@ -478,7 +496,6 @@ fn prepare_packing_bound(
     height: usize,
     s: &mut PlannerScratch,
 ) {
-    const PIVOTS: usize = 512;
     let cells = width * height;
     let mut leaves = [f64::INFINITY; SIDE * SIDE];
     for &c in candidates {
@@ -518,35 +535,108 @@ fn prepare_packing_bound(
             n += 1;
         }
     }
+    // Slack prices of the final dual: zero for basic slacks.
+    let mut prices = [0.0f64; SIDE * SIDE];
+    if s.fast_lp {
+        packing_simplex_generated(
+            candidates,
+            &column_ids,
+            &benefits,
+            n,
+            width,
+            cells,
+            &mut s.tableau,
+            &mut prices,
+        );
+    } else {
+        packing_simplex(
+            candidates,
+            &mut column_ids,
+            &benefits,
+            n,
+            width,
+            cells,
+            &mut s.tableau,
+            &mut prices,
+        );
+    }
+    let mut potentials = [0.0; SIDE * SIDE];
+    for i in 0..cells {
+        potentials[i] = leaves[i] - prices[i];
+    }
+    if potentials[..cells].iter().any(|x| !x.is_finite()) {
+        return;
+    }
+    // For every tile, sum(cell potentials) <= tile cost is the dual constraint.
+    // Only lower a potential when repairing, so earlier constraints stay valid.
+    for &c in candidates {
+        if !c.cost.is_finite() {
+            continue;
+        }
+        let mut sum = 0.0;
+        for y in c.y()..c.y() + c.height() {
+            for x in c.x()..c.x() + c.width() {
+                sum = -add_lower(-sum, -potentials[y * width + x]);
+            }
+        }
+        if sum > c.cost {
+            let excess = -add_lower(-sum, c.cost);
+            let i = c.y() * width + c.x();
+            potentials[i] = add_lower(potentials[i], -excess);
+        }
+    }
+    for x in 0..width {
+        s.packing[x][height] = 0.0;
+        for y in (0..height).rev() {
+            s.packing[x][y] = add_lower(potentials[y * width + x], s.packing[x][y + 1]);
+        }
+    }
+    s.packing_valid = true;
+}
+
+// Reference bounded primal simplex on the packing LP: Dantzig pricing over
+// the full tableau. Fills the final slack prices.
+#[allow(clippy::too_many_arguments)]
+fn packing_simplex(
+    candidates: &[Candidate],
+    column_ids: &mut [u16; MAX_CANDIDATES],
+    benefits: &[f64; MAX_CANDIDATES],
+    n: usize,
+    width: usize,
+    cells: usize,
+    tableau: &mut Vec<f64>,
+    prices: &mut [f64; SIDE * SIDE],
+) {
+    const PIVOTS: usize = 512;
     // Basic columns are identity vectors. Store only the nonbasic columns
     // and exchange entering/leaving column IDs after each pivot.
     let cols = n + 1;
     let rows = cells + 1;
     let objective = cells * cols;
-    s.tableau.clear();
-    s.tableau.resize(rows * cols, 0.0);
+    tableau.clear();
+    tableau.resize(rows * cols, 0.0);
     let mut basis: [u16; SIDE * SIDE] = std::array::from_fn(|row| (n + row) as u16);
     let nonbasic = &mut column_ids[..n];
-    for (v, (id, &benefit)) in nonbasic.iter_mut().zip(&benefits).enumerate() {
+    for (v, (id, &benefit)) in nonbasic.iter_mut().zip(benefits.iter()).enumerate() {
         let c = candidates[usize::from(*id)];
         *id = v as u16;
         for y in c.y()..c.y() + c.height() {
             for x in c.x()..c.x() + c.width() {
-                s.tableau[(y * width + x) * cols + v] = 1.0;
+                tableau[(y * width + x) * cols + v] = 1.0;
             }
         }
-        s.tableau[objective + v] = -benefit;
+        tableau[objective + v] = -benefit;
     }
     for row in 0..cells {
-        s.tableau[row * cols + cols - 1] = 1.0;
+        tableau[row * cols + cols - 1] = 1.0;
     }
     for _ in 0..PIVOTS {
-        let Some(enter) = entering_column(&s.tableau[objective..objective + n], nonbasic) else {
+        let Some(enter) = entering_column(&tableau[objective..objective + n], nonbasic) else {
             break;
         };
         let mut leave = None;
         let mut ratio = f64::INFINITY;
-        for (row, values) in s.tableau[..objective].chunks_exact(cols).enumerate() {
+        for (row, values) in tableau[..objective].chunks_exact(cols).enumerate() {
             let a = values[enter];
             if a <= 1e-12 {
                 continue;
@@ -564,7 +654,7 @@ fn prepare_packing_bound(
         };
         // Row slices: every other row reads only the pivot row, and the
         // elementwise updates vectorize without per-index checks.
-        let (above, rest) = s.tableau[..rows * cols].split_at_mut(leave * cols);
+        let (above, rest) = tableau[..rows * cols].split_at_mut(leave * cols);
         let (pivot_row, below) = rest.split_at_mut(cols);
         let pivot = pivot_row[enter];
         // Unit pivots leave every entry of the pivot row unchanged.
@@ -601,45 +691,203 @@ fn prepare_packing_bound(
         }
         std::mem::swap(&mut basis[leave], &mut nonbasic[enter]);
     }
-    let mut potentials = [0.0; SIDE * SIDE];
-    for i in 0..cells {
-        potentials[i] = leaves[i] - 0.0;
-    }
     for (i, &column) in nonbasic.iter().enumerate() {
         let column = usize::from(column);
         if column >= n {
-            let cell = column - n;
-            potentials[cell] = leaves[cell] - s.tableau[objective + i].max(0.0);
+            prices[column - n] = tableau[objective + i].max(0.0);
         }
     }
-    if potentials[..cells].iter().any(|x| !x.is_finite()) {
-        return;
+}
+
+// The same LP by column generation. Only about two in five columns ever enter
+// the basis, so the tableau keeps just the columns that have entered; the
+// others are priced from a summed-area table of the slack duals, and a column
+// joins the tableau as the sum of its cells' B^-1 columns when it first
+// enters. Pricing is Dantzig over all columns as in `packing_simplex`, but the
+// rounding differs, so only the staged first search uses it. The tableau is
+// column-major: every pivot updates whole contiguous columns.
+#[allow(clippy::too_many_arguments)]
+fn packing_simplex_generated(
+    candidates: &[Candidate],
+    column_ids: &[u16; MAX_CANDIDATES],
+    benefits: &[f64; MAX_CANDIDATES],
+    n: usize,
+    width: usize,
+    cells: usize,
+    tableau: &mut Vec<f64>,
+    prices: &mut [f64; SIDE * SIDE],
+) {
+    const PIVOTS: usize = 512;
+    const LIMIT: f64 = -1e-10;
+    const AREA_STRIDE: usize = SIDE + 1;
+    // Row `cells` of every column is its reduced cost. Position `n` is a
+    // zero column standing in for basic slacks.
+    let rows = cells + 1;
+    let zero = n;
+    if tableau.len() < (n + 1) * rows {
+        tableau.resize((n + 1) * rows, 0.0);
     }
-    // For every tile, sum(cell potentials) <= tile cost is the dual constraint.
-    // Only lower a potential when repairing, so earlier constraints stay valid.
-    for &c in candidates {
-        if !c.cost.is_finite() {
-            continue;
-        }
-        let mut sum = 0.0;
-        for y in c.y()..c.y() + c.height() {
-            for x in c.x()..c.x() + c.width() {
-                sum = -add_lower(-sum, -potentials[y * width + x]);
+    tableau[zero * rows..(zero + 1) * rows].fill(0.0);
+    let mut rhs = [1.0f64; SIDE * SIDE + 1];
+    rhs[cells] = 0.0;
+    // Variables: structural `j < n`, or the slack of cell `n + cell`.
+    let mut basis: [u16; SIDE * SIDE] = std::array::from_fn(|row| (n + row) as u16);
+    let mut variable_at = [0u16; MAX_CANDIDATES];
+    let mut slack_at = [zero as u16; SIDE * SIDE];
+    let height = cells / width;
+    let mut base = [f64::INFINITY; MAX_CANDIDATES];
+    let mut corners = [[0u8; 4]; MAX_CANDIDATES];
+    for j in 0..n {
+        let c = candidates[usize::from(column_ids[j])];
+        let (x0, y0) = (c.x(), c.y());
+        let (x1, y1) = (x0 + c.width(), y0 + c.height());
+        base[j] = -benefits[j];
+        corners[j] = [
+            (y1 * AREA_STRIDE + x1) as u8,
+            (y0 * AREA_STRIDE + x1) as u8,
+            (y1 * AREA_STRIDE + x0) as u8,
+            (y0 * AREA_STRIDE + x0) as u8,
+        ];
+    }
+    let mut area = [0.0f64; AREA_STRIDE * AREA_STRIDE];
+    let mut outside = [0.0f64; MAX_CANDIDATES];
+    let mut reduced_at = [0.0f64; MAX_CANDIDATES];
+    let mut factors = [0.0f64; SIDE * SIDE + 1];
+    let mut active = 0;
+    for _ in 0..PIVOTS {
+        // Duals are the slacks' reduced costs; a basic slack reads zero.
+        for y in 0..height {
+            let mut run = 0.0;
+            for x in 0..width {
+                let at = usize::from(slack_at[y * width + x]);
+                run += tableau[at * rows + cells];
+                area[(y + 1) * AREA_STRIDE + x + 1] = area[y * AREA_STRIDE + x + 1] + run;
             }
         }
-        if sum > c.cost {
-            let excess = -add_lower(-sum, c.cost);
-            let i = c.y() * width + c.x();
-            potentials[i] = add_lower(potentials[i], -excess);
+        for ((value, &cost), corner) in outside[..n].iter_mut().zip(&base[..n]).zip(&corners[..n]) {
+            let [a, b, c, d] = corner.map(usize::from);
+            *value = cost + ((area[a] - area[b]) - (area[c] - area[d]));
+        }
+        for (value, column) in reduced_at[..active]
+            .iter_mut()
+            .zip(tableau.chunks_exact(rows))
+        {
+            *value = column[cells];
+        }
+        // Most negative reduced cost; ties go to the tableau, then to the
+        // lowest position or column.
+        let reduced = column_minimum(&reduced_at[..active]).min(column_minimum(&outside[..n]));
+        if reduced >= LIMIT {
+            break;
+        }
+        let enter = match reduced_at[..active].iter().position(|&v| v == reduced) {
+            Some(at) => at,
+            None => {
+                // Generate B^-1 A_j at a new position from the slack columns.
+                let j = outside[..n].iter().position(|&v| v == reduced).unwrap();
+                let c = candidates[usize::from(column_ids[j])];
+                let at = active;
+                let mut column = [0.0f64; SIDE * SIDE + 1];
+                for y in c.y()..c.y() + c.height() {
+                    for x in c.x()..c.x() + c.width() {
+                        let cell = y * width + x;
+                        let slack = usize::from(slack_at[cell]);
+                        if slack == zero {
+                            let row = basis[..cells]
+                                .iter()
+                                .position(|&v| usize::from(v) == n + cell)
+                                .unwrap();
+                            column[row] += 1.0;
+                        } else {
+                            let source = &tableau[slack * rows..slack * rows + cells];
+                            for (v, &s) in column[..cells].iter_mut().zip(source) {
+                                *v += s;
+                            }
+                        }
+                    }
+                }
+                column[cells] = reduced;
+                tableau[at * rows..(at + 1) * rows].copy_from_slice(&column[..rows]);
+                variable_at[at] = j as u16;
+                base[j] = f64::INFINITY;
+                active += 1;
+                at
+            }
+        };
+        factors[..rows].copy_from_slice(&tableau[enter * rows..(enter + 1) * rows]);
+        let mut leave = None;
+        let mut ratio = f64::INFINITY;
+        for row in 0..cells {
+            let a = factors[row];
+            if a <= 1e-12 {
+                continue;
+            }
+            let r = rhs[row] / a;
+            if r < ratio - 1e-12
+                || ((r - ratio).abs() <= 1e-12 && leave.is_none_or(|old| basis[row] < basis[old]))
+            {
+                ratio = r;
+                leave = Some(row);
+            }
+        }
+        let Some(leave) = leave else {
+            break;
+        };
+        let pivot = factors[leave];
+        let inverse = 1.0 / pivot;
+        let factors = &factors[..rows];
+        let eliminate = |column: &mut [f64], element: f64| {
+            for (v, &f) in column.iter_mut().zip(factors) {
+                *v -= f * element;
+            }
+            column[leave] = element;
+        };
+        for (at, column) in tableau.chunks_exact_mut(rows).take(active).enumerate() {
+            let element = column[leave];
+            if at == enter || element == 0.0 {
+                continue;
+            }
+            eliminate(
+                column,
+                if pivot != 1.0 {
+                    element / pivot
+                } else {
+                    element
+                },
+            );
+        }
+        let element = rhs[leave];
+        eliminate(
+            &mut rhs[..rows],
+            if pivot != 1.0 {
+                element / pivot
+            } else {
+                element
+            },
+        );
+        // The leaving variable takes the entering column's position.
+        let column = &mut tableau[enter * rows..(enter + 1) * rows];
+        for (v, &f) in column.iter_mut().zip(factors) {
+            *v = 0.0 - f * inverse;
+        }
+        column[leave] = inverse;
+        let leaving = basis[leave];
+        let entering = variable_at[enter];
+        if usize::from(entering) >= n {
+            slack_at[usize::from(entering) - n] = zero as u16;
+        }
+        if usize::from(leaving) >= n {
+            slack_at[usize::from(leaving) - n] = enter as u16;
+        }
+        variable_at[enter] = leaving;
+        basis[leave] = entering;
+    }
+    for cell in 0..cells {
+        let at = usize::from(slack_at[cell]);
+        if at != zero {
+            prices[cell] = tableau[at * rows + cells].max(0.0);
         }
     }
-    for x in 0..width {
-        s.packing[x][height] = 0.0;
-        for y in (0..height).rev() {
-            s.packing[x][y] = add_lower(potentials[y * width + x], s.packing[x][y + 1]);
-        }
-    }
-    s.packing_valid = true;
 }
 
 fn prepare_bounds(candidates: &[Candidate], width: usize, height: usize, s: &mut PlannerScratch) {
@@ -864,7 +1112,34 @@ fn unpack_region(x: usize, y: usize, w: usize, h: usize, s: &PlannerScratch, out
     }
 }
 
+/// Plan with the generated-column packing bound first. Its dual differs
+/// from the reference only in rounding, and every repaired dual is
+/// admissible, so a search that is not cut short by its visit budget finds
+/// the same tiling. A search that is cut short is redone with the reference
+/// bound. Not provably byte-identical: the reference search can itself run
+/// out of budget on a tile the first search completes (then the first,
+/// optimal, tiling is kept).
+fn plan_staged(s: &mut PlannerScratch, mut search: impl FnMut(&mut PlannerScratch) -> f64) -> f64 {
+    s.fast_lp = true;
+    let cost = search(s);
+    s.fast_lp = false;
+    if s.budget > 0 {
+        return cost;
+    }
+    search(s)
+}
+
 fn plan(
+    candidates: &[Candidate],
+    width: usize,
+    height: usize,
+    s: &mut PlannerScratch,
+    out: &mut Vec<usize>,
+) -> f64 {
+    plan_staged(s, |s| plan_once(candidates, width, height, s, out))
+}
+
+fn plan_once(
     candidates: &[Candidate],
     width: usize,
     height: usize,
@@ -1035,8 +1310,20 @@ impl Scores<'_, '_> {
                 .as_ref()
                 .and_then(|table| table.get(global_key))
             {
-                cache.reconstruction[key] = hit;
-                return hit;
+                // A given-up piece keeps its exceeded bound as `base`: a limit
+                // under that bound would give it up again.
+                if hit.cost.is_finite() || hit.base > limit {
+                    let hit = CachedCost {
+                        base: if hit.cost.is_finite() {
+                            hit.base
+                        } else {
+                            f32::NAN
+                        },
+                        ..hit
+                    };
+                    cache.reconstruction[key] = hit;
+                    return hit;
+                }
             }
             let (px, py) = (params.dc_group_px + x * 8, params.dc_group_py + y * 8);
             let mut score = reconstruction_strategy_cost_bounded(
@@ -1073,15 +1360,27 @@ impl Scores<'_, '_> {
                     fine_admit_charge(coder.rate_prices.is_some(), params.distance, score.rate);
                 score.cost = fmla(lambda, bits, score.cost);
             }
+            if let Some(table) = &mut cache.global
+                && !score.cost.is_nan()
+            {
+                // Finite scores do not depend on the limit; a given-up one
+                // keeps its bound for later, possibly lower, limits.
+                table.insert(
+                    global_key,
+                    CachedCost {
+                        cost: score.cost,
+                        base: score.base,
+                    },
+                );
+            }
             let score = CachedCost {
                 cost: score.cost,
-                base: score.base,
+                base: if score.cost.is_finite() {
+                    score.base
+                } else {
+                    f32::NAN
+                },
             };
-            if let Some(table) = &mut cache.global
-                && score.cost.is_finite()
-            {
-                table.insert(global_key, score);
-            }
             cache.reconstruction[key] = score;
         }
         cache.reconstruction[key]
@@ -2258,6 +2557,51 @@ mod tests {
                 let (actual, pieces) = solve(&candidates, w, h);
                 assert_eq!(actual, expected, "{w}x{h} seed={seed}");
                 assert_coverage(&pieces, w, h);
+            }
+        }
+    }
+    #[test]
+    fn generated_packing_lp_matches_the_reference_and_staged_plans_are_exact() {
+        let mut seed = 11u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            f64::from(seed >> 8) / f64::from(1u32 << 24)
+        };
+        for (w, h) in [(4, 4), (8, 4), (4, 8), (8, 8)] {
+            for trial in 0..12 {
+                let mut candidates = Vec::new();
+                for_each_piece(w, h, |p| {
+                    let area = (p.width() * p.height()) as f64;
+                    let cost = area * (0.55 + 0.6 * rnd()) + 0.1 * rnd();
+                    candidates.push(Candidate::new(p, (cost as f32) as f64));
+                });
+                let mut reference = PlannerScratch::default();
+                prepare_planner(&candidates, w, h, &mut reference);
+                let mut generated = PlannerScratch {
+                    fast_lp: true,
+                    ..Default::default()
+                };
+                prepare_planner(&candidates, w, h, &mut generated);
+                assert_eq!(reference.packing_valid, generated.packing_valid);
+                let total = |s: &PlannerScratch| (0..w).map(|x| s.packing[x][0]).sum::<f64>();
+                let (a, b) = (total(&reference), total(&generated));
+                assert!(
+                    (a - b).abs() <= 1e-9 * a.abs().max(1.0),
+                    "{w}x{h} trial={trial}: {a} vs {b}"
+                );
+                // The staged plan equals the reference-bound plan.
+                let mut exact = PlannerScratch::default();
+                let mut exact_out = Vec::new();
+                let exact_cost = plan_once(&candidates, w, h, &mut exact, &mut exact_out);
+                let mut staged = PlannerScratch::default();
+                let mut staged_out = Vec::new();
+                let staged_cost = plan(&candidates, w, h, &mut staged, &mut staged_out);
+                assert_eq!(
+                    exact_cost.to_bits(),
+                    staged_cost.to_bits(),
+                    "{w}x{h} trial={trial}"
+                );
+                assert_eq!(exact_out, staged_out, "{w}x{h} trial={trial}");
             }
         }
     }
