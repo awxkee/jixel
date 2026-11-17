@@ -325,6 +325,7 @@ fn permute_sample_rows<T: Copy>(
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct MaLearnParams {
     pub(crate) alphabet: usize,
     pub(crate) max_leaves: usize,
@@ -358,6 +359,15 @@ pub(crate) struct MaLearnParams {
     /// two of them plus this; greedy growth stops where no single split
     /// pays, pruning keeps a split whose descendants do.
     pub(crate) prune_leaf_bits: f32,
+    /// A node holding more than one channel splits on the channel property
+    /// only. The decoder resolves those splits once per channel, so every
+    /// channel gets a tree of its own for free; left to the gains, the
+    /// learner mixes channels in its early splits and codes larger.
+    pub(crate) channel_first: bool,
+    /// Bitmask of channel ids whose nodes may not use the Weighted Predictor
+    /// or split on its error property (needs `channel_first`): the decoder
+    /// then skips the per-pixel WP state for those channels.
+    pub(crate) no_wp_channels: u32,
 }
 
 /// Reusable scratch for scoring one property of one MA-tree node. One lives in
@@ -735,12 +745,21 @@ fn scan_split_plans<T: MaProperty>(
             }
         }
     } else {
+        // A row's side-predictor slots are the same in every plan's bins:
+        // resolve them once per row, then count them into each plan's bin.
+        let n = preds.len().min(window.spans.len());
+        let mut slots = [0u32; NUM_MA_PREDS];
         for (props, toks) in properties.iter().zip(tokens) {
+            for (slot, (&p, span)) in slots.iter_mut().zip(preds.iter().zip(&window.spans)) {
+                *slot = span.slot(toks[p]) as u32;
+            }
             for plan in plans {
                 let bin = plan.bin_for(props[plan.prop as usize].into(), luts);
-                let base = plan.hist_start as usize + bin * plan.bin_stride as usize;
-                for (&p, span) in preds.iter().zip(&window.spans) {
-                    hist[base + span.slot(toks[p])] += 1;
+                let stride = plan.bin_stride as usize;
+                let base = plan.hist_start as usize + bin * stride;
+                let cells = &mut hist[base..base + stride];
+                for &slot in &slots[..n] {
+                    cells[slot as usize] += 1;
                 }
             }
         }
@@ -1066,8 +1085,26 @@ impl Learner<'_> {
         scratch: &mut CoderScratch,
     ) -> Pending {
         debug_assert_eq!(properties.len(), end - start);
-        let (base_bits, base_pred) =
-            node_cost_all(tokens.iter(), &self.p, &mut scratch.ma_property);
+        // `channel_first`: the node's channel, or `None` when it holds several.
+        let channel = (self.p.channel_first && !properties.is_empty()).then(|| {
+            let first: i32 = properties[0][0].into();
+            properties
+                .iter()
+                .all(|row| Into::<i32>::into(row[0]) == first)
+                .then_some(first)
+        });
+        let no_wp = matches!(channel, Some(Some(c)) if (0..32).contains(&c) && self.p.no_wp_channels >> c & 1 != 0);
+        let node_p;
+        let params = if no_wp && self.p.allow_wp {
+            node_p = MaLearnParams {
+                allow_wp: false,
+                ..self.p
+            };
+            &node_p
+        } else {
+            &self.p
+        };
+        let (base_bits, base_pred) = node_cost_all(tokens.iter(), params, &mut scratch.ma_property);
         let mut split = None;
         let mut gain = 0.0f32;
         // A split gains at most `base_bits - split_cost_bits`: a node that is
@@ -1087,7 +1124,7 @@ impl Learner<'_> {
             // Side candidates: the node's `side_preds` cheapest predictors.
             let mut preds: Vec<usize> = (0..NUM_MA_PREDS)
                 .filter(|&p| {
-                    (self.p.allow_wp || p != PRED_WEIGHTED) && self.p.allowed_preds & (1 << p) != 0
+                    (params.allow_wp || p != PRED_WEIGHTED) && params.allowed_preds & (1 << p) != 0
                 })
                 .collect();
             // Keep the stable sort's predictor-id tie order without evaluating
@@ -1097,7 +1134,11 @@ impl Learner<'_> {
             });
             preds.truncate(self.p.side_preds.max(1));
             let window = SymbolWindow::new(&preds, alphabet, &all_hist);
-            let props = split_props(self.p.allow_wp);
+            let props: &[u8] = if channel == Some(None) {
+                &[0]
+            } else {
+                split_props(params.allow_wp)
+            };
             let max_candidates = self.p.max_candidates;
             let n = properties.len();
 
@@ -1903,6 +1944,8 @@ mod tests {
             max_candidates: 16,
             modal_offsets: true,
             prune_leaf_bits: 2.,
+            channel_first: false,
+            no_wp_channels: 0,
         };
         let assert_tree = |a: &LearnedTree, b: &LearnedTree| {
             assert_eq!(a.nodes, b.nodes);
@@ -2292,6 +2335,8 @@ mod tests {
                 max_candidates: MAX_CANDIDATES,
                 modal_offsets: false,
                 prune_leaf_bits: 0.0,
+                channel_first: false,
+                no_wp_channels: 0,
             },
             &serial_pool,
             &mut serial_scratch,
@@ -2311,6 +2356,8 @@ mod tests {
                 max_candidates: MAX_CANDIDATES,
                 modal_offsets: false,
                 prune_leaf_bits: 0.0,
+                channel_first: false,
+                no_wp_channels: 0,
             },
             &parallel_pool,
             &mut parallel_scratch,
@@ -2353,6 +2400,8 @@ mod tests {
                 max_candidates: MAX_CANDIDATES,
                 modal_offsets: false,
                 prune_leaf_bits: 0.0,
+                channel_first: false,
+                no_wp_channels: 0,
             },
             &ThreadPool::new(1),
             &mut CoderScratch::default(),
@@ -2395,6 +2444,8 @@ mod tests {
             max_candidates: MAX_CANDIDATES,
             modal_offsets: false,
             prune_leaf_bits: 0.0,
+            channel_first: false,
+            no_wp_channels: 0,
         };
         let pool = ThreadPool::new(1);
         let indexed = learn_ma_tree_indexed(

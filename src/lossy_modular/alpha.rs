@@ -485,6 +485,8 @@ impl ExtraSqueeze {
                 max_candidates: MA_PHOTO_CANDIDATES,
                 modal_offsets: false,
                 prune_leaf_bits: 0.0,
+                channel_first: false,
+                no_wp_channels: 0,
             };
             let budget = (px / BUDGET_DIV).clamp(1, BUDGET_CAP);
             let tree = if samples.len() < 4 * MA_MIN_NODE_SAMPLES {

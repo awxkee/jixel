@@ -64,6 +64,31 @@ use crate::util::EncodeError;
 pub(super) type Reselect<'a> =
     &'a mut dyn FnMut(&mut CoderScratch) -> Result<Vec<DcGroupData>, EncodeError>;
 
+/// Side of the loop's 32x32-family sites, in blocks.
+const SITE_32: usize = 4;
+/// Transforms that tile a 32x32 site, each tried as one variant.
+const SITE_32_STRATEGIES: [u8; 6] = [
+    crate::dc_group_data::STRATEGY_DCT16X16,
+    crate::dc_group_data::STRATEGY_DCT32X32,
+    crate::dc_group_data::STRATEGY_DCT32X16,
+    crate::dc_group_data::STRATEGY_DCT16X32,
+    crate::dc_group_data::STRATEGY_DCT32X8,
+    crate::dc_group_data::STRATEGY_DCT8X32,
+];
+
+/// `strategy` repeated over a `w` x `h`-block site, as (strategy, dx, dy)
+/// parts in raster order.
+fn tile_site(strategy: u8, w: usize, h: usize) -> Vec<(u8, usize, usize)> {
+    use crate::dc_group_data::AcStrategyImage;
+    let cw = AcStrategyImage::covered_blocks_x_of(strategy);
+    let ch = AcStrategyImage::covered_blocks_y_of(strategy);
+    debug_assert!(w.is_multiple_of(cw) && h.is_multiple_of(ch));
+    (0..h)
+        .step_by(ch)
+        .flat_map(|dy| (0..w).step_by(cw).map(move |dx| (strategy, dx, dy)))
+        .collect()
+}
+
 pub(super) fn run_quant_field_loop(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
@@ -1558,7 +1583,8 @@ pub(super) fn run_quant_field_loop(
     // contribute their stored bits instead of their tokens) and arbitrated by the
     // incremental SSIMULACRA2 state at the loop's exchange rate. One site per
     // AC group per parallel round; the best variant is re-encoded in full and
-    // kept if it still improves.
+    // kept if it still improves. Aligned 32x32 sites then do the same with the
+    // 32x32 family (`layout_loop_32`).
     if ctx.speed.effort().layout_loop() && cached_slope > 0.0 {
         use crate::dc_group_data::{
             AcStrategyImage, NUM_STRATEGIES, STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16,
@@ -1605,9 +1631,19 @@ pub(super) fn run_quant_field_loop(
         if present[STRATEGY_DCT8X16 as usize] {
             variants.push(vec![(STRATEGY_DCT8X16, 0, 0), (STRATEGY_DCT8X16, 0, 1)]);
         }
+        let variants_32: Vec<Parts> = if ctx.speed.effort().layout_loop_32() {
+            SITE_32_STRATEGIES
+                .iter()
+                .filter(|&&st| present[st as usize])
+                .map(|&st| tile_site(st, SITE_32, SITE_32))
+                .collect()
+        } else {
+            Vec::new()
+        };
         /// A region the loop re-chooses: a 2x2 site with the 16x16-family
-        /// variants, or a region the exact re-tiling proposed, with that
-        /// proposal as its only variant.
+        /// variants, an aligned 4x4 site with the 32x32-family variants, or a
+        /// region the exact re-tiling proposed, with that proposal as its only
+        /// variant.
         struct Site {
             x: usize,
             y: usize,
@@ -1617,8 +1653,9 @@ pub(super) fn run_quant_field_loop(
         }
         // Sites of each AC task, DC-group-local block coordinates: the
         // aligned 2x2 grid, the three odd-offset grids (the format allows
-        // unaligned blocks; none may cross a 64px CfL tile), then the
-        // proposed regions, judged against the refined layout.
+        // unaligned blocks; none may cross a 64px CfL tile), the aligned 4x4
+        // grid, then the proposed regions, judged against the refined layout.
+        // Offset 4x4 sites cost a third more time for no further gain.
         let sites: Vec<Vec<Site>> = ac_tasks
             .iter()
             .map(|&(dc_idx, gx, gy)| {
@@ -1640,6 +1677,23 @@ pub(super) fn run_quant_field_loop(
                                     y,
                                     w: 2,
                                     h: 2,
+                                    proposal: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                if !variants_32.is_empty() {
+                    for sy in (0..K_GROUP_DIM_IN_BLOCKS).step_by(SITE_32) {
+                        for sx in (0..K_GROUP_DIM_IN_BLOCKS).step_by(SITE_32) {
+                            let x = gx * K_GROUP_DIM_IN_BLOCKS + sx;
+                            let y = gy * K_GROUP_DIM_IN_BLOCKS + sy;
+                            if x + SITE_32 <= st.xsize() && y + SITE_32 <= st.ysize() {
+                                v.push(Site {
+                                    x,
+                                    y,
+                                    w: SITE_32,
+                                    h: SITE_32,
                                     proposal: None,
                                 });
                             }
@@ -1828,6 +1882,9 @@ pub(super) fn run_quant_field_loop(
                             } else {
                                 Vec::new()
                             }
+                        }
+                        None if site.w == SITE_32 => {
+                            variants_32.iter().filter(|v| differs(v)).collect()
                         }
                         None => variants.iter().filter(|v| differs(v)).collect(),
                     }
@@ -2304,4 +2361,42 @@ pub(super) fn run_quant_field_loop(
     }
     let recon = want_recon.then(|| std::mem::replace(&mut cur.recon, Image3F::new(0, 0)));
     finish(cur, distp_out, recon)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dc_group_data::AcStrategyImage;
+
+    #[test]
+    fn site_32_variants_tile_the_site_exactly_once() {
+        for &strategy in &SITE_32_STRATEGIES {
+            let parts = tile_site(strategy, SITE_32, SITE_32);
+            let mut covered = [[0u8; SITE_32]; SITE_32];
+            for &(st, dx, dy) in &parts {
+                assert_eq!(st, strategy);
+                let cw = AcStrategyImage::covered_blocks_x_of(st);
+                let ch = AcStrategyImage::covered_blocks_y_of(st);
+                for row in &mut covered[dy..dy + ch] {
+                    for cell in &mut row[dx..dx + cw] {
+                        *cell += 1;
+                    }
+                }
+            }
+            assert!(covered.iter().flatten().all(|&c| c == 1), "{strategy}");
+        }
+        // The rectangle pairs are two transforms, the square one.
+        assert_eq!(
+            tile_site(crate::dc_group_data::STRATEGY_DCT32X16, 4, 4).len(),
+            2
+        );
+        assert_eq!(
+            tile_site(crate::dc_group_data::STRATEGY_DCT16X32, 4, 4).len(),
+            2
+        );
+        assert_eq!(
+            tile_site(crate::dc_group_data::STRATEGY_DCT32X32, 4, 4).len(),
+            1
+        );
+    }
 }

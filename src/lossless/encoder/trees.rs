@@ -201,10 +201,19 @@ const ORDER_RACE_BOTH_MAX_BITS: f64 = 65536.0;
 /// ones only when their first-stage estimate leads by this factor.
 const ORDERED_GROUP_PALETTE_MARGIN: f64 = 0.97;
 
+/// Groups a frame keeps under its large layout. One modular group decodes
+/// on one thread, so an image under ~4 MP in 1024-px groups decodes on one
+/// to four. With 512-px groups there (256-px at Kodak size) djxl decodes
+/// 2.5-3.8x faster on eight threads; 63 images cost +0.17% (Kodak), +0.10%
+/// (screens), +0.02% (art), +0.05% (2-3 MP photos), inside the learner's
+/// per-image noise except on Kodak, and encode 1-8% faster. Larger images
+/// already have the groups and are untouched.
+const PARALLEL_MIN_GROUPS: usize = 6;
+
 /// The group layouts the learns try.
 ///
 /// With every decoding tool available, Slow lossless runs the first learning
-/// stage (sampling plus a 32-leaf tree) under both 1024- and 256-pixel
+/// stage (sampling plus a 32-leaf tree) under both the large and 256-pixel
 /// groups, one layout at a time so a single sample set is alive. Everything
 /// else keeps the codestream default.
 struct LayoutPlan {
@@ -222,15 +231,30 @@ impl LayoutPlan {
             // An image inside one 256-px group learns the same thing under
             // both layouts.
             && (frame.xsize > GroupLayout::DEFAULT.dim() || frame.ysize > GroupLayout::DEFAULT.dim());
-        let all: Vec<GroupLayout> = if dual {
-            vec![GroupLayout::LARGE, GroupLayout::DEFAULT]
+        // The largest groups that still leave the decoder
+        // `PARALLEL_MIN_GROUPS` of them to run on its threads.
+        let large = (GroupLayout::DEFAULT.shift..=GroupLayout::LARGE.shift)
+            .rev()
+            .map(|shift| GroupLayout {
+                shift,
+                ..GroupLayout::DEFAULT
+            })
+            .find(|layout| {
+                frame.xsize.div_ceil(layout.dim()) * frame.ysize.div_ceil(layout.dim())
+                    >= PARALLEL_MIN_GROUPS
+            })
+            // A frame too small for that many 256-px groups (0.4 MP, or a
+            // cropped region frame) decodes in no time: it keeps the density.
+            .unwrap_or(GroupLayout::LARGE);
+        let all: Vec<GroupLayout> = if dual && large != GroupLayout::DEFAULT {
+            vec![large, GroupLayout::DEFAULT]
         } else {
             vec![GroupLayout::DEFAULT]
         }
         .into_iter()
         .map(|layout| layout.with_upsampling(frame.settings.upsampling))
         .collect();
-        // RGB sources of more than a megapixel-channel learn the 1024-px
+        // RGB sources of more than a megapixel-channel learn the large
         // layout only: the 256 layout's first stage costs a sampling pass and
         // its full learn doubles the frame's learning time.
         let rgb_count = if dual

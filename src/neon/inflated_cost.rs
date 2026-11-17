@@ -370,6 +370,11 @@ fn recon_dist_and_rate_neon_impl<const BIASED: bool>(
     )
 }
 
+/// The biased, rate-free coefficient error of `recon_quantize_scalar`, bit
+/// for bit (the coefficient model's luma error before rebasing CfL).
+pub(crate) const RECON_QUANTIZE_ERROR_NEON: crate::inflated_cost::ReconQuantizeFn =
+    recon_quantize_neon::<true, false>;
+
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "neon")]
 fn recon_quantize_neon<const BIASED: bool, const COMPUTE_RATE: bool>(

@@ -1030,6 +1030,8 @@ fn ma_dc_params(
         max_candidates: budget.max_candidates,
         modal_offsets: false,
         prune_leaf_bits: 0.0,
+        channel_first: false,
+        no_wp_channels: 0,
     }
 }
 

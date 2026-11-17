@@ -88,8 +88,9 @@ pub(crate) use entropy::{counts_bit_cost_avx2, entropy_of_hist_avx2};
 pub(crate) use frame::chroma_gradient_sums_avx2;
 pub(crate) use haar::haar_rows_avx2;
 pub(crate) use inflated_cost::{
-    combine_error_avx2, recon_chroma_phase_avx2, recon_dist_and_rate_avx2, recon_luma_phase_avx2,
-    rgb_hue_chroma_edge_loss_avx2, ssim_deficit_avx2,
+    RECON_QUANTIZE_ERROR_AVX2, combine_error_avx2, recon_chroma_phase_avx2,
+    recon_dist_and_rate_avx2, recon_luma_phase_avx2, rgb_hue_chroma_edge_loss_avx2,
+    ssim_deficit_avx2,
 };
 pub(crate) use ink_layer::{luma_row_avx2, ridge_row_avx2};
 pub(crate) use lossless_grad::grad_pack_interior;

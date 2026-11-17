@@ -130,8 +130,6 @@ pub(crate) fn sse_and_rate_avx2_impl<const BIASED: bool, const SAVE_LEVELS: bool
     let izero = _mm256_setzero_si256();
     let all_active_i = _mm256_cmpeq_epi32(izero, izero);
 
-    const RND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
-
     for (y, (coeffs, inv_matrix)) in coeff
         .chunks_exact(width)
         .zip(inv_matrix.chunks_exact(width))
@@ -171,7 +169,8 @@ pub(crate) fn sse_and_rate_avx2_impl<const BIASED: bool, const SAVE_LEVELS: bool
             let absa = _mm256_andnot_ps(sign, a);
 
             let keep = _mm256_cmp_ps::<_CMP_GE_OQ>(absa, thr_v);
-            let rounded = _mm256_round_ps::<RND>(a);
+            // Ties away from zero, as the scalar kernel and the coding quantizer.
+            let rounded = super::inflated_cost::round_ties_away(a);
             let q = _mm256_and_ps(rounded, keep);
 
             let active_i = if y < cy && x < cx {
@@ -414,8 +413,6 @@ pub(crate) fn sse_and_rate_avx2_impl_reference<const BIASED: bool, const SAVE_LE
     let izero = _mm256_setzero_si256();
     let all_active_i = _mm256_cmpeq_epi32(izero, izero);
 
-    const RND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
-
     for (y, (coeffs, inv_matrix)) in coeff
         .chunks_exact(width)
         .zip(inv_matrix.chunks_exact(width))
@@ -455,7 +452,8 @@ pub(crate) fn sse_and_rate_avx2_impl_reference<const BIASED: bool, const SAVE_LE
             let absa = _mm256_andnot_ps(sign, a);
 
             let keep = _mm256_cmp_ps::<_CMP_GE_OQ>(absa, thr_v);
-            let rounded = _mm256_round_ps::<RND>(a);
+            // Ties away from zero, as the scalar kernel and the coding quantizer.
+            let rounded = super::inflated_cost::round_ties_away(a);
             let q = _mm256_and_ps(rounded, keep);
 
             let d = if BIASED {
@@ -598,7 +596,7 @@ pub(crate) fn avx2_log2p1_f32(x: __m256) -> __m256 {
 mod tests {
     use super::*;
 
-    // Round-ties-even reference matching `_mm256_round_ps::<NEAREST>` + the
+    // Ties-away reference matching the scalar kernel's `f32::round` + the
     // shared LUT, summed sequentially. Verifies the AVX kernel: nzeros/mag_bits
     // must be exact; sse may differ by float reassociation (8-lane reduction).
     #[allow(clippy::too_many_arguments)]
@@ -628,11 +626,7 @@ mod tests {
                 let idx = y * w + x;
                 let t = if x >= half { hi } else { lo };
                 let a = (inv[idx] * qs) * coeff[idx];
-                let q = if a.abs() >= t {
-                    a.round_ties_even()
-                } else {
-                    0.0
-                };
+                let q = if a.abs() >= t { a.round() } else { 0.0 };
                 let d = if biased { a - bias.level_f32(q) } else { a - q };
                 sse += d * d;
                 if q != 0.0 {

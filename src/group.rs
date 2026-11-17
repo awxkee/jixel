@@ -53,8 +53,8 @@ use std::sync::OnceLock;
 mod trellis;
 
 use trellis::{
-    RESTORE_FEW_COLORS_PENALTY, RESTORE_FEW_COLORS_PER_BLOCK, RdoqScratch, RdoqSearch, few_colors,
-    rdoq_block,
+    RESTORE_FEW_COLORS_PENALTY, RESTORE_FEW_COLORS_PER_BLOCK, RdoqScratch, RdoqSearch, TrellisTail,
+    few_colors, rdoq_block,
 };
 pub(crate) use trellis::{chroma_rdoq_weight, rdoq_channel_weights, rdoq_lambda};
 
@@ -69,6 +69,23 @@ pub(crate) const MAX_BLOCK_COEFFICIENTS: usize = if cfg!(feature = "extraslow") 
 };
 
 #[inline]
+/// A memo channel's stored levels of the transform at block (`bx`, `lby`).
+fn copy_cached_levels(
+    m: &AcBlockCache,
+    c: usize,
+    lby: usize,
+    bx: usize,
+    cov_x: usize,
+    cov_y: usize,
+    out: &mut [i32],
+) {
+    let len = cov_x * 64;
+    for j in 0..cov_y {
+        let slot = ((lby + j) * m.xsize_blocks + bx) * 64;
+        out[j * len..(j + 1) * len].copy_from_slice(&m.quantized[c][slot..slot + len]);
+    }
+}
+
 pub(crate) fn predict_from_top_and_left(
     row_top: Option<&[u8]>,
     row: &[u8],
@@ -839,6 +856,11 @@ pub(crate) struct AcBlockCache {
     cell_gen: Vec<u32>,
     /// Frozen-price bits of each first block's first stream, per channel.
     bits: Vec<[f32; 3]>,
+    /// Per first block and channel, the trellis's last row, keyed by the
+    /// memo key it was computed under. A tail is only read while that key is
+    /// still the channel's stored key, so restores and invalidations (which
+    /// rewrite keys) retire it without being snapshotted.
+    tails: Vec<[TrellisTail; 3]>,
     /// Trial evaluation: a cached channel adds its bits to `trial_bits`
     /// instead of copying its tokens (the group's token streams are partial).
     pub(crate) trial: bool,
@@ -866,6 +888,7 @@ impl AcBlockCache {
             epoch: 0,
             cell_gen: vec![0; n],
             bits: vec![[f32::NAN; 3]; n],
+            tails: vec![[TrellisTail::default(); 3]; n],
             trial: false,
             trial_bits: 0.0,
         }
@@ -879,6 +902,8 @@ impl AcBlockCache {
             for key in &mut self.keys {
                 key[row * self.xsize_blocks + x..row * self.xsize_blocks + x + w].fill(u32::MAX);
             }
+            self.tails[row * self.xsize_blocks + x..row * self.xsize_blocks + x + w]
+                .fill([TrellisTail::default(); 3]);
         }
     }
 
@@ -993,6 +1018,8 @@ impl AcBlockCache {
         let (mut k, mut q, mut sp, mut n) = (0, 0, 0, 0);
         for row in y..y + h {
             let cells = row * self.xsize_blocks + x..row * self.xsize_blocks + x + w;
+            // Tails are not snapshotted: the restored levels may predate them.
+            self.tails[cells.clone()].fill([TrellisTail::default(); 3]);
             for c in 0..3 {
                 self.keys[c][cells.clone()].copy_from_slice(&snap.keys[k..k + w]);
                 self.quantized[c][cells.start * 64..cells.end * 64]
@@ -1365,6 +1392,23 @@ pub(crate) fn write_ac_group(
                 memo.as_deref()
                     .is_some_and(|m| m.keys[c][bi] == memo_keys[c])
             });
+            // A missed channel whose field and qm scale match its stored key
+            // differs only in the predicted nonzero contexts, which the
+            // trellis reads at its last step alone: its stored tail re-picks.
+            // Chroma also needs Y's levels unchanged (CfL reads them).
+            let cached_tail: [Option<TrellisTail>; 3] = std::array::from_fn(|c| {
+                let m = memo.as_deref()?;
+                let stored = m.keys[c][bi];
+                let tail = m.tails[bi][c];
+                let same_inputs = stored & 0xff == memo_keys[c] & 0xff
+                    && (c == 1 || stored >> 24 == memo_keys[c] >> 24);
+                (!hit[c] && stored != u32::MAX && tail.key == stored && same_inputs).then_some(tail)
+            });
+            let mut new_tails = [TrellisTail::default(); 3];
+            // Channels whose re-picked levels equal the stored ones: their
+            // reconstruction in the memo's capture image is already current.
+            let mut reused = [false; 3];
+            let mut y_levels_kept = hit[1];
             debug_assert!(memo.is_none() || !measure_chroma_distortion);
             // A hit channel's levels (unless its tokens are cached too) and DC.
             if let Some(m) = memo.as_deref() {
@@ -1698,29 +1742,52 @@ pub(crate) fn write_ac_group(
                             bx,
                             32,
                         );
-                        rdoq_block(
-                            rdoq_channel_weights(ctx.coding)[1],
-                            prices,
-                            coeff_orders.scan_for(strategy_code, 1),
-                            &source_y.as_ref().expect("luma saved for RDOQ")[..size],
-                            inv_qm_y,
-                            quantize_ac_q_scaled(quant_ac, scale, 1.0),
-                            &mut quantized[1][..size],
-                            raw_strategy,
-                            strategy_code,
-                            1,
-                            ctx.dequant_bias(1),
-                            predicted,
-                            cx,
-                            cy,
-                            distance,
-                            quant_ac as u32 > qf_threshold,
+                        let qf_hi = quant_ac as u32 > qf_threshold;
+                        let lambda =
                             rdoq_lambda(ctx.arbiter, quant_ac as f32 / qf_threshold.max(1) as f32)
-                                / visible,
+                                / visible;
+                        let inputs = TrellisTail::inputs(
+                            raw_strategy,
+                            quantize_ac_q_scaled(quant_ac, scale, 1.0),
+                            lambda,
                             restore_penalty,
-                            RdoqSearch::of(ctx.speed.effort()),
-                            rdoq.get_or_insert_with(RdoqScratch::default),
+                            distance,
+                            &quantized[1][..size],
                         );
+                        if let Some(tail) = cached_tail[1].filter(|t| {
+                            t.same_pick(inputs, prices, 1, strategy_code, qf_hi, predicted, lambda)
+                        }) && let Some(m) = memo.as_deref()
+                        {
+                            copy_cached_levels(m, 1, lby, bx, cov_x, cov_y, &mut quantized[1]);
+                            new_tails[1] = tail;
+                            y_levels_kept = true;
+                            reused[1] = true;
+                        } else {
+                            rdoq_block(
+                                rdoq_channel_weights(ctx.coding)[1],
+                                prices,
+                                coeff_orders.scan_for(strategy_code, 1),
+                                &source_y.as_ref().expect("luma saved for RDOQ")[..size],
+                                inv_qm_y,
+                                quantize_ac_q_scaled(quant_ac, scale, 1.0),
+                                &mut quantized[1][..size],
+                                raw_strategy,
+                                strategy_code,
+                                1,
+                                ctx.dequant_bias(1),
+                                predicted,
+                                cx,
+                                cy,
+                                distance,
+                                qf_hi,
+                                lambda,
+                                restore_penalty,
+                                RdoqSearch::of(ctx.speed.effort()),
+                                rdoq.get_or_insert_with(RdoqScratch::default),
+                                Some(&mut new_tails[1]),
+                            );
+                            new_tails[1].inputs = inputs;
+                        }
                         let inv_qac = 1.0 / (scale * quant_ac as f32);
                         for (out, (&q, &dq)) in coeffs[1][..size]
                             .iter_mut()
@@ -1735,6 +1802,7 @@ pub(crate) fn write_ac_group(
                 // rerank's reconstruction model; the cx*cy lowest frequencies ride
                 // on the DC path and are excluded.
                 if !hit[1]
+                    && !reused[1]
                     && let Some((recon, y_off, _)) = recon_y.as_mut()
                 {
                     let (recon_err, recon_pix) =
@@ -1982,29 +2050,60 @@ pub(crate) fn write_ac_group(
                             bx,
                             32,
                         );
-                        rdoq_block(
-                            rdoq_channel_weights(ctx.coding)[0],
-                            prices,
-                            coeff_orders.scan_for(strategy_code, 0),
-                            &coeffs[0][..size],
-                            inv_qm_x,
-                            quantize_ac_q_scaled(quant_ac, scale, x_qm_mul),
-                            &mut quantized[0][..size],
-                            raw_strategy,
-                            strategy_code,
-                            0,
-                            ctx.dequant_bias(0),
-                            predicted,
-                            cx,
-                            cy,
-                            distance,
-                            quant_ac as u32 > qf_threshold,
+                        let qf_hi = quant_ac as u32 > qf_threshold;
+                        let lambda =
                             rdoq_lambda(ctx.arbiter, quant_ac as f32 / qf_threshold.max(1) as f32)
-                                / visible,
+                                / visible;
+                        let inputs = TrellisTail::inputs(
+                            raw_strategy,
+                            quantize_ac_q_scaled(quant_ac, scale, x_qm_mul),
+                            lambda,
                             restore_penalty,
-                            RdoqSearch::of(ctx.speed.effort()),
-                            rdoq.get_or_insert_with(RdoqScratch::default),
+                            distance,
+                            &quantized[0][..size],
                         );
+                        if let Some(tail) = cached_tail[0].filter(|t| {
+                            y_levels_kept
+                                && t.same_pick(
+                                    inputs,
+                                    prices,
+                                    0,
+                                    strategy_code,
+                                    qf_hi,
+                                    predicted,
+                                    lambda,
+                                )
+                        }) && let Some(m) = memo.as_deref()
+                        {
+                            copy_cached_levels(m, 0, lby, bx, cov_x, cov_y, &mut quantized[0]);
+                            new_tails[0] = tail;
+                            reused[0] = true;
+                        } else {
+                            rdoq_block(
+                                rdoq_channel_weights(ctx.coding)[0],
+                                prices,
+                                coeff_orders.scan_for(strategy_code, 0),
+                                &coeffs[0][..size],
+                                inv_qm_x,
+                                quantize_ac_q_scaled(quant_ac, scale, x_qm_mul),
+                                &mut quantized[0][..size],
+                                raw_strategy,
+                                strategy_code,
+                                0,
+                                ctx.dequant_bias(0),
+                                predicted,
+                                cx,
+                                cy,
+                                distance,
+                                qf_hi,
+                                lambda,
+                                restore_penalty,
+                                RdoqSearch::of(ctx.speed.effort()),
+                                rdoq.get_or_insert_with(RdoqScratch::default),
+                                Some(&mut new_tails[0]),
+                            );
+                            new_tails[0].inputs = inputs;
+                        }
                     }
                 }
                 // Every transform spans a power-of-two number of blocks, so a
@@ -2083,29 +2182,60 @@ pub(crate) fn write_ac_group(
                             bx,
                             32,
                         );
-                        rdoq_block(
-                            rdoq_channel_weights(ctx.coding)[2],
-                            prices,
-                            coeff_orders.scan_for(strategy_code, 2),
-                            &coeffs[2][..size],
-                            inv_qm_b,
-                            quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul()),
-                            &mut quantized[2][..size],
-                            raw_strategy,
-                            strategy_code,
-                            2,
-                            ctx.dequant_bias(2),
-                            predicted,
-                            cx,
-                            cy,
-                            distance,
-                            quant_ac as u32 > qf_threshold,
+                        let qf_hi = quant_ac as u32 > qf_threshold;
+                        let lambda =
                             rdoq_lambda(ctx.arbiter, quant_ac as f32 / qf_threshold.max(1) as f32)
-                                / visible,
+                                / visible;
+                        let inputs = TrellisTail::inputs(
+                            raw_strategy,
+                            quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul()),
+                            lambda,
                             restore_penalty,
-                            RdoqSearch::of(ctx.speed.effort()),
-                            rdoq.get_or_insert_with(RdoqScratch::default),
+                            distance,
+                            &quantized[2][..size],
                         );
+                        if let Some(tail) = cached_tail[2].filter(|t| {
+                            y_levels_kept
+                                && t.same_pick(
+                                    inputs,
+                                    prices,
+                                    2,
+                                    strategy_code,
+                                    qf_hi,
+                                    predicted,
+                                    lambda,
+                                )
+                        }) && let Some(m) = memo.as_deref()
+                        {
+                            copy_cached_levels(m, 2, lby, bx, cov_x, cov_y, &mut quantized[2]);
+                            new_tails[2] = tail;
+                            reused[2] = true;
+                        } else {
+                            rdoq_block(
+                                rdoq_channel_weights(ctx.coding)[2],
+                                prices,
+                                coeff_orders.scan_for(strategy_code, 2),
+                                &coeffs[2][..size],
+                                inv_qm_b,
+                                quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul()),
+                                &mut quantized[2][..size],
+                                raw_strategy,
+                                strategy_code,
+                                2,
+                                ctx.dequant_bias(2),
+                                predicted,
+                                cx,
+                                cy,
+                                distance,
+                                qf_hi,
+                                lambda,
+                                restore_penalty,
+                                RdoqSearch::of(ctx.speed.effort()),
+                                rdoq.get_or_insert_with(RdoqScratch::default),
+                                Some(&mut new_tails[2]),
+                            );
+                            new_tails[2].inputs = inputs;
+                        }
                     }
                 }
                 if measure_chroma_distortion && !hit[0] {
@@ -2147,7 +2277,7 @@ pub(crate) fn write_ac_group(
                     let q_x = quantize_ac_q_scaled(quant_ac, scale, x_qm_mul);
                     let q_b = quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul());
                     for (c, q_scaled) in [(0usize, q_x), (2, q_b)] {
-                        if hit[c] {
+                        if hit[c] || reused[c] {
                             continue;
                         }
                         let bias = ctx.dequant_bias(c);
@@ -2188,6 +2318,11 @@ pub(crate) fn write_ac_group(
                             continue;
                         }
                         m.keys[c][bi] = memo_keys[c];
+                        let mut tail = new_tails[c];
+                        if tail.key != u32::MAX {
+                            tail.key = memo_keys[c];
+                        }
+                        m.tails[bi][c] = tail;
                         for j in 0..cov_y {
                             let row = (lby + j) * m.xsize_blocks;
                             m.dc_f[c][row + bx..row + bx + cov_x]

@@ -760,6 +760,8 @@ struct ReconStrategyCost {
     /// Ramped-lambda RD cost without metadata, for quantizer refinement.
     /// NaN when the selection quantizer rescaled the candidate, so the score
     /// does not match refinement's candidates; the caller must recompute it.
+    /// For a candidate a bounded score gave up on (`cost` infinite), the
+    /// lower bound on its cost that exceeded the limit.
     base: f32,
     distortion: f32,
     rate: f32,
@@ -829,9 +831,11 @@ fn reconstruction_strategy_cost_bounded(
     } = scratch;
     let prices = rate_prices.as_deref();
     let keep_spatial_errors = spatial_errors.is_some();
-    let infinite = |distortion: f32, rate: f32| ReconStrategyCost {
+    // A given-up candidate carries, as its `base`, the lower bound on its
+    // cost that exceeded `limit`: any limit below that bound gives it up too.
+    let infinite = |distortion: f32, rate: f32, bound: f32| ReconStrategyCost {
         cost: f32::INFINITY,
-        base: f32::NAN,
+        base: bound,
         distortion,
         rate,
         hue_distortion: 0.0,
@@ -927,8 +931,9 @@ fn reconstruction_strategy_cost_bounded(
             (Some(prices), Some(bits)) => prices.scaled_rate(strategy, distance, bits),
             _ => luma.rate,
         };
-        if fmla(lambda, y_rate + meta_r, luma_distortion) > limit {
-            return infinite(luma_distortion, y_rate);
+        let bound = fmla(lambda, y_rate + meta_r, luma_distortion);
+        if bound > limit {
+            return infinite(luma_distortion, y_rate, bound);
         }
         for c in [0, 2] {
             forward_transform(
@@ -985,10 +990,11 @@ fn reconstruction_strategy_cost_bounded(
             (Some(prices), Some(bits)) => Some(prices.scaled_rate(strategy, distance, bits)),
             _ => None,
         };
-        if let Some(rate) = rate
-            && fmla(lambda, rate + meta_r, luma_distortion) > limit
-        {
-            return infinite(luma_distortion, rate);
+        if let Some(rate) = rate {
+            let bound = fmla(lambda, rate + meta_r, luma_distortion);
+            if bound > limit {
+                return infinite(luma_distortion, rate, bound);
+            }
         }
         let input = recon_input(
             ctx,
@@ -1115,22 +1121,26 @@ fn luma_coefficient_error(
     error: &mut [f32],
 ) {
     let width = cx * 8;
-    crate::inflated_cost::recon_quantize_scalar::<true, false>(
-        y,
-        inverse_matrix_for(ctx, strategy, 1),
-        matrix_for(ctx, strategy, 1),
-        qac,
-        ctx.dequant_bias(1),
-        &crate::group::quantize_ac_thresholds(1, cx, cy, distance),
-        width,
-        cy * 8,
-        width / 2,
-        cx,
-        cy,
-        error,
-        ctx.rate_log2_lut,
-        &[],
-    );
+    // Every selected kernel is bit-exact with the scalar one on this path.
+    // SAFETY: the selector checked the kernel's target features.
+    unsafe {
+        crate::inflated_cost::recon_quantize_error_fn()(
+            y,
+            inverse_matrix_for(ctx, strategy, 1),
+            matrix_for(ctx, strategy, 1),
+            qac,
+            ctx.dequant_bias(1),
+            &crate::group::quantize_ac_thresholds(1, cx, cy, distance),
+            width,
+            cy * 8,
+            width / 2,
+            cx,
+            cy,
+            error,
+            ctx.rate_log2_lut,
+            &[],
+        )
+    };
 }
 
 /// Moves chroma residuals taken against the source luma onto the dequantized
