@@ -115,6 +115,7 @@ impl MaLookup {
     }
 
     /// Return the unchanged leaf context and predictor for this channel.
+    #[cfg(test)]
     #[inline]
     pub(super) fn lookup(&self, properties: &[i32; NUM_MA_PROPS]) -> (u32, u32) {
         let mut target = self.root;
@@ -132,6 +133,38 @@ impl MaLookup {
             target & ((1 << PREDICTOR_BITS) - 1),
         )
     }
+
+    /// [`Self::lookup`] for a batch of pixels walked in step. One pixel's
+    /// walk is a chain of dependent loads; independent chains overlap, and
+    /// the loop ends once for the batch instead of once per pixel.
+    #[inline]
+    pub(super) fn lookup_batch<const N: usize>(
+        &self,
+        properties: &[[i32; NUM_MA_PROPS]; N],
+    ) -> [(u32, u32); N] {
+        let mut targets = [self.root; N];
+        loop {
+            let mut leaves = LEAF;
+            for (target, properties) in targets.iter_mut().zip(properties) {
+                // A settled walker reads some split and keeps its leaf.
+                let split = &self.splits[(*target & SPLIT_MASK) as usize];
+                let value = properties[split.property as usize];
+                let shift = u32::from(value > split.value) * u32::BITS;
+                let next = (split.children >> shift) as u32;
+                *target = if *target & LEAF == 0 { next } else { *target };
+                leaves &= *target;
+            }
+            if leaves != 0 {
+                break;
+            }
+        }
+        targets.map(|target| {
+            (
+                (target & !LEAF) >> PREDICTOR_BITS,
+                target & ((1 << PREDICTOR_BITS) - 1),
+            )
+        })
+    }
 }
 
 #[cfg(test)]
@@ -145,6 +178,7 @@ mod tests {
             let lookup = MaLookup::new(tree, contexts, channel, stream);
             let (node, pred) = tree.lookup(&p);
             assert_eq!(lookup.lookup(&p), (contexts[node as usize], pred));
+            assert_eq!(lookup.lookup_batch(&[p; 3]), [lookup.lookup(&p); 3]);
         }
     }
 

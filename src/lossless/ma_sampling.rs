@@ -30,10 +30,13 @@
 //! Modular property traversal, sampling, and DC plane tokenization.
 
 use super::ma_lookup::MaLookup;
+use super::predictor::row_kernels::{Rows, Sample, selected as selected_row_kernels};
 use super::predictor::{PredictorNeighbors, predictor_value};
 use super::tokens::RawTokens;
 use crate::entropy::{Token, pack_signed, uint_encode};
-use crate::ma_tree::{LearnedTree, MA_REF_CHANNELS, MaSamples, NUM_MA_PREDS, NUM_MA_PROPS};
+use crate::ma_tree::{
+    LearnedTree, MA_REF_CHANNELS, MaSamples, NUM_MA_PREDS, NUM_MA_PROPS, PRED_WEIGHTED,
+};
 use crate::weighted_predictor::{WpNeighbors, WpParams, WpState};
 
 /// Walk one channel rectangle in scan order, feeding the visitor the property
@@ -273,7 +276,7 @@ pub(super) fn ma_channel_sample_count(w: usize, h: usize, stride: usize) -> usiz
 }
 
 /// Visit the selected pixels with residual tokens under every decoder predictor.
-pub(crate) fn sample_channel_ma<'a, T: Copy + 'a>(
+pub(crate) fn sample_channel_ma<'a, T: Sample + 'a>(
     get_row: impl Fn(usize) -> &'a [T],
     gw: usize,
     gh: usize,
@@ -301,7 +304,7 @@ pub(crate) fn sample_channel_ma<'a, T: Copy + 'a>(
 // Share the loop across callback types: one getter call per row and one output
 // call per selected sample. Keep WP-on/off specializations so disabled WP work
 // is removed, especially for lossy modular sampling.
-fn sample_channel_ma_shared<'a, T: Copy + 'a, const USE_WP: bool>(
+fn sample_channel_ma_shared<'a, T: Sample + 'a, const USE_WP: bool>(
     get_row: &dyn Fn(usize) -> &'a [T],
     gw: usize,
     gh: usize,
@@ -316,6 +319,13 @@ fn sample_channel_ma_shared<'a, T: Copy + 'a, const USE_WP: bool>(
 {
     debug_assert!(stride != 0);
     let disabled = !USE_WP;
+    // A row of fixed-predictor symbols fits in scratch. Give strided probes
+    // their scalar path so they only calculate symbols at retained positions.
+    let mut dense = if stride == 1 && gw >= 16 {
+        T::ma_row_kernel(selected_row_kernels()).map(|kernel| (kernel, vec![[0; NUM_MA_PREDS]; gw]))
+    } else {
+        None
+    };
     let mut wp = WpState::with_params(gw, wp_params);
     let mut north_row: &[T] = &[];
     let mut north_north_row: &[T] = &[];
@@ -332,6 +342,16 @@ fn sample_channel_ma_shared<'a, T: Copy + 'a, const USE_WP: bool>(
         }
         assert_eq!(north_row.len(), gw);
         assert_eq!(north_north_row.len(), gw);
+        if let Some((kernel, symbols)) = &mut dense {
+            kernel(
+                Rows {
+                    current: current_row,
+                    north: (y > 0).then_some(north_row),
+                    north_north: (y > 1).then_some(north_north_row),
+                },
+                symbols,
+            );
+        }
         let row = wp.row_offsets(y);
         let mut west = 0i64;
         let mut west_west = 0i64;
@@ -410,12 +430,23 @@ fn sample_channel_ma_shared<'a, T: Copy + 'a, const USE_WP: bool>(
                 props[15] = if disabled { 0 } else { wp.wp_prop as i32 };
                 ref_props(refs, x, y, &mut props);
 
-                let mut tok = [0u8; NUM_MA_PREDS];
-                for pred in 0..NUM_MA_PREDS as u32 {
-                    let pv = predictor_value(pred, neighbors, wp_pred);
-                    let (t, _, _) = uint_encode(pack_signed((value - pv) as i32));
-                    tok[pred as usize] = t.min(u8::MAX as u32) as u8;
-                }
+                let tok = if let Some((_, symbols)) = &dense {
+                    let mut tok = symbols[x];
+                    tok[PRED_WEIGHTED] = if USE_WP {
+                        uint_encode(pack_signed((value - wp_pred) as i32)).0 as u8
+                    } else {
+                        tok[0]
+                    };
+                    tok
+                } else {
+                    let mut tok = [0; NUM_MA_PREDS];
+                    for pred in 0..NUM_MA_PREDS as u32 {
+                        let pv = predictor_value(pred, neighbors, wp_pred);
+                        let (t, _, _) = uint_encode(pack_signed((value - pv) as i32));
+                        tok[pred as usize] = t.min(u8::MAX as u32) as u8;
+                    }
+                    tok
+                };
                 push(props, tok, value as i32);
             }
             previous_local_gradient = local_gradient;
@@ -429,7 +460,10 @@ fn sample_channel_ma_shared<'a, T: Copy + 'a, const USE_WP: bool>(
 
 /// Tokenize the channel rectangle through the learned tree: every pixel is
 /// routed to its leaf's context and coded with its leaf's predictor.
-pub(super) fn tokenize_channel_ma<'a, T: Copy + 'a>(
+/// Pixels whose tree walks advance together (`MaLookup::lookup_batch`).
+const LOOKUP_BATCH: usize = 8;
+
+pub(super) fn tokenize_channel_ma<'a, T: Sample + 'a>(
     get_row: impl Fn(usize) -> &'a [T],
     gw: usize,
     gh: usize,
@@ -444,11 +478,17 @@ pub(super) fn tokenize_channel_ma<'a, T: Copy + 'a>(
 ) where
     i64: From<T>,
 {
-    // Keep the traversal's stores simple, then validate and pack one row at
-    // a time. The temporary row fits in cache and is reused for the channel.
+    // The traversal resolves each pixel's leaf; a row's residuals then come
+    // from one SIMD pass per fixed predictor its leaves name, so no pixel
+    // dispatches on its predictor. The row scratch is reused for the channel.
+    let kernels = selected_row_kernels();
+    let mut leaves: Vec<(u32, u32)> = Vec::with_capacity(gw);
+    let mut batch = [[0i32; NUM_MA_PROPS]; LOOKUP_BATCH];
+    let mut packed = vec![0u32; NUM_MA_PREDS * gw];
+    let mut used = 0u32;
     let mut row = Vec::with_capacity(gw);
     walk_channel_ma(
-        get_row,
+        &get_row,
         gw,
         gh,
         chan,
@@ -456,16 +496,45 @@ pub(super) fn tokenize_channel_ma<'a, T: Copy + 'a>(
         refs,
         wp_params,
         use_wp && lookup.needs_wp(),
-        |x, _y, v, p, n, wp_pred| {
-            let (context, pred) = lookup.lookup(p);
-            let pv = predictor_value(pred, n, wp_pred);
-            row.push(Token::new(
-                context,
-                pack_signed((v - pv) as i32 - offsets[context as usize]),
-            ));
+        |x, y, v, p, _, wp_pred| {
+            // Only read back where a leaf names the weighted predictor.
+            packed[PRED_WEIGHTED * gw + x] = pack_signed((v - wp_pred) as i32);
+            let slot = x % LOOKUP_BATCH;
+            batch[slot] = *p;
+            if slot + 1 == LOOKUP_BATCH || x + 1 == gw {
+                // A short last batch walks stale rows and drops their leaves.
+                for &(context, pred) in &lookup.lookup_batch(&batch)[..=slot] {
+                    leaves.push((context, pred));
+                    used |= 1 << pred;
+                }
+            }
             if x + 1 == gw {
+                let rows = Rows {
+                    current: get_row(y),
+                    north: (y > 0).then(|| get_row(y - 1)),
+                    north_north: (y > 1).then(|| get_row(y - 2)),
+                };
+                let mut fixed = used & !(1 << PRED_WEIGHTED);
+                while fixed != 0 {
+                    let pred = fixed.trailing_zeros();
+                    fixed &= fixed - 1;
+                    T::pack(kernels, rows, pred, &mut packed[pred as usize * gw..][..gw]);
+                }
+                row.extend(leaves.iter().enumerate().map(|(x, &(context, pred))| {
+                    let residual = packed[pred as usize * gw + x];
+                    let offset = offsets[context as usize];
+                    let value = if offset == 0 {
+                        residual
+                    } else {
+                        let signed = (residual >> 1) as i32 ^ -((residual & 1) as i32);
+                        pack_signed(signed - offset)
+                    };
+                    Token::new(context, value)
+                }));
                 out.extend(&row);
                 row.clear();
+                leaves.clear();
+                used = 0;
             }
         },
     );
