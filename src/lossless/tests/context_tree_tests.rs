@@ -192,7 +192,11 @@ fn compiled_ma_tokenization_matches_full_tree_with_and_without_wp() {
                     .map(|i| (((i * 7919) ^ (i / 7 * 1237)) % 65536) as i32 - 32768)
                     .collect();
                 let get_row = |y| &values[y * width..][..width];
-                for use_wp in [false, true] {
+                for (use_wp, shifted) in [(false, false), (true, false), (false, true), (true, true)] {
+                    // Leaf offsets move a residual before it is packed.
+                    let offsets: Vec<i32> = (0..contexts.len() as i32)
+                        .map(|i| if shifted { i % 5 - 2 } else { 0 })
+                        .collect();
                     let mut expected = Vec::new();
                     walk_channel_ma(
                         get_row,
@@ -205,9 +209,11 @@ fn compiled_ma_tokenization_matches_full_tree_with_and_without_wp() {
                         use_wp,
                         |_x, _y, value, props, n, wp| {
                             let (node, pred) = tree.lookup(props);
+                            let context = contexts[node as usize];
+                            let residual = (value - predictor_value(pred, n, wp)) as i32;
                             expected.push((
-                                contexts[node as usize],
-                                pack_signed((value - predictor_value(pred, n, wp)) as i32),
+                                context,
+                                pack_signed(residual - offsets.get(context as usize).map_or(0, |&o| o)),
                             ));
                         },
                     );
@@ -222,7 +228,7 @@ fn compiled_ma_tokenization_matches_full_tree_with_and_without_wp() {
                         WpParams::DEFAULT,
                         use_wp,
                         &lookup,
-                        &vec![0; contexts.len()],
+                        &offsets,
                         &mut actual,
                     );
                     let actual: Vec<_> = match RawTokenStreams::new(vec![actual]) {
@@ -242,10 +248,132 @@ fn compiled_ma_tokenization_matches_full_tree_with_and_without_wp() {
                     };
                     assert_eq!(
                         actual, expected,
-                        "channel={channel}, width={width}, height={height}, wp={use_wp}"
+                        "channel={channel}, width={width}, height={height}, wp={use_wp}, shifted={shifted}"
                     );
                 }
             }
+        }
+    }
+}
+
+/// Every predictor in one row, in every sample type: the row tokenizer's
+/// per-predictor passes and batched tree walks against the per-pixel walk.
+#[test]
+fn row_tokenization_matches_per_pixel_walk_for_every_predictor() {
+    use crate::lossless::predictor::row_kernels::Sample;
+    // A chain on the x property: column `x` below 13 reaches predictor `x`,
+    // later columns alternate on the west gradient between two more.
+    let mut nodes = Vec::new();
+    for pred in 0..13u32 {
+        let split = nodes.len() as u32;
+        nodes.push(MaNode::Split {
+            prop: 3,
+            val: pred as i32,
+            gt: split + 2,
+            le: split + 1,
+        });
+        nodes.push(MaNode::Leaf { pred, offset: 0 });
+    }
+    let split = nodes.len() as u32;
+    nodes.push(MaNode::Split {
+        prop: 10,
+        val: 0,
+        gt: split + 1,
+        le: split + 2,
+    });
+    nodes.push(MaNode::Leaf {
+        pred: 13,
+        offset: 0,
+    });
+    nodes.push(MaNode::Leaf { pred: 6, offset: 0 });
+    let tree = LearnedTree {
+        nodes,
+        est_bits: 0.,
+        flat_bits: 0.,
+    };
+    let (_, contexts, _) = emit_learned_tree(&tree);
+    let lookup = MaLookup::new(&tree, &contexts, 0, 0);
+    let offsets: Vec<i32> = (0..contexts.len() as i32).map(|i| i % 3 - 1).collect();
+
+    fn check<T: Sample + PartialEq + std::fmt::Debug>(
+        values: &[T],
+        width: usize,
+        height: usize,
+        tree: &LearnedTree,
+        contexts: &[u32],
+        lookup: &MaLookup,
+        offsets: &[i32],
+    ) where
+        i64: From<T>,
+    {
+        let get_row = |y| &values[y * width..][..width];
+        let mut expected = Vec::new();
+        walk_channel_ma(
+            get_row,
+            width,
+            height,
+            0,
+            0,
+            &[],
+            WpParams::PRESETS[1],
+            true,
+            |_x, _y, value, props, n, wp| {
+                let (node, pred) = tree.lookup(props);
+                let context = contexts[node as usize];
+                let residual = (value - predictor_value(pred, n, wp)) as i32;
+                expected.push((context, pack_signed(residual - offsets[context as usize])));
+            },
+        );
+        let mut actual = RawTokens::with_capacity(values.len());
+        tokenize_channel_ma(
+            get_row,
+            width,
+            height,
+            0,
+            0,
+            &[],
+            WpParams::PRESETS[1],
+            true,
+            lookup,
+            offsets,
+            &mut actual,
+        );
+        let actual: Vec<_> = match RawTokenStreams::new(vec![actual]) {
+            RawTokenStreams::Compact(streams) => streams
+                .into_iter()
+                .flatten()
+                .map(|t| {
+                    let t = t.unpack();
+                    (t.context, t.value)
+                })
+                .collect(),
+            RawTokenStreams::Wide(streams) => streams
+                .into_iter()
+                .flatten()
+                .map(|t| (t.context, t.value))
+                .collect(),
+        };
+        assert_eq!(actual, expected, "width={width}, height={height}");
+    }
+
+    for width in [1usize, 2, 7, 8, 9, 13, 14, 16, 17, 31, 40, 64, 65, 257] {
+        for height in [1usize, 2, 3, 9] {
+            let mut state = 0x9e37_79b9u32;
+            let noise: Vec<u32> = (0..width * height)
+                .map(|i| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    // Flat runs between noisy ones exercise the WP shortcut.
+                    if (i / 11) % 3 == 0 { 77 } else { state >> 16 }
+                })
+                .collect();
+            let bytes: Vec<u8> = noise.iter().map(|&v| v as u8).collect();
+            let words: Vec<u16> = noise.iter().map(|&v| v as u16).collect();
+            let wide: Vec<i32> = noise.iter().map(|&v| v as i32 - 32768).collect();
+            let huge: Vec<i32> = noise.iter().map(|&v| (v as i32 - 32768) << 12).collect();
+            check(&bytes, width, height, &tree, &contexts, &lookup, &offsets);
+            check(&words, width, height, &tree, &contexts, &lookup, &offsets);
+            check(&wide, width, height, &tree, &contexts, &lookup, &offsets);
+            check(&huge, width, height, &tree, &contexts, &lookup, &offsets);
         }
     }
 }

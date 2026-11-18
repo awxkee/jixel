@@ -32,7 +32,7 @@
 //! 1. Region split: a screenshot with gradient or photo-like rectangles (see
 //!    `region_frames`) may code as a base saved to reference slot 0 plus one
 //!    cropped kReplace frame per rectangle. When the first-stage estimates
-//!    favour the split, both it and the whole frame are encoded and the
+//!    favor the split, both it and the whole frame are encoded and the
 //!    smaller is kept.
 //! 2. Displayed frame: the image itself or, with patches, a reference-only
 //!    atlas plus the patched image; both compete on complete size.

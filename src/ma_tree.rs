@@ -383,6 +383,8 @@ pub(crate) struct MaPropertyScratch {
     luts: Vec<u8>,
     /// Every plan's `[bin][side pred][symbol]` histogram, back to back.
     multi_hist: Vec<u32>,
+    /// One row's four histogram offsets, reused across single-property scans.
+    split_slots: Vec<[u8; 4]>,
     /// Value histogram scratch of `rebase_zero` (modal offsets).
     multi_bin_count: Vec<u32>,
     /// Per predictor: running histogram of the `le` side.
@@ -405,6 +407,7 @@ impl Default for MaPropertyScratch {
             plans: Vec::with_capacity(NUM_MA_PROPS),
             luts: Vec::new(),
             multi_hist: Vec::new(),
+            split_slots: Vec::new(),
             multi_bin_count: Vec::new(),
             left_hist: Vec::new(),
             node_hist: Vec::new(),
@@ -766,6 +769,121 @@ fn scan_split_plans<T: MaProperty>(
     }
 }
 
+/// A cache-resident node scans one property at a time. Bind its LUT or
+/// thresholds once, so classification does not reload the plan in each row.
+#[allow(clippy::too_many_arguments)]
+fn scan_split_plan<T: MaProperty>(
+    properties: &[[T; NUM_MA_PROPS]],
+    tokens: &[[u8; NUM_MA_PREDS]],
+    plan: &SplitPlan,
+    luts: &[u8],
+    preds: &[usize],
+    window: &SymbolWindow,
+    packed_slots: Option<&[[u8; 4]]>,
+    hist: &mut [u32],
+) {
+    let &[p0, p1, p2, p3] = preds else {
+        let mut local = *plan;
+        local.hist_start = 0;
+        scan_split_plans(
+            properties,
+            tokens,
+            std::slice::from_ref(&local),
+            luts,
+            preds,
+            window,
+            hist,
+        );
+        return;
+    };
+    if let Some(slots) = packed_slots {
+        debug_assert_eq!(properties.len(), slots.len());
+        scan_split_plan_four(
+            properties,
+            plan,
+            luts,
+            slots.iter().map(|row| row.map(usize::from)),
+            hist,
+        );
+    } else {
+        scan_split_plan_four(
+            properties,
+            plan,
+            luts,
+            split_slots(tokens, [p0, p1, p2, p3], &window.spans),
+            hist,
+        );
+    }
+}
+
+fn split_slots<'a>(
+    tokens: &'a [[u8; NUM_MA_PREDS]],
+    [p0, p1, p2, p3]: [usize; 4],
+    spans: &'a [PredictorSpan],
+) -> impl Iterator<Item = [usize; 4]> + 'a {
+    let [s0, s1, s2, s3] = spans else {
+        unreachable!("one span per side predictor");
+    };
+    assert!(p0 < NUM_MA_PREDS && p1 < NUM_MA_PREDS && p2 < NUM_MA_PREDS && p3 < NUM_MA_PREDS);
+    tokens.iter().map(move |toks| {
+        [
+            s0.slot(toks[p0]),
+            s1.slot(toks[p1]),
+            s2.slot(toks[p2]),
+            s3.slot(toks[p3]),
+        ]
+    })
+}
+
+fn scan_split_plan_four<T: MaProperty>(
+    properties: &[[T; NUM_MA_PROPS]],
+    plan: &SplitPlan,
+    luts: &[u8],
+    slots: impl Iterator<Item = [usize; 4]>,
+    hist: &mut [u32],
+) {
+    let prop = plan.prop as usize;
+    assert!(prop < NUM_MA_PROPS);
+    let values = properties.iter().map(|row| row[prop].into());
+    let stride = plan.bin_stride as usize;
+    if plan.use_lut {
+        let lo = plan.lo_v;
+        let hi = plan.hi_v;
+        let start = plan.lut_start as usize;
+        let lut = &luts[start..=start + (hi - lo) as usize];
+        scan_split_plan_bins(
+            values.map(|v| lut[(v.max(lo).min(hi) - lo) as usize] as usize),
+            slots,
+            stride,
+            hist,
+        );
+    } else {
+        let candidates = &plan.cands[..plan.ncand as usize];
+        scan_split_plan_bins(
+            values.map(|v| candidates.partition_point(|&c| c < v)),
+            slots,
+            stride,
+            hist,
+        );
+    }
+}
+
+#[inline]
+fn scan_split_plan_bins(
+    bins: impl Iterator<Item = usize>,
+    slots: impl Iterator<Item = [usize; 4]>,
+    stride: usize,
+    hist: &mut [u32],
+) {
+    for (bin, [t0, t1, t2, t3]) in bins.zip(slots) {
+        let base = bin * stride;
+        hist[base + t0] += 1;
+        hist[base + t1] += 1;
+        hist[base + t2] += 1;
+        hist[base + t3] += 1;
+    }
+}
+
 /// Samples use uint_encode's fixed (4, 2, 0) config, so a symbol determines
 /// its raw-bit count: zero below 16, otherwise (symbol / 4) - 2. Summing
 /// over the symbols a predictor uses in the node avoids storing and
@@ -880,15 +998,28 @@ fn best_split_on_prop<T: MaProperty>(
         scratch,
     )?;
     let mut hist = vec![0u32; plan.hist_len()];
-    scan_split_plans(
-        properties,
-        tokens,
-        std::slice::from_ref(&plan),
-        &luts,
-        preds,
-        &window,
-        &mut hist,
+    scan_split_plan(
+        properties, tokens, &plan, &luts, preds, &window, None, &mut hist,
     );
+    if window.bin_stride <= 256
+        && let &[p0, p1, p2, p3] = preds
+    {
+        let slots: Vec<_> = split_slots(tokens, [p0, p1, p2, p3], &window.spans)
+            .map(|row| row.map(|slot| slot as u8))
+            .collect();
+        let mut packed_hist = vec![0; plan.hist_len()];
+        scan_split_plan(
+            properties,
+            tokens,
+            &plan,
+            &luts,
+            preds,
+            &window,
+            Some(&slots),
+            &mut packed_hist,
+        );
+        assert_eq!(hist, packed_hist);
+    }
     score_split_plan(
         &plan,
         preds,
@@ -1256,25 +1387,37 @@ impl Learner<'_> {
                 // its own (concurrently for medium nodes); a small
                 // single-property histogram stays in L1 and beats summing
                 // per-chunk multi-property ones.
+                let mut slots = std::mem::take(&mut scratch.ma_property.split_slots);
+                slots.clear();
+                if plans.len() >= 4
+                    && window.bin_stride <= 256
+                    && let &[p0, p1, p2, p3] = &preds[..]
+                {
+                    // When the active spans occupy at most 256 cells, one
+                    // byte represents each row's offset.
+                    slots.extend(
+                        split_slots(tokens, [p0, p1, p2, p3], &window.spans)
+                            .map(|row| row.map(|slot| slot as u8)),
+                    );
+                }
+                let packed_slots = (!slots.is_empty()).then_some(slots.as_slice());
                 let one_plan = |plan: &SplitPlan, sc: &mut MaPropertyScratch| {
                     sc.prepare(alphabet);
-                    let mut local = *plan;
-                    local.hist_start = 0;
                     let mut hist = std::mem::take(&mut sc.multi_hist);
                     hist.clear();
                     hist.resize(plan.hist_len(), 0);
-                    scan_split_plans(
+                    scan_split_plan(
                         properties,
                         tokens,
-                        std::slice::from_ref(&local),
+                        plan,
                         &luts,
                         &preds,
                         &window,
+                        packed_slots,
                         &mut hist,
                     );
                     let score = score_split_plan(
-                        &local, &preds, alphabet, &window, &hist, &all_hist, &all_nbits, n as u32,
-                        sc,
+                        plan, &preds, alphabet, &window, &hist, &all_hist, &all_nbits, n as u32, sc,
                     );
                     sc.multi_hist = hist;
                     score
@@ -1298,6 +1441,7 @@ impl Learner<'_> {
                         best = Some((plan.prop as usize, t, bits));
                     }
                 }
+                scratch.ma_property.split_slots = slots;
             }
             scratch.ma_property.plans = plans;
             scratch.ma_property.luts = luts;

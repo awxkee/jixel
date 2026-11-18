@@ -33,6 +33,7 @@
 use super::{PredictorNeighbors, predictor_value};
 use crate::entropy::pack_signed;
 use crate::lossless::rct::RctHistogram;
+use crate::ma_tree::{NUM_MA_PREDS, PRED_WEIGHTED};
 use std::sync::OnceLock;
 
 #[derive(Clone, Copy)]
@@ -96,10 +97,11 @@ pub(crate) trait Sample: Copy {
         zero: Option<&mut Vec<u64>>,
         weighted_zero: bool,
     );
+    fn ma_row_kernel(kernels: &Kernels) -> Option<MaRowFn<Self>>;
 }
 
 macro_rules! sample {
-    ($sample:ty, $field:ident, $costs:ident) => {
+    ($sample:ty, $field:ident, $costs:ident, $ma:ident) => {
         impl Sample for $sample {
             fn pack(kernels: &Kernels, rows: Rows<'_, Self>, pred: u32, out: &mut [u32]) {
                 (kernels.$field)(rows, pred, out);
@@ -113,14 +115,18 @@ macro_rules! sample {
             ) {
                 (kernels.$costs)(rows, hist, zero, weighted_zero);
             }
+            fn ma_row_kernel(kernels: &Kernels) -> Option<MaRowFn<Self>> {
+                kernels.$ma
+            }
         }
     };
 }
-sample!(i32, i32, costs_i32);
-sample!(u8, u8, costs_u8);
-sample!(u16, u16, costs_u16);
+sample!(i32, i32, costs_i32, ma_i32);
+sample!(u8, u8, costs_u8, ma_u8);
+sample!(u16, u16, costs_u16, ma_u16);
 
 type CostRowFn<T> = fn(Rows<'_, T>, &mut [Vec<u64>], Option<&mut Vec<u64>>, bool);
+pub(crate) type MaRowFn<T> = fn(Rows<'_, T>, &mut [[u8; NUM_MA_PREDS]]);
 
 #[derive(Clone, Copy)]
 pub(crate) struct Kernels {
@@ -130,6 +136,9 @@ pub(crate) struct Kernels {
     costs_i32: CostRowFn<i32>,
     costs_u8: CostRowFn<u8>,
     costs_u16: CostRowFn<u16>,
+    ma_i32: Option<MaRowFn<i32>>,
+    ma_u8: Option<MaRowFn<u8>>,
+    ma_u16: Option<MaRowFn<u16>>,
     pub(in crate::lossless) rct: fn(&[i32], &[i32], bool, &mut RctHistogram) -> u64,
 }
 
@@ -219,6 +228,25 @@ fn cost_scalar<T: Copy>(
 }
 
 #[allow(dead_code)]
+fn ma_span<T: Copy>(rows: Rows<'_, T>, start: usize, out: &mut [[u8; NUM_MA_PREDS]])
+where
+    i64: From<T>,
+{
+    for (x, out) in (start..).zip(out) {
+        let value = i64::from(rows.current[x]);
+        let neighbors = rows.neighbors(x);
+        for (pred, symbol) in out.iter_mut().enumerate() {
+            *symbol = if pred == PRED_WEIGHTED {
+                0 // Filled by the ordered weighted-predictor walk.
+            } else {
+                let prediction = predictor_value(pred as u32, neighbors, 0);
+                crate::entropy::uint_encode(pack_signed((value - prediction) as i32)).0 as u8
+            };
+        }
+    }
+}
+
+#[allow(dead_code)]
 pub(in crate::lossless) fn scalar() -> Kernels {
     Kernels {
         i32: pack_scalar,
@@ -227,6 +255,9 @@ pub(in crate::lossless) fn scalar() -> Kernels {
         costs_i32: cost_scalar,
         costs_u8: cost_scalar,
         costs_u16: cost_scalar,
+        ma_i32: None,
+        ma_u8: None,
+        ma_u16: None,
         rct: crate::lossless::rct::rct_gradient_row_scalar,
     }
 }
@@ -311,6 +342,93 @@ macro_rules! backend {
             let large = lt_unsigned(splat(15), value);
             let token = add(shl::<2>(log), and(shr_unsigned::<21>(bits), splat(3)));
             (select(large, token, value), and(large, sub(log, splat(2))))
+        }
+
+        // The caller leaves two pixels at either edge and validates the row
+        // widths. Every typed load reads exactly one vector's worth of samples.
+        #[inline]
+        #[target_feature(enable = $feature)]
+        unsafe fn load_neighbors<T: Copy>(
+            rows: super::Rows<'_, T>,
+            x: usize,
+            load: &impl Fn(*const T) -> $vector,
+        ) -> [$vector; 7] {
+            unsafe {
+                let w = load(rows.current.as_ptr().add(x - 1));
+                let ww = load(rows.current.as_ptr().add(x - 2));
+                let n = rows.north.map_or(w, |r| load(r.as_ptr().add(x)));
+                let nw = rows.north.map_or(w, |r| load(r.as_ptr().add(x - 1)));
+                let ne = rows.north.map_or(w, |r| load(r.as_ptr().add(x + 1)));
+                let nee = rows.north.map_or(w, |r| load(r.as_ptr().add(x + 2)));
+                let nn = rows.north_north.map_or(n, |r| load(r.as_ptr().add(x)));
+                [w, n, nw, ne, ww, nn, nee]
+            }
+        }
+
+        #[inline]
+        #[target_feature(enable = $feature)]
+        fn average4_fits([w, n, _, ne, ww, nn, nee]: [$vector; 7]) -> bool {
+            bits_clear(
+                [w, n, ww, nn, ne, nee]
+                    .into_iter()
+                    .fold(splat(0), |bits, v| or(bits, abs(v))),
+                splat(!((1 << 26) - 1)),
+            )
+        }
+
+        #[target_feature(enable = $feature)]
+        fn ma_symbols<T: Copy, const CHECK: bool>(
+            rows: super::Rows<'_, T>,
+            out: &mut [[u8; super::NUM_MA_PREDS]],
+            load: impl Fn(*const T) -> $vector,
+        ) where
+            i64: From<T>,
+        {
+            let len = out.len();
+            rows.validate(len);
+            if len < $lanes + 4 {
+                super::ma_span(rows, 0, out);
+                return;
+            }
+            super::ma_span(rows, 0, &mut out[..2]);
+            let (blocks, tail) = out[2..len - 2].as_chunks_mut::<$lanes>();
+            let end = 2 + blocks.len() * $lanes;
+            for (block, output) in blocks.iter_mut().enumerate() {
+                let x = 2 + block * $lanes;
+                // SAFETY: every block has two samples before and after it.
+                let value = load(unsafe { rows.current.as_ptr().add(x) });
+                let neighbors = unsafe { load_neighbors(rows, x, &load) };
+                if CHECK && !average4_fits(neighbors) {
+                    super::ma_span(rows, x, output);
+                    continue;
+                }
+                let mut columns = [[0i32; $lanes]; super::NUM_MA_PREDS];
+                let mut write_symbols = |pred, prediction| {
+                    let (tokens, _) = symbols(packed(value, prediction));
+                    let column: &mut [i32; $lanes] = &mut columns[pred];
+                    // SAFETY: one complete vector fits the column.
+                    unsafe { store(column.as_mut_ptr(), tokens) };
+                };
+                write_symbols(0, prediction::<0>(neighbors));
+                write_symbols(1, prediction::<1>(neighbors));
+                write_symbols(2, prediction::<2>(neighbors));
+                write_symbols(3, prediction::<3>(neighbors));
+                write_symbols(4, prediction::<4>(neighbors));
+                write_symbols(5, prediction::<5>(neighbors));
+                write_symbols(7, prediction::<7>(neighbors));
+                write_symbols(8, prediction::<8>(neighbors));
+                write_symbols(9, prediction::<9>(neighbors));
+                write_symbols(10, prediction::<10>(neighbors));
+                write_symbols(11, prediction::<11>(neighbors));
+                write_symbols(12, prediction::<12>(neighbors));
+                write_symbols(13, prediction::<13>(neighbors));
+                for (lane, sample) in output.iter_mut().enumerate() {
+                    // Every (4, 2, 0) symbol is at most 127.
+                    *sample = columns.each_ref().map(|column| column[lane] as u8);
+                }
+            }
+            super::ma_span(rows, end, tail);
+            super::ma_span(rows, len - 2, &mut out[len - 2..]);
         }
 
         #[target_feature(enable = $feature)]
@@ -557,6 +675,9 @@ macro_rules! backend {
                 costs_i32: |r, h, z, w| unsafe { costs::<i32, true>(r, h, z, w, |v| load(v)) },
                 costs_u8: |r, h, z, w| unsafe { costs::<u8, false>(r, h, z, w, |v| load_u8(v)) },
                 costs_u16: |r, h, z, w| unsafe { costs::<u16, false>(r, h, z, w, |v| load_u16(v)) },
+                ma_i32: Some(|r, o| unsafe { ma_symbols::<i32, true>(r, o, |v| load(v)) }),
+                ma_u8: Some(|r, o| unsafe { ma_symbols::<u8, false>(r, o, |v| load_u8(v)) }),
+                ma_u16: Some(|r, o| unsafe { ma_symbols::<u16, false>(r, o, |v| load_u16(v)) }),
                 rct: |c, p, f, h| unsafe { rct(c, p, f, h) },
             }
         }
@@ -632,6 +753,7 @@ mod tests {
                 north_north: y.checked_sub(2).map(|y| rows[y]),
             };
             let get = |x: usize, y: usize| i32::from(rows[y][x]);
+            let mut expected_ma = vec![[0; NUM_MA_PREDS]; width];
             for pred in (0..14).filter(|&p| p != 6) {
                 let expected: Vec<u32> = (0..width)
                     .map(|x| {
@@ -639,12 +761,25 @@ mod tests {
                         pack_signed(((get(x, y) as i64) - predictor_value(pred, n, 0)) as i32)
                     })
                     .collect();
+                for (&value, sample) in expected.iter().zip(&mut expected_ma) {
+                    sample[pred as usize] = crate::entropy::uint_encode(value).0 as u8;
+                }
                 for (name, kernels) in available() {
                     let mut actual = vec![u32::MAX; width];
                     T::pack(&kernels, row, pred, &mut actual);
                     assert_eq!(
                         actual, expected,
                         "{name}, predictor {pred}, width {width}, row {y}, offset {offset}"
+                    );
+                }
+            }
+            for (name, kernels) in available() {
+                if let Some(kernel) = T::ma_row_kernel(&kernels) {
+                    let mut actual = vec![[u8::MAX; NUM_MA_PREDS]; width];
+                    kernel(row, &mut actual);
+                    assert_eq!(
+                        actual, expected_ma,
+                        "{name}, width {width}, row {y}, offset {offset}"
                     );
                 }
             }
