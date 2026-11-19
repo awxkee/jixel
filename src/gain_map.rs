@@ -256,7 +256,7 @@ impl GainMap {
         self
     }
 
-    fn validate(&self) -> Result<(), EncodeError> {
+    pub(crate) fn validate(&self) -> Result<(), EncodeError> {
         if self.width == 0 || self.height == 0 {
             return Err(EncodeError::GainMap("gain map dimensions must be non-zero"));
         }
@@ -394,7 +394,7 @@ pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainM
 }
 
 /// JXL signature box that opens every container file.
-static CONTAINER_SIGNATURE: [u8; 12] = [
+pub(crate) static CONTAINER_SIGNATURE: [u8; 12] = [
     0, 0, 0, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
 ];
 
@@ -402,7 +402,7 @@ static CONTAINER_SIGNATURE: [u8; 12] = [
 /// returned as is; a container is scanned for its `jxlc` box and the level
 /// declared by `jxll` (the encoder only wraps when level 10 is required, or
 /// for metadata boxes, which the gain map config never requests).
-fn strip_container(bytes: Vec<u8>) -> Result<(Vec<u8>, bool), EncodeError> {
+pub(crate) fn strip_container(bytes: Vec<u8>) -> Result<(Vec<u8>, bool), EncodeError> {
     if !bytes.starts_with(&CONTAINER_SIGNATURE) {
         return Ok((bytes, false));
     }

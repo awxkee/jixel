@@ -32,7 +32,7 @@ use crate::coding::CodingTransform;
 use crate::color::{
     ColorTransform, FloatTransferDecoder, RgbBlockTransform, TransferDecoder, TransferLut,
 };
-use crate::color_encoding::write_color_encoding_with_icc;
+use crate::color_encoding::{RenderingIntent, write_color_encoding_with_icc};
 use crate::encoding_context::EncodingContext;
 use crate::frame::encode_frame;
 use crate::gain_map::{EncodedGainMap, GainMap, encode_gain_map};
@@ -328,6 +328,7 @@ pub struct EncodeConfig {
     /// Ignored when `lossless` is true.
     pub distance: f32,
     pub color_encoding: ColorEncoding,
+    /// ICC profile of the source (see [`EncodeConfig::with_icc_profile`]).
     pub icc_profile: Option<Vec<u8>>,
     /// EXIF/TIFF metadata to embed via an `Exif` container box. Forces the
     /// output into the JXL container form. Raw TIFF bytes (no "Exif\0\0" prefix).
@@ -986,6 +987,18 @@ impl EncodeConfig {
         self
     }
 
+    /// Whether frames may be blended over an XYB frame (crop stack, ink
+    /// stack, layered function fields). libjxl blends XYB frames only when
+    /// it decodes to the image's original color encoding
+    /// (`stage_blending.cc`, "Blending in unsupported color space"), and an
+    /// ICC-tagged XYB image never decodes to its original: djxl and every
+    /// libjxl viewer fail on such a file. jxl-oxide decodes it either way.
+    /// Single frames, patches (blended before the color transform) and
+    /// non-XYB layers (lossless vector frames) are unaffected.
+    pub(crate) fn xyb_layers_decodable(&self) -> bool {
+        self.icc_profile.is_none()
+    }
+
     pub(crate) fn tone_mapping(&self) -> ToneMappingParams {
         ToneMappingParams {
             intensity_target: self.intensity_target,
@@ -995,7 +1008,18 @@ impl EncodeConfig {
         }
     }
 
-    /// Embed an ICC profile in the codestream (predicted + entropy-coded ICC stream).
+    /// The source's ICC profile, embedded in the codestream (predicted +
+    /// entropy-coded ICC stream).
+    ///
+    /// A lossy XYB encode writes a profile that only restates
+    /// [`EncodeConfig::color_encoding`] (sRGB, Display P3, Rec. 2020 or
+    /// linear sRGB matrix/TRC profiles, D65) as that enum instead, with the
+    /// profile's rendering intent, as libjxl does: the decoder converts XYB to
+    /// the declared space either way. Set `color_encoding` to the profile's
+    /// space for this to apply. Any other profile is embedded, and then the
+    /// encode keeps to frames that libjxl can decode under it: no ink or
+    /// crop-frame stacks, which libjxl cannot blend in an ICC-tagged XYB
+    /// image. Lossless and non-XYB encodes always embed the profile.
     pub fn with_icc_profile(mut self, icc: Vec<u8>) -> Self {
         self.icc_profile = Some(icc);
         self
@@ -1355,7 +1379,7 @@ pub(crate) fn lossy_context(
             config.progressive_shifts.as_deref(),
         ) == [0]
         && config.decoding_speed == DecodingSpeed::Slow;
-    ctx.function_fields_layered = ctx.function_fields && config.icc_profile.is_none();
+    ctx.function_fields_layered = ctx.function_fields && config.xyb_layers_decodable();
     ctx.function_fields_portable = config.function_fields_portable;
     ctx.function_fields_exact = ctx.function_fields
         && cfg!(feature = "extraslow")
@@ -1526,6 +1550,11 @@ pub fn encode_image(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Rgb) {
+        return with_prepared_config(config, IccTarget::Rgb, |config| {
+            encode_image(input, width, height, config)
+        });
+    }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     // Glyph templates need an alpha channel, which an RGB image declares
@@ -1622,6 +1651,7 @@ fn encode_image_rgb(
     // vector layers took the image: crops over a plain VarDCT base do not
     // beat a near-lossless vector encode.
     if config.crop_frames
+        && config.xyb_layers_decodable()
         && let Some(crop_share) = crop_share
         && config.coding_transform == CodingTransform::Xyb
         && !config.progressive
@@ -1890,6 +1920,7 @@ fn encode_image_arms(
         None => VectorRace::default(),
     };
     if config.ink_layer
+        && config.xyb_layers_decodable()
         && let Some(ink_plan) = ink_plan
     {
         return ink_arm(input, width, height, config, ink_plan, race);
@@ -1914,9 +1945,12 @@ fn plan_ink(
     config: &EncodeConfig,
 ) -> Option<crate::ink_layer::InkLayers> {
     let layers = config.coding_transform == CodingTransform::Xyb && !config.progressive_dc;
+    // An ICC-tagged encode codes no ink stack; only the vector race's
+    // glyph-text flag can still want the plan.
+    let ink_stack = config.ink_layer && config.xyb_layers_decodable();
     if !(layers
         && width * height >= 64 * 64
-        && (config.ink_layer || (config.vector_layers && config.patches)))
+        && (ink_stack || (config.vector_layers && config.patches)))
     {
         return None;
     }
@@ -3199,6 +3233,11 @@ pub fn encode_image_with_alpha(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Rgb) {
+        return with_prepared_config(config, IccTarget::Rgb, |config| {
+            encode_image_with_alpha(input, width, height, config)
+        });
+    }
     if width == 0 || height == 0 {
         return Err(EncodeError::EmptyImage);
     }
@@ -3374,6 +3413,7 @@ fn encode_lossy_u8_alpha_arms<const CHANNELS: usize>(
         )
     };
     if config.ink_layer
+        && config.xyb_layers_decodable()
         && config.coding_transform == CodingTransform::Xyb
         && !config.progressive_dc
         && width * height >= 64 * 64
@@ -3462,6 +3502,11 @@ pub fn encode_image_with_alpha_10bit(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Rgb) {
+        return with_prepared_config(config, IccTarget::Rgb, |config| {
+            encode_image_with_alpha_10bit(input, width, height, config)
+        });
+    }
     encode_high_depth_rgba(input, width, height, true, config, BitsPerSample::Ten)
 }
 
@@ -3471,6 +3516,11 @@ pub fn encode_image_with_alpha_12bit(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Rgb) {
+        return with_prepared_config(config, IccTarget::Rgb, |config| {
+            encode_image_with_alpha_12bit(input, width, height, config)
+        });
+    }
     encode_high_depth_rgba(input, width, height, true, config, BitsPerSample::Twelve)
 }
 
@@ -3482,6 +3532,11 @@ pub fn encode_image_with_alpha_16bit(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Rgb) {
+        return with_prepared_config(config, IccTarget::Rgb, |config| {
+            encode_image_with_alpha_16bit(input, width, height, config)
+        });
+    }
     encode_high_depth_rgba(input, width, height, true, config, BitsPerSample::Sixteen)
 }
 
@@ -3493,6 +3548,11 @@ pub fn encode_image_16bit(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Rgb) {
+        return with_prepared_config(config, IccTarget::Rgb, |config| {
+            encode_image_16bit(input, width, height, config)
+        });
+    }
     encode_high_depth_rgba(input, width, height, false, config, BitsPerSample::Sixteen)
 }
 
@@ -3502,6 +3562,11 @@ pub fn encode_image_10bit(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Rgb) {
+        return with_prepared_config(config, IccTarget::Rgb, |config| {
+            encode_image_10bit(input, width, height, config)
+        });
+    }
     encode_high_depth_rgba(input, width, height, false, config, BitsPerSample::Ten)
 }
 
@@ -3511,6 +3576,11 @@ pub fn encode_image_12bit(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Rgb) {
+        return with_prepared_config(config, IccTarget::Rgb, |config| {
+            encode_image_12bit(input, width, height, config)
+        });
+    }
     encode_high_depth_rgba(input, width, height, false, config, BitsPerSample::Twelve)
 }
 
@@ -3525,6 +3595,11 @@ pub fn encode_image_gray(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Gray) {
+        return with_prepared_config(config, IccTarget::Gray, |config| {
+            encode_image_gray(input, width, height, config)
+        });
+    }
     encode_gray_impl::<1>(input, width, height, config)
 }
 
@@ -3534,6 +3609,11 @@ pub fn encode_image_gray_alpha(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Gray) {
+        return with_prepared_config(config, IccTarget::Gray, |config| {
+            encode_image_gray_alpha(input, width, height, config)
+        });
+    }
     let expected = checked_buffer_size::<u8>(width, height, 2)?;
     if input.len() != expected {
         return Err(EncodeError::InputSizeMismatch {
@@ -3644,6 +3724,11 @@ pub fn encode_image_gray_10bit(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Gray) {
+        return with_prepared_config(config, IccTarget::Gray, |config| {
+            encode_image_gray_10bit(input, width, height, config)
+        });
+    }
     encode_gray_high_depth_impl::<1>(input, width, height, config, BitsPerSample::Ten)
 }
 
@@ -3654,6 +3739,11 @@ pub fn encode_image_gray_12bit(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Gray) {
+        return with_prepared_config(config, IccTarget::Gray, |config| {
+            encode_image_gray_12bit(input, width, height, config)
+        });
+    }
     encode_gray_high_depth_impl::<1>(input, width, height, config, BitsPerSample::Twelve)
 }
 
@@ -3665,6 +3755,11 @@ pub fn encode_image_gray_alpha_10bit(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Gray) {
+        return with_prepared_config(config, IccTarget::Gray, |config| {
+            encode_image_gray_alpha_10bit(input, width, height, config)
+        });
+    }
     let expected = checked_buffer_size::<u16>(width, height, 2)?;
     if input.len() != expected {
         return Err(EncodeError::InputSizeMismatch {
@@ -3683,6 +3778,11 @@ pub fn encode_image_gray_alpha_12bit(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Gray) {
+        return with_prepared_config(config, IccTarget::Gray, |config| {
+            encode_image_gray_alpha_12bit(input, width, height, config)
+        });
+    }
     let expected = checked_buffer_size::<u16>(width, height, 2)?;
     if input.len() != expected {
         return Err(EncodeError::InputSizeMismatch {
@@ -3700,6 +3800,11 @@ pub fn encode_image_gray_16bit(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Gray) {
+        return with_prepared_config(config, IccTarget::Gray, |config| {
+            encode_image_gray_16bit(input, width, height, config)
+        });
+    }
     encode_gray_high_depth_impl::<1>(input, width, height, config, BitsPerSample::Sixteen)
 }
 
@@ -3711,6 +3816,11 @@ pub fn encode_image_gray_alpha_16bit(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Gray) {
+        return with_prepared_config(config, IccTarget::Gray, |config| {
+            encode_image_gray_alpha_16bit(input, width, height, config)
+        });
+    }
     let expected = checked_buffer_size::<u16>(width, height, 2)?;
     if input.len() != expected {
         return Err(EncodeError::InputSizeMismatch {
@@ -4227,6 +4337,11 @@ pub fn encode_image_f32(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Rgb) {
+        return with_prepared_config(config, IccTarget::Rgb, |config| {
+            encode_image_f32(input, width, height, config)
+        });
+    }
     encode_float_rgba(input, width, height, false, config, BitsPerSample::F32)
 }
 
@@ -4238,6 +4353,11 @@ pub fn encode_image_f16(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Rgb) {
+        return with_prepared_config(config, IccTarget::Rgb, |config| {
+            encode_image_f16(input, width, height, config)
+        });
+    }
     encode_float_rgba(input, width, height, false, config, BitsPerSample::F16)
 }
 
@@ -4250,6 +4370,11 @@ pub fn encode_image_with_alpha_f32(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Rgb) {
+        return with_prepared_config(config, IccTarget::Rgb, |config| {
+            encode_image_with_alpha_f32(input, width, height, config)
+        });
+    }
     encode_float_rgba(input, width, height, true, config, BitsPerSample::F32)
 }
 
@@ -4260,6 +4385,11 @@ pub fn encode_image_with_alpha_f16(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Rgb) {
+        return with_prepared_config(config, IccTarget::Rgb, |config| {
+            encode_image_with_alpha_f16(input, width, height, config)
+        });
+    }
     encode_float_rgba(input, width, height, true, config, BitsPerSample::F16)
 }
 
@@ -4271,6 +4401,11 @@ pub fn encode_image_gray_f32(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Gray) {
+        return with_prepared_config(config, IccTarget::Gray, |config| {
+            encode_image_gray_f32(input, width, height, config)
+        });
+    }
     encode_float_gray(input, width, height, config, BitsPerSample::F32)
 }
 
@@ -4281,6 +4416,11 @@ pub fn encode_image_gray_f16(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    if needs_preparing(config, IccTarget::Gray) {
+        return with_prepared_config(config, IccTarget::Gray, |config| {
+            encode_image_gray_f16(input, width, height, config)
+        });
+    }
     encode_float_gray(input, width, height, config, BitsPerSample::F16)
 }
 
@@ -4887,6 +5027,127 @@ fn finalize_container(
     }
 }
 
+/// Which profile an entry point's ICC may be replaced by an enum for.
+#[derive(Clone, Copy)]
+pub(crate) enum IccTarget {
+    Rgb,
+    Gray,
+    /// The profile is part of the pixel format (CMYK): always kept.
+    Keep,
+}
+
+/// The rendering intent to declare when `config`'s ICC profile only restates
+/// its color encoding on an XYB encode, so the header can carry the enum
+/// instead (see [`crate::icc_match`]). Lossless and non-XYB encodes keep
+/// their profile: their samples are in the profile's own space.
+fn describable_icc(config: &EncodeConfig, target: IccTarget) -> Option<RenderingIntent> {
+    let grayscale = match target {
+        IccTarget::Rgb => false,
+        IccTarget::Gray => true,
+        IccTarget::Keep => return None,
+    };
+    if config.lossless || config.coding_transform != CodingTransform::Xyb {
+        return None;
+    }
+    crate::icc_match::matching_intent(
+        config.icc_profile.as_deref()?,
+        &config.color_encoding,
+        grayscale,
+    )
+}
+
+/// Whether an entry point must go through [`with_prepared_config`].
+pub(crate) fn needs_preparing(config: &EncodeConfig, target: IccTarget) -> bool {
+    config.gain_map.is_some() || describable_icc(config, target).is_some()
+}
+
+pub(crate) fn with_prepared_config(
+    config: &EncodeConfig,
+    target: IccTarget,
+    encode: impl FnOnce(&EncodeConfig) -> Result<Vec<u8>, EncodeError>,
+) -> Result<Vec<u8>, EncodeError> {
+    // A malformed gain map fails before the primary is coded; a malformed
+    // primary fails before the gain map is. The two encodes never overlap.
+    if let Some(gain_map) = &config.gain_map {
+        gain_map.validate()?;
+    }
+    let mut inner = config.clone();
+    inner.gain_map = None;
+    if let Some(intent) = describable_icc(config, target) {
+        inner.icc_profile = None;
+        inner.color_encoding.rendering_intent = intent;
+    }
+    let bytes = encode(&inner)?;
+    drop(inner);
+    match encode_gain_map(config)? {
+        Some(gain_map) => attach_gain_map(bytes, &gain_map),
+        None => Ok(bytes),
+    }
+}
+
+/// Add a `jhgm` box to a finished encode: right after the codestream, where
+/// `wrap_jxl_container` puts it, with the level raised to 10 when the gain
+/// map codestream needs it. A bare codestream is wrapped first.
+fn attach_gain_map(bytes: Vec<u8>, gain_map: &EncodedGainMap) -> Result<Vec<u8>, EncodeError> {
+    if !bytes.starts_with(&crate::gain_map::CONTAINER_SIGNATURE) {
+        return finalize_container(bytes, None, None, None, false, Some(gain_map));
+    }
+    let mut out = Vec::with_capacity(bytes.len() + gain_map.bundle.len() + 32);
+    let mut attached = false;
+    let mut leveled = false;
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let malformed = EncodeError::GainMap("internal: malformed container before the gain map");
+        if pos + 8 > bytes.len() {
+            return Err(malformed);
+        }
+        let small = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let kind: [u8; 4] = bytes[pos + 4..pos + 8].try_into().unwrap();
+        let (header, size) = match small {
+            0 => (8, bytes.len() - pos),
+            1 => {
+                if pos + 16 > bytes.len() {
+                    return Err(malformed);
+                }
+                let large = u64::from_be_bytes(bytes[pos + 8..pos + 16].try_into().unwrap());
+                (16, usize::try_from(large).map_err(|_| malformed.clone())?)
+            }
+            n => (8, n),
+        };
+        if size < header || pos + size > bytes.len() {
+            return Err(malformed);
+        }
+        let payload = &bytes[pos + header..pos + size];
+        match &kind {
+            b"jxll" if gain_map.needs_level_10 => {
+                push_container_box(&mut out, b"jxll", &[10]);
+                leveled = true;
+            }
+            // Re-sized explicitly: a box running to the end of the file
+            // (size 0) would swallow the gain map box after it.
+            b"jxlc" => {
+                // The level box precedes the codestream it governs.
+                if gain_map.needs_level_10 && !leveled {
+                    push_container_box(&mut out, b"jxll", &[10]);
+                    leveled = true;
+                }
+                push_container_box(&mut out, b"jxlc", payload);
+                push_container_box(&mut out, b"jhgm", &gain_map.bundle);
+                attached = true;
+            }
+            _ => out.extend_from_slice(&bytes[pos..pos + size]),
+        }
+        pos += size;
+    }
+    if attached {
+        Ok(out)
+    } else {
+        Err(EncodeError::GainMap(
+            "internal: gain map container without a jxlc box",
+        ))
+    }
+}
+
 fn write_int_bit_depth(bits: u32, w: &mut BitWriter) {
     w.write(1, 0); // floating_point_sample = false
     match bits {
@@ -5460,6 +5721,81 @@ mod encode_smoke_tests {
     /// with `EmptyImage`: the lossless core's "learned tree was decisive"
     /// flag was read as success.
     #[test]
+    fn icc_tagged_xyb_encodes_stay_single_frame() {
+        // libjxl cannot blend XYB frames into an ICC-tagged image (it never
+        // decodes to the original space there): with a profile attached,
+        // the ink and crop stacks must not run at all.
+        let rgb = many_ink_half_coverage_fixture();
+        let icc = b"\0\0\x02\x18appl\x04\0\0\0mntrRGB XYZ ".to_vec();
+        let layered_off =
+            |config: EncodeConfig| config.with_ink_layer(false).with_crop_frames(false);
+        // Medium: the ink stack takes the fixture (≈ 0.65 kB vs 8.8 kB plain).
+        let config = EncodeConfig::default()
+            .with_speed(Speed::Medium)
+            .with_distance(1.0)
+            .with_num_threads(1);
+        // The fixture layers when nothing forbids it.
+        let plain = encode_image(&rgb, 256, 256, &config).unwrap();
+        let flat = encode_image(&rgb, 256, 256, &layered_off(config.clone())).unwrap();
+        assert_ne!(plain, flat, "the fixture must take a layered arm");
+        let tagged = config.with_icc_profile(icc);
+        assert!(!tagged.xyb_layers_decodable());
+        assert_eq!(
+            encode_image(&rgb, 256, 256, &tagged).unwrap(),
+            encode_image(&rgb, 256, 256, &layered_off(tagged.clone())).unwrap()
+        );
+    }
+
+    #[test]
+    fn describable_icc_becomes_the_enum_and_keeps_the_layers() {
+        use crate::icc_match::tests::synthetic_profile;
+        let rgb = many_ink_half_coverage_fixture();
+        let config = EncodeConfig::default()
+            .with_speed(Speed::Medium)
+            .with_distance(1.0)
+            .with_num_threads(1);
+        let encode = |config: &EncodeConfig| encode_image(&rgb, 256, 256, config).unwrap();
+        // A perceptual-intent sRGB profile on an sRGB encode: the enum, with
+        // the profile's intent, and the ink stack still runs.
+        let srgb_icc = synthetic_profile(crate::Primaries::Bt709, None, &[], 0);
+        let mut perceptual = config.clone();
+        perceptual.color_encoding.rendering_intent = RenderingIntent::Perceptual;
+        let tagged = encode(&config.clone().with_icc_profile(srgb_icc.clone()));
+        assert_eq!(tagged, encode(&perceptual));
+        assert_ne!(
+            tagged,
+            encode(
+                &perceptual
+                    .clone()
+                    .with_ink_layer(false)
+                    .with_crop_frames(false)
+            )
+        );
+        // A P3 profile on an sRGB encode restates nothing: it is kept, and
+        // the layered arms are off.
+        let p3_icc = synthetic_profile(crate::Primaries::Smpte431, None, &[], 0);
+        let mismatched = config.clone().with_icc_profile(p3_icc);
+        assert_eq!(
+            encode(&mismatched),
+            encode(
+                &mismatched
+                    .clone()
+                    .with_ink_layer(false)
+                    .with_crop_frames(false)
+            )
+        );
+        assert_ne!(encode(&mismatched), encode(&perceptual));
+        // Lossless samples are in the profile's own space: it stays.
+        let lossless = EncodeConfig::default()
+            .with_lossless(true)
+            .with_num_threads(1);
+        assert_ne!(
+            encode(&lossless.clone().with_icc_profile(srgb_icc)),
+            encode(&lossless)
+        );
+    }
+
+    #[test]
     fn ink_frame_without_a_decisive_tree_encodes() {
         let (rgb, width, height) = clipped_text_strip_fixture();
         let pool = crate::thread_pool::ThreadPool::new(1);
@@ -5621,6 +5957,78 @@ mod encode_smoke_tests {
             ]
         );
         assert_eq!(box_payload(&encoded, b"xml "), Some(&b"<x/>"[..]));
+    }
+
+    #[test]
+    fn gain_map_leaves_the_primary_encode_untouched() {
+        // The primary codestream is decided without the gain map (no arm
+        // prices its bytes), and the map is coded once, at the caller's
+        // settings, not at whatever speed or distance an arm runs at.
+        let gm = crate::GainMap::rgb8(
+            (0..W * H * 3).map(|i| (i * 5) as u8).collect(),
+            W,
+            H,
+            gain_map_metadata(),
+        );
+        for config in [lossy(), slow_lossy(1.5), lossless()] {
+            let with = config.clone().with_gain_map(gm.clone());
+            let encoded = encode_image(&rgb8(), W, H, &with).unwrap();
+            let plain = encode_image(&rgb8(), W, H, &config).unwrap();
+            let (codestream, _) = crate::gain_map::strip_container(plain).unwrap();
+            assert_eq!(box_payload(&encoded, b"jxlc"), Some(&codestream[..]));
+            let once = encode_gain_map(&with).unwrap().unwrap();
+            assert_eq!(box_payload(&encoded, b"jhgm"), Some(&once.bundle[..]));
+        }
+    }
+
+    #[test]
+    fn gain_map_attaches_after_a_codestream_box_running_to_the_end() {
+        let mut container = crate::gain_map::CONTAINER_SIGNATURE.to_vec();
+        push_container_box(&mut container, b"ftyp", b"jxl \0\0\0\0jxl ");
+        push_container_box(&mut container, b"jxll", &[5]);
+        container.extend_from_slice(&0u32.to_be_bytes());
+        container.extend_from_slice(b"jxlc");
+        container.extend_from_slice(&[0xFF, 0x0A, 1, 2, 3]);
+        let gain_map = EncodedGainMap {
+            bundle: vec![9, 8, 7],
+            needs_level_10: true,
+        };
+        let out = attach_gain_map(container, &gain_map).unwrap();
+        assert_eq!(
+            box_kinds(&out),
+            [*b"JXL ", *b"ftyp", *b"jxll", *b"jxlc", *b"jhgm"]
+        );
+        assert_eq!(box_payload(&out, b"jxll"), Some(&[10u8][..]));
+        assert_eq!(box_payload(&out, b"jxlc"), Some(&[0xFF, 0x0A, 1, 2, 3][..]));
+        assert_eq!(box_payload(&out, b"jhgm"), Some(&[9u8, 8, 7][..]));
+    }
+
+    #[test]
+    fn gain_map_attach_declares_level_10_when_the_container_has_no_level_box() {
+        let mut container = crate::gain_map::CONTAINER_SIGNATURE.to_vec();
+        push_container_box(&mut container, b"ftyp", b"jxl \0\0\0\0jxl ");
+        push_container_box(&mut container, b"jxlc", &[0xFF, 0x0A, 1]);
+        push_container_box(&mut container, b"Exif", &[0, 0, 0, 0, b'I', b'I']);
+        let level_10 = EncodedGainMap {
+            bundle: vec![9],
+            needs_level_10: true,
+        };
+        let out = attach_gain_map(container.clone(), &level_10).unwrap();
+        assert_eq!(
+            box_kinds(&out),
+            [*b"JXL ", *b"ftyp", *b"jxll", *b"jxlc", *b"jhgm", *b"Exif"]
+        );
+        assert_eq!(box_payload(&out, b"jxll"), Some(&[10u8][..]));
+        // A level-5 gain map adds no level box.
+        let level_5 = EncodedGainMap {
+            bundle: vec![9],
+            needs_level_10: false,
+        };
+        let out = attach_gain_map(container, &level_5).unwrap();
+        assert_eq!(
+            box_kinds(&out),
+            [*b"JXL ", *b"ftyp", *b"jxlc", *b"jhgm", *b"Exif"]
+        );
     }
 
     #[test]
@@ -5947,7 +6355,6 @@ mod encode_smoke_tests {
         px
     }
 
-    #[cfg(feature = "splines")]
     fn slow_lossy(distance: f32) -> EncodeConfig {
         EncodeConfig::default()
             .with_distance(distance)
