@@ -224,7 +224,6 @@ fn select_transfer(transfer: TransferFunction) -> TransferFn {
 /// Decode a normalized source sample to linear light according to its declared
 /// transfer function. Selection is factored out for block-oriented hot paths.
 #[inline]
-#[cfg(test)]
 pub(crate) fn transfer_to_linear_f32(v: f32, transfer: TransferFunction) -> f32 {
     select_transfer(transfer)(v)
 }

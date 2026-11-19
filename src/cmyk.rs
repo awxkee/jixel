@@ -113,6 +113,12 @@ fn encode_cmyk_impl<T: CmykSample + crate::encode_image::AsSignedInt>(
     convention: InkConvention,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
+    use crate::encode_image::{IccTarget, needs_preparing, with_prepared_config};
+    if needs_preparing(config, IccTarget::Keep) {
+        return with_prepared_config(config, IccTarget::Keep, |config| {
+            encode_cmyk_impl(input, width, height, bits, icc_profile, convention, config)
+        });
+    }
     if width == 0 || height == 0 {
         return Err(EncodeError::EmptyImage);
     }

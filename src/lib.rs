@@ -80,6 +80,7 @@ mod gain_map;
 mod group;
 mod haar;
 mod icc_codec;
+mod icc_match;
 mod image;
 mod inflated_cost;
 mod ink_layer;
