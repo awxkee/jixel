@@ -114,12 +114,14 @@ pub(super) fn write_frame_header_modular_kind(
             y0,
             width,
             height,
+            full,
             last,
         } => write_frame_header_modular_crop(
             has_alpha,
             false,
             [x0, y0, width, height],
             layout,
+            full,
             last,
             w,
         ),
@@ -128,12 +130,14 @@ pub(super) fn write_frame_header_modular_kind(
             y0,
             width,
             height,
+            full,
             last,
         } => write_frame_header_modular_crop(
             has_alpha,
             true,
             [x0, y0, width, height],
             layout,
+            full,
             last,
             w,
         ),
@@ -322,12 +326,14 @@ pub(super) fn write_frame_header_modular(has_alpha: bool, layout: GroupLayout, w
 /// Frame header of a region frame: a regular modular frame cropped to
 /// `rect` (x0, y0, width, height), kReplace over reference slot 0; the
 /// composite goes back to slot 0 unless this is the last frame. A partial
-/// frame always signals its source and never `save_before_color_transform`.
+/// frame always signals its source and never `save_before_color_transform`;
+/// a `full` one (the rectangle covers the whole image) is the reverse.
 fn write_frame_header_modular_crop(
     has_alpha: bool,
     xyb_encoded: bool,
     rect: [usize; 4],
     layout: GroupLayout,
+    full: bool,
     last: bool,
     w: &mut BitWriter,
 ) {
@@ -352,13 +358,18 @@ fn write_frame_header_modular_crop(
     write_frame_dimension(rect[3], w);
     for _ in 0..1 + usize::from(has_alpha) {
         w.write(2, 0b00); // blending = Replace
-        w.write(2, 0); // source = 0
+        if !full {
+            w.write(2, 0); // source = 0
+        }
     }
     if last {
         w.write(1, 1); // is_last
     } else {
         w.write(1, 0); // not the last frame
         w.write(2, 0); // save_as_reference = 0
+        if full {
+            w.write(1, 0); // save_before_color_transform = false
+        }
     }
     w.write(2, 0b00); // name length = 0
     w.write(1, 0); // loop_filter NOT all_default
@@ -621,6 +632,41 @@ pub(crate) fn write_toc_entry(byte_len: usize, w: &mut BitWriter) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A kReplace crop covering the whole image is not a partial frame: the
+    /// decoder reads no source field, and reads
+    /// `save_before_color_transform` when the frame is saved.
+    #[test]
+    fn whole_image_crop_header_follows_full_frame_syntax() {
+        let bits = |has_alpha: bool, full: bool, last: bool| {
+            let mut w = BitWriter::new();
+            write_frame_header_modular_kind(
+                has_alpha,
+                ModularFrameKind::XybCrop {
+                    x0: 0,
+                    y0: 0,
+                    width: 128,
+                    height: 128,
+                    full,
+                    last,
+                },
+                GroupLayout::DEFAULT,
+                &mut w,
+            );
+            w.bits_written()
+        };
+        for has_alpha in [false, true] {
+            let sources = 2 * (1 + usize::from(has_alpha));
+            assert_eq!(
+                bits(has_alpha, true, true) + sources,
+                bits(has_alpha, false, true)
+            );
+            assert_eq!(
+                bits(has_alpha, true, false) + sources,
+                bits(has_alpha, false, false) + 1
+            );
+        }
+    }
 
     fn entry(positions: Vec<(usize, usize)>, add: bool) -> PatchReference {
         PatchReference {

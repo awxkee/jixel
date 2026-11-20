@@ -91,8 +91,9 @@ pub(crate) struct Pyramid {
     /// channel at that index + 1 holds the indices.
     pub(crate) palette: Option<usize>,
     /// A crop frame over reference slot 0: the rectangle's origin in the
-    /// image and whether the frame is the last one.
-    pub(crate) crop: Option<([usize; 2], bool)>,
+    /// image, whether it covers the whole image and whether the frame is
+    /// the last one.
+    pub(crate) crop: Option<([usize; 2], bool, bool)>,
 }
 
 /// Luma step multipliers by squeeze level (shift sum 1..=6, coarser levels
@@ -498,12 +499,13 @@ impl Pyramid {
     pub(crate) fn write_frame_header(&self, w: &mut BitWriter) {
         if self.dc_frame {
             write_dc_frame_header(w);
-        } else if let Some((origin, last)) = self.crop {
+        } else if let Some((origin, full, last)) = self.crop {
             super::layout::write_xyb_crop_frame_header(
                 self.epf,
                 self.group_shift,
                 origin,
                 [self.xsize, self.ysize],
+                full,
                 last,
                 w,
             );

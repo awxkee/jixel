@@ -942,6 +942,8 @@ pub(crate) enum ModularFrameKind<'a> {
         y0: usize,
         width: usize,
         height: usize,
+        /// The rectangle covers the whole image.
+        full: bool,
         last: bool,
     },
     /// A crop frame of an `xyb_encoded` codestream (see `crop_frames`): the
@@ -953,6 +955,8 @@ pub(crate) enum ModularFrameKind<'a> {
         y0: usize,
         width: usize,
         height: usize,
+        /// The rectangle covers the whole image.
+        full: bool,
         last: bool,
     },
     /// The last frame of a cell-layer codestream (see `cell_layer`): a crop

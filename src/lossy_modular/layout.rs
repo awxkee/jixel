@@ -145,12 +145,16 @@ fn write_xyb_frame_header(epf: (u32, f32), patched: bool, group_shift: u32, w: &
 
 /// Cropped modular frame of the lossy codestream: the rectangle at `origin`
 /// replaces reference slot 0 there and, unless `last`, the result goes back
-/// to slot 0 (a crop frame over a saved base, see `crop_frames`).
+/// to slot 0 (a crop frame over a saved base, see `crop_frames`). `full`
+/// marks a rectangle covering the whole image: a kReplace frame that is not
+/// partial has no source field and, when saved, signals
+/// `save_before_color_transform`.
 pub(super) fn write_xyb_crop_frame_header(
     epf: (u32, f32),
     group_shift: u32,
     origin: [usize; 2],
     size: [usize; 2],
+    full: bool,
     last: bool,
     w: &mut BitWriter,
 ) {
@@ -167,12 +171,17 @@ pub(super) fn write_xyb_crop_frame_header(
     write_frame_dimension(size[0], w);
     write_frame_dimension(size[1], w);
     w.write(2, 0b00); // blending = Replace
-    w.write(2, 0); // source = 0
+    if !full {
+        w.write(2, 0); // source = 0
+    }
     if last {
         w.write(1, 1); // is_last
     } else {
         w.write(1, 0); // not the last frame
         w.write(2, 0); // save_as_reference = 0
+        if full {
+            w.write(1, 0); // save_before_color_transform = false
+        }
     }
     w.write(2, 0b00); // name length = 0
     write_loop_filter(epf, w);
@@ -254,5 +263,24 @@ fn write_xyb_dc_quant(w: &mut BitWriter) {
     for scale in XYB_SCALE {
         let step_x128 = 128.0 / scale;
         w.write(16, f32_to_f16_bits(step_x128) as u64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A kReplace crop covering the whole image is not a partial frame: the
+    /// decoder reads no source field, and reads
+    /// `save_before_color_transform` when the frame is saved.
+    #[test]
+    fn whole_image_crop_header_follows_full_frame_syntax() {
+        let bits = |full: bool, last: bool| {
+            let mut w = BitWriter::new();
+            write_xyb_crop_frame_header((0, 0.0), 1, [0, 0], [128, 128], full, last, &mut w);
+            w.bits_written()
+        };
+        assert_eq!(bits(true, true) + 2, bits(false, true));
+        assert_eq!(bits(true, false) + 2, bits(false, false) + 1);
     }
 }

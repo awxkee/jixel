@@ -1056,7 +1056,7 @@ pub(super) fn spline_quant_field(
 /// only when together they cover this share of the frame, or when the plan
 /// with them wins the bit race up to the race distance.
 pub(super) const GLYPH_SINGLETON_FREE_MAX_DISTANCE: f32 = 1.0;
-pub(super) const GLYPH_SINGLETON_RACE_MAX_DISTANCE: f32 = 2.0;
+pub(super) const GLYPH_SINGLETON_RACE_MAX_DISTANCE: f32 = 16.0;
 const GLYPH_SINGLETON_MIN_COVER: f64 = 0.5;
 /// A glyph must differ from its background by this many lattice rounding
 /// steps somewhere; fainter shapes are shading the base codes for less.
@@ -1070,11 +1070,7 @@ const GLYPH_CHECK_ATLAS_SHARE: f64 = 0.35;
 /// Patched bits may exceed the frame's without tiles by this factor.
 pub(super) const GLYPH_BITS_MARGIN: f64 = 1.10;
 /// The frame without any patches stands as soon as its estimate is the
-/// smaller one. Both outcomes forced on 92 race points of 24 graphics
-/// images: with the plain estimate smaller the plain frame was also at
-/// least as good at 19-21 of 25 points (patches there cost 2.3-3.2 % at
-/// equal SSIMULACRA2 and Butteraugli, the worst miss of plain 0.4 %), and
-/// every plan that pays (to 30 %) estimates below 0.95 of the plain frame.
+/// smaller one.
 pub(super) const UNPATCHED_BITS_MARGIN: f64 = 1.0;
 /// A lattice arm must stay under this share of the best tile/glyph plan's bits.
 pub(super) const LATTICE_BITS_MARGIN: f64 = 0.5;
