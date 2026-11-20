@@ -565,6 +565,9 @@ pub struct EncodeConfig {
     /// The templated arm of the glyph-template race: glyph searches build
     /// templates (frames carry the declared opaque alpha).
     pub(crate) templates_active: bool,
+    /// `patches` came from the speed tier's lite default, not from
+    /// `with_patches`: lossy frames only, without the Slow-tier races.
+    pub(crate) patches_lite: bool,
     /// The plain arm of the glyph-template race: glyph searches report how
     /// many shapes templates could share.
     pub(crate) template_probe: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
@@ -716,6 +719,7 @@ impl Default for EncodeConfig {
             coding_transform: CodingTransform::Xyb,
             grain: Grain::Off,
             templates_active: false,
+            patches_lite: false,
             template_probe: None,
         }
     }
@@ -878,6 +882,7 @@ impl EncodeConfigImpl {
 
     /// Copy frame settings from a public `EncodeConfig`.
     pub(crate) fn with_progressive_from(self, config: &EncodeConfig) -> Self {
+        let lossless = self.lossless;
         #[cfg(feature = "splines")]
         let this = self
             .with_splines(config.splines)
@@ -888,7 +893,7 @@ impl EncodeConfigImpl {
         this.with_progressive(config.progressive)
             .with_grain(config.grain)
             .with_fill_invisible(config.fill_invisible)
-            .with_patches(config.patches)
+            .with_patches(config.patches_in(lossless))
             .with_progressive_passes(config.progressive_passes)
             .with_progressive_shifts(config.progressive_shifts.clone())
             .with_speed(config.speed)
@@ -1094,7 +1099,14 @@ impl EncodeConfig {
     /// Enable exact patch-dictionary matching with full rate comparison.
     pub fn with_patches(mut self, patches: bool) -> Self {
         self.patches = patches;
+        self.patches_lite = false;
         self
+    }
+
+    /// Patches for a lossless (`true`) or lossy frame: the lite default
+    /// covers lossy frames only.
+    pub(crate) fn patches_in(&self, lossless: bool) -> bool {
+        self.patches && !(lossless && self.patches_lite)
     }
 
     /// Fit the edge-preserving filter with glyph patches in the reconstruction
@@ -1251,13 +1263,21 @@ impl EncodeConfig {
     /// [`EncodeConfig::glyph_templates`], [`EncodeConfig::patch_epf`],
     /// [`EncodeConfig::vector_layers`] and
     /// [`EncodeConfig::crop_frames`]; [`Speed::Medium`] and above turn on
-    /// [`EncodeConfig::ink_layer`].
+    /// [`EncodeConfig::ink_layer`]. [`Speed::Medium`] and
+    /// [`Speed::MediumSlow`] turn on a lite form of
+    /// [`EncodeConfig::patches`] for lossy encodes (no lattice search,
+    /// templates or patch EPF; lossless encodes keep patches off);
+    /// [`EncodeConfig::with_patches`] after this call overrides it.
     pub fn with_speed(mut self, speed: Speed) -> Self {
         self.speed = speed;
         if speed.effort().patches_default {
             self.patches = true;
             self.glyph_templates = true;
             self.patch_epf = true;
+            self.patches_lite = false;
+        } else if speed.effort().patches_lite_default && !self.patches {
+            self.patches = true;
+            self.patches_lite = true;
         }
         if speed.effort().ink_layer_default {
             self.ink_layer = true;
@@ -1375,8 +1395,9 @@ pub(crate) fn lossy_context(
     ctx.extra_learned_trees = alpha_learned_trees(config);
     ctx.extra_plane_tree = alpha_plane_tree(config.speed, config.decoding_speed);
     ctx.extra_context_trees = config.decoding_speed != DecodingSpeed::Fastest;
-    ctx.alpha_patches = config.patches;
+    ctx.alpha_patches = config.patches && !config.patches_lite;
     ctx.patch_epf = config.patch_epf;
+    ctx.patch_lite = config.patches_lite;
     ctx.glyph_templates = config.templates_active && config.patches;
     ctx.template_probe = config.template_probe.clone();
     // The representation is color-agnostic: the plane is judged against its
@@ -1636,7 +1657,7 @@ fn encode_image_rgb(
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(config.lossless)
                 .with_progressive(config.progressive)
-                .with_patches(config.patches)
+                .with_patches(config.patches_in(config.lossless))
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
                 .with_gain_map(encode_gain_map(config)?)
@@ -3278,7 +3299,7 @@ pub fn encode_image_with_alpha(
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(config.lossless)
                 .with_progressive(config.progressive)
-                .with_patches(config.patches)
+                .with_patches(config.patches_in(config.lossless))
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
                 .with_gain_map(encode_gain_map(config)?)
@@ -3676,7 +3697,7 @@ fn encode_gray_impl<const CHANNELS: usize>(
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(true)
                 .with_grayscale(true)
-                .with_patches(config.patches)
+                .with_patches(config.patches_in(true))
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
                 .with_gain_map(encode_gain_map(config)?)
@@ -3890,7 +3911,7 @@ fn encode_gray_high_depth_impl<const CHANNELS: usize>(
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(true)
                 .with_grayscale(true)
-                .with_patches(config.patches)
+                .with_patches(config.patches_in(true))
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
@@ -3988,7 +4009,7 @@ fn encode_high_depth_rgba(
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(config.lossless)
                 .with_bits_per_sample(bps)
-                .with_patches(config.patches)
+                .with_patches(config.patches_in(config.lossless))
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
                 .with_gain_map(encode_gain_map(config)?)

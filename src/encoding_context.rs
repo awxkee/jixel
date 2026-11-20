@@ -145,6 +145,10 @@ pub(crate) struct EncodingContext {
     /// template (color and coverage) in frames that carry an 8-bit alpha
     /// channel (see `EncodeConfig::glyph_templates`).
     pub(crate) glyph_templates: bool,
+    /// Patches were turned on by the speed tier's lite default
+    /// (`Effort::patches_lite_default`): no lattice search, and unrepeated
+    /// glyphs race only in frames that have repeated ones.
+    pub(crate) patch_lite: bool,
     /// Receives the most atlas area (pixels) any glyph search's templates
     /// would save over exact patches.
     pub(crate) template_probe: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
@@ -656,6 +660,7 @@ impl EncodingContext {
             patch_epf: false,
             epf_overlay: None,
             glyph_templates: false,
+            patch_lite: false,
             template_probe: None,
             function_fields: false,
             function_fields_layered: false,

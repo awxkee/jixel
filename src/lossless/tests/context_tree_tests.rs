@@ -192,7 +192,9 @@ fn compiled_ma_tokenization_matches_full_tree_with_and_without_wp() {
                     .map(|i| (((i * 7919) ^ (i / 7 * 1237)) % 65536) as i32 - 32768)
                     .collect();
                 let get_row = |y| &values[y * width..][..width];
-                for (use_wp, shifted) in [(false, false), (true, false), (false, true), (true, true)] {
+                for (use_wp, shifted) in
+                    [(false, false), (true, false), (false, true), (true, true)]
+                {
                     // Leaf offsets move a residual before it is packed.
                     let offsets: Vec<i32> = (0..contexts.len() as i32)
                         .map(|i| if shifted { i % 5 - 2 } else { 0 })
@@ -213,7 +215,9 @@ fn compiled_ma_tokenization_matches_full_tree_with_and_without_wp() {
                             let residual = (value - predictor_value(pred, n, wp)) as i32;
                             expected.push((
                                 context,
-                                pack_signed(residual - offsets.get(context as usize).map_or(0, |&o| o)),
+                                pack_signed(
+                                    residual - offsets.get(context as usize).map_or(0, |&o| o),
+                                ),
                             ));
                         },
                     );

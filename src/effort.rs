@@ -177,6 +177,10 @@ effort_gates! {
     lossy_modular_auto,
     splines,
     patches_default,
+    /// Lossy encodes turn `EncodeConfig::patches` on in its lite form
+    /// (glyph and tile patches without the lattice search; no templates, no
+    /// patch EPF) at this speed.
+    patches_lite_default,
     /// `EncodeConfig::ink_layer` is on by default at this speed.
     ink_layer_default,
     /// `EncodeConfig::vector_layers` is on by default at this speed.
@@ -351,6 +355,7 @@ static MEDIUM: Effort = Effort {
     chroma_dc_squeeze: true,
     dc_x_cfl: true,
     ink_layer_default: true,
+    patches_lite_default: true,
     clip_continuation: true,
     lz_deep: true,
     lz_refined_entropy: true,
