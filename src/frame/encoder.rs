@@ -233,14 +233,17 @@ pub(crate) fn encode_frame(
 }
 
 /// A lossy-modular crop frame over the saved base (see `crop_frames`): the
-/// rectangle `linear` at `origin`, at the arm's calibrated distance for
-/// `distance`. None when the rectangle is too small to squeeze.
+/// rectangle `linear` at `origin` (`full` when it covers the whole image),
+/// at the arm's calibrated distance for `distance`. None when the rectangle
+/// is too small to squeeze.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_modular_crop_frame(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
     distance: f32,
     linear: Image3F,
     origin: [usize; 2],
+    full: bool,
     last: bool,
     writer: &mut BitWriter,
 ) -> Option<usize> {
@@ -253,6 +256,7 @@ pub(crate) fn encode_modular_crop_frame(
         modular_distance,
         screen,
         origin,
+        full,
         last,
         ctx.speed,
         &ctx.thread_pool,

@@ -417,6 +417,29 @@ mod tests {
         }
     }
 
+    /// A small image of nothing but strokes plans one box over all of it:
+    /// its crop frame is then a full frame (see the crop header writers).
+    #[test]
+    fn plan_detail_can_take_the_whole_image() {
+        let (w, h) = (128, 128);
+        let mut rgb = vec![250u8; w * h * 3];
+        for (i, px) in rgb.chunks_exact_mut(3).enumerate() {
+            let (x, y) = (i % w, i / w);
+            if y % 7 < 4 && (x + y / 7) % 5 < 2 {
+                px.fill(20);
+            }
+        }
+        assert_eq!(
+            plan_detail(&rgb, w, h, &[]),
+            vec![CropBox {
+                x0: 0,
+                y0: 0,
+                width: w,
+                height: h
+            }]
+        );
+    }
+
     #[test]
     fn plan_detail_leaves_saturated_strokes_noise_and_taken_boxes() {
         let (w, h) = (448, 320);

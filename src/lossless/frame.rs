@@ -317,6 +317,7 @@ impl FrameCoder<'_, '_> {
                     y0: r.y0,
                     width: r.width,
                     height: r.height,
+                    full: r.width == split.base.xsize() && r.height == split.base.ysize(),
                     last: i + 1 == split.regions.len(),
                 },
                 true,

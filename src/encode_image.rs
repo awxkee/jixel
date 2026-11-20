@@ -2832,6 +2832,7 @@ fn encode_crop_stack(
                 y0: b.y0,
                 width: b.width,
                 height: b.height,
+                full: b.width == width && b.height == height,
                 last,
             },
             speed,
@@ -2857,6 +2858,7 @@ fn encode_crop_stack(
             distance,
             linear,
             [b.x0, b.y0],
+            b.width == width && b.height == height,
             last,
             &mut frame,
         )?;
