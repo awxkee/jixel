@@ -179,7 +179,7 @@ impl GroupLayout {
 
     /// The frame header's U32(1, 2, 4, 8) selector of `upsampling`.
     pub(crate) const fn upsampling_selector(self) -> u64 {
-        (self.upsampling.trailing_zeros()) as u64
+        self.upsampling.trailing_zeros() as u64
     }
 
     pub(crate) const fn dim(self) -> usize {

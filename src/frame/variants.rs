@@ -1054,9 +1054,10 @@ pub(super) fn spline_quant_field(
 
 /// Unrepeated glyphs join the atlas freely up to this distance; above it
 /// only when together they cover this share of the frame, or when the plan
-/// with them wins the bit race up to the race distance.
+/// with them wins the bit race: at any distance on a frame whose estimate
+/// is trusted, up to the race distance elsewhere.
 pub(super) const GLYPH_SINGLETON_FREE_MAX_DISTANCE: f32 = 1.0;
-pub(super) const GLYPH_SINGLETON_RACE_MAX_DISTANCE: f32 = 16.0;
+pub(super) const GLYPH_SINGLETON_RACE_MAX_DISTANCE: f32 = 2.0;
 const GLYPH_SINGLETON_MIN_COVER: f64 = 0.5;
 /// A glyph must differ from its background by this many lattice rounding
 /// steps somewhere; fainter shapes are shading the base codes for less.

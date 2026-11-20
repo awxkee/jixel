@@ -143,9 +143,13 @@ pub(super) fn encode_frame_vardct(
     // The race arm skips spline selection, which only costs it bits; a
     // winner is rebuilt with splines.
     // The lite tier races unrepeated glyphs only where repeated ones exist.
+    // Past the race distance only frames whose estimate tracks real bytes
+    // race: under an ink layer it accepts a larger base.
+    let estimate_trusted =
+        ctx.frame_role == crate::encoding_context::FrameRole::Last || ctx.crop_base;
     if (!ctx.patch_lite || glyphs.is_some())
         && distance > GLYPH_SINGLETON_FREE_MAX_DISTANCE
-        && distance <= GLYPH_SINGLETON_RACE_MAX_DISTANCE
+        && (estimate_trusted || distance <= GLYPH_SINGLETON_RACE_MAX_DISTANCE)
         && let Some(singles) =
             GlyphStage::find(ctx, scratch, distance, &xyb, alpha, true, retain_epf_luma)
     {
