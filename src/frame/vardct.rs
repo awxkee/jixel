@@ -102,7 +102,13 @@ pub(super) fn encode_frame_vardct(
 
     // Compare bounded residual samples plus the actual atlas, dictionary and
     // spline costs. Only the selected plan receives a full-frame encode.
-    let lattice = crate::lattice_patches::find(&xyb);
+    // The lite tier (see `EncodingContext::patch_lite`) skips the lattice
+    // search: it is the one patch stage a photo pays for.
+    let lattice = if ctx.patch_lite {
+        None
+    } else {
+        crate::lattice_patches::find(&xyb)
+    };
     let retain_epf_luma = ctx.patch_epf
         && super::vardct_encoder::epf_fit_enabled(ctx, distance)
         && !ctx.progressive_dc
@@ -136,7 +142,9 @@ pub(super) fn encode_frame_vardct(
     // plan with them that is also smaller dominates the repeated-only one.
     // The race arm skips spline selection, which only costs it bits; a
     // winner is rebuilt with splines.
-    if distance > GLYPH_SINGLETON_FREE_MAX_DISTANCE
+    // The lite tier races unrepeated glyphs only where repeated ones exist.
+    if (!ctx.patch_lite || glyphs.is_some())
+        && distance > GLYPH_SINGLETON_FREE_MAX_DISTANCE
         && distance <= GLYPH_SINGLETON_RACE_MAX_DISTANCE
         && let Some(singles) =
             GlyphStage::find(ctx, scratch, distance, &xyb, alpha, true, retain_epf_luma)
