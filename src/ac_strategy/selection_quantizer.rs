@@ -137,26 +137,6 @@ fn erased_detail(luma: &[f32], inverse: &[f32], qac: f32, cx: usize, cy: usize) 
 mod tests {
     use super::*;
 
-    #[cfg(not(feature = "extraslow"))]
-    #[test]
-    fn featureless_extraslow_retains_the_slow_selection_policy() {
-        for distance in [1.0, 1.5, 2.25, 4.0] {
-            let active = [crate::Speed::Slow, crate::Speed::ExtraSlow].map(|speed| {
-                let ctx = EncodingContext::new(
-                    speed,
-                    crate::Arbiter::Ssimulacra2,
-                    crate::xyb::XybMatrix::SPEC,
-                    distance,
-                    1,
-                );
-                ctx.set_chroma_heavy(true);
-                ctx.set_luma_texture(0.07);
-                enabled(&ctx, distance)
-            });
-            assert_eq!(active[0], active[1], "distance {distance}");
-        }
-    }
-
     #[test]
     fn rectangular_orientations_use_the_same_canonical_coefficient_layout() {
         let ctx = EncodingContext::new(

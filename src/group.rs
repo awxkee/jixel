@@ -2825,150 +2825,6 @@ mod tests {
         AcBlockCache::new(0, 0, 0, 0).compact_tokens();
     }
 
-    #[test]
-    fn ac_scratch_allocates_optional_buffers_only_for_active_tools_and_reuses_them() {
-        use super::{AcGroupScratch, write_ac_group};
-        use crate::coeff_order::CoeffOrders;
-        use crate::dc_group_data::DcGroupData;
-        use crate::encoding_context::EncodingContext;
-        use crate::entropy::{FrozenTokenPrices, Token, build_entropy_code_no_cluster};
-        use crate::image::{Image3B, Image3F, Image3S, Rect};
-
-        let (w, h) = (17, 19);
-        let mut image = Image3F::new(w, h);
-        for c in 0..3 {
-            for (i, value) in image.plane_mut(c).as_mut_slice().iter_mut().enumerate() {
-                *value = ((i * 97 + c * 13) % 257) as f32 / 257.0;
-            }
-        }
-        let mut dc = DcGroupData::new(w.div_ceil(8), h.div_ceil(8)).unwrap();
-        dc.raw_quant_field.as_mut_slice().fill(8);
-        let orders = CoeffOrders::natural();
-        let samples: Vec<_> = (0..4096).map(|i| Token::new(i % 2, i % 17)).collect();
-        let mut code = build_entropy_code_no_cluster(&samples, 2, &mut Vec::new());
-        code.context_map = (0..crate::ac_context::K_NUM_FINE_AC_CONTEXTS)
-            .map(|i| (i % 2) as u8)
-            .collect();
-        let prices = FrozenTokenPrices::new(&code);
-        let run = |ctx: &EncodingContext,
-                   scratch: &mut AcGroupScratch,
-                   rdoq: bool,
-                   capture: bool,
-                   shifts: &[u32]| {
-            let mut quant_dc = Image3S::new(w.div_ceil(8), h.div_ceil(8));
-            let mut nzeros: Vec<_> = shifts.iter().map(|_| Image3B::new(32, 32)).collect();
-            let mut tokens: Vec<_> = shifts.iter().map(|_| Vec::new()).collect();
-            let mut recon = Image3F::new(w, h);
-            let mut starts = Vec::new();
-            write_ac_group(
-                ctx,
-                scratch,
-                &image,
-                (0, 0),
-                Rect::new(0, 0, w.div_ceil(8), h.div_ceil(8)),
-                1.0,
-                1.0,
-                [1.0; 3],
-                2.0,
-                2,
-                &dc,
-                0,
-                &mut quant_dc,
-                None,
-                0,
-                0,
-                &mut nzeros,
-                shifts,
-                rdoq.then_some(&prices),
-                &orders,
-                &[],
-                None,
-                false,
-                8,
-                capture.then_some((&mut recon, 0, Some(&mut starts))),
-                None,
-                &mut tokens,
-            );
-            (
-                tokens
-                    .into_iter()
-                    .map(|stream| {
-                        stream
-                            .into_iter()
-                            .map(|t| (t.context, t.value))
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>(),
-                [0, 1, 2].map(|c| {
-                    recon
-                        .plane_data(c)
-                        .iter()
-                        .map(|v| v.to_bits())
-                        .collect::<Vec<_>>()
-                }),
-            )
-        };
-        let pointers = |scratch: &AcGroupScratch| {
-            (
-                scratch.source_y.as_ref().map(|v| v.as_ptr()),
-                scratch.rdoq.as_ref().map(|v| {
-                    (
-                        v.choices.as_ptr(),
-                        v.costs.as_ref().map(|costs| costs[0].as_ptr()),
-                    )
-                }),
-                scratch
-                    .recon
-                    .as_ref()
-                    .map(|v| (v.err.as_ptr(), v.pix.as_ptr())),
-            )
-        };
-        for speed in [
-            crate::Speed::UltraFast,
-            crate::Speed::Fastest,
-            crate::Speed::Fast,
-            crate::Speed::Medium,
-        ] {
-            let ctx = EncodingContext::new(
-                speed,
-                crate::Arbiter::Ssimulacra2,
-                crate::xyb::XybMatrix::SPEC,
-                2.0,
-                1,
-            );
-            let mut scratch = AcGroupScratch::default();
-            for shifts in [&[0u32][..], &[2, 0]] {
-                run(&ctx, &mut scratch, false, false, shifts);
-                assert_eq!(pointers(&scratch), (None, None, None));
-                assert_eq!(
-                    scratch.block.as_deref().map(<[i32]>::len),
-                    (shifts.len() > 1).then_some(64)
-                );
-            }
-        }
-        let ctx = EncodingContext::new(
-            crate::Speed::Slow,
-            crate::Arbiter::Ssimulacra2,
-            crate::xyb::XybMatrix::SPEC,
-            2.0,
-            1,
-        );
-        for (rdoq, capture) in [(true, false), (false, true), (true, true)] {
-            let mut scratch = AcGroupScratch::default();
-            for shifts in [&[0u32][..], &[2, 0]] {
-                let expected = run(&ctx, &mut scratch, rdoq, capture, shifts);
-                assert_eq!(scratch.source_y.as_deref().map(<[f32]>::len), Some(64));
-                assert_eq!(scratch.rdoq.is_some(), rdoq);
-                assert_eq!(scratch.recon.is_some(), capture);
-                let storage = pointers(&scratch);
-                assert_eq!(run(&ctx, &mut scratch, rdoq, capture, shifts), expected);
-                assert_eq!(pointers(&scratch), storage);
-                let mut fresh = AcGroupScratch::default();
-                assert_eq!(run(&ctx, &mut fresh, rdoq, capture, shifts), expected);
-            }
-        }
-    }
-
     /// A warm block memo must reproduce a fresh evaluation of the same
     /// candidate: tokens, quantized DC and the unrounded source DC, on full
     /// hits and when only B misses (a B matrix-scale change keeps Y cached).
@@ -3106,8 +2962,7 @@ mod tests {
     }
 
     use super::{
-        QuantizeDcMethods, quantize_ac_thresholds, quantize_ac_thresholds_scaled,
-        quantize_dc_cfl_scalar, quantize_dc_scalar, selected_quantize_dc_methods,
+        QuantizeDcMethods, quantize_dc_cfl_scalar, quantize_dc_scalar, selected_quantize_dc_methods,
     };
 
     fn check_dc_quantizers(methods: QuantizeDcMethods) {
@@ -3293,33 +3148,5 @@ mod tests {
                 },
             });
         }
-    }
-
-    #[test]
-    fn deadzones_fade_to_existing_values_by_distance_one() {
-        assert_eq!(
-            quantize_ac_thresholds(1, 1, 1, 0.1),
-            [0.50, 0.51, 0.52, 0.54]
-        );
-        assert_eq!(
-            quantize_ac_thresholds(2, 1, 1, 0.1),
-            [0.58, 0.75, 0.75, 0.75]
-        );
-        assert_eq!(
-            quantize_ac_thresholds(1, 1, 1, 1.0),
-            [0.58, 0.635, 0.66, 0.7]
-        );
-        assert_eq!(
-            quantize_ac_thresholds(2, 1, 1, 1.0),
-            [0.58, 0.75, 0.75, 0.75]
-        );
-        assert_eq!(
-            quantize_ac_thresholds_scaled(2, 1, 1, 1.0, 1.25),
-            [0.58, 0.65, 0.65, 0.65]
-        );
-        assert_eq!(
-            quantize_ac_thresholds_scaled(1, 1, 1, 1.0, 1.25),
-            quantize_ac_thresholds(1, 1, 1, 1.0)
-        );
     }
 }

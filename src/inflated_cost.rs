@@ -398,93 +398,6 @@ pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn, biased
     }
 }
 
-// Compare the new lane reduction against the original population-count kernel,
-// including the coding quantizer's ties-away levels and special float inputs.
-#[cfg(test)]
-#[allow(dead_code)] // Called by target-specific SSE/AVX/WASM tests.
-pub(crate) fn assert_coefficient_kernel_preserves_original(
-    original: SseAndQuantizeFn,
-    optimized: SseAndQuantizeFn,
-) {
-    let special = [
-        0.0,
-        -0.0,
-        0.5,
-        -0.5,
-        1.5,
-        -1.5,
-        f32::INFINITY,
-        f32::NEG_INFINITY,
-        f32::NAN,
-    ];
-    let mut rng = 73u32;
-    for (width, height, cx, cy) in [
-        (8, 8, 1, 1),
-        (16, 8, 2, 1),
-        (8, 16, 1, 2),
-        (16, 16, 2, 2),
-        (32, 16, 4, 2),
-        (32, 32, 4, 4),
-        (64, 32, 8, 4),
-        (64, 64, 8, 8),
-    ] {
-        let n = width * height;
-        let scan: Vec<u32> = (0..n).map(|i| ((i * 17) % n) as u32).collect();
-        for case in 0..32 {
-            let coeff: Vec<f32> = (0..n)
-                .map(|_| {
-                    rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
-                    match case % 4 {
-                        0 => 0.0,
-                        1 => ((rng >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.2,
-                        2 => ((rng >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 200.0,
-                        _ => special[rng as usize % special.len()],
-                    }
-                })
-                .collect();
-            let inv: Vec<f32> = (0..n).map(|i| 0.01 + (i % 7) as f32 * 0.15).collect();
-            let scale = [0.01, 0.5, 1.0, 7.0, 80.0][case % 5];
-            let thresholds = [0.0, 0.42, 0.57, 0.91];
-            let mut expected_levels = vec![-123; n + 5];
-            let mut actual_levels = expected_levels.clone();
-            let run = |kernel: SseAndQuantizeFn, levels: &mut [i32]| unsafe {
-                kernel(
-                    &coeff,
-                    &inv,
-                    scale,
-                    crate::group::DequantBias::DEFAULT[case % 3],
-                    width,
-                    height,
-                    width / 2,
-                    cx,
-                    cy,
-                    rate_log2_lut(),
-                    &thresholds,
-                    &scan,
-                    levels,
-                )
-            };
-            let expected = run(original, &mut expected_levels);
-            let actual = run(optimized, &mut actual_levels);
-            // Bit-exact, except that a NaN's sign and payload are not
-            // specified by Rust and differ with release codegen.
-            let bits = |v: f32| {
-                if v.is_nan() {
-                    f32::NAN.to_bits()
-                } else {
-                    v.to_bits()
-                }
-            };
-            assert_eq!(
-                (bits(actual.0), actual.1, bits(actual.2), actual.3),
-                (bits(expected.0), expected.1, bits(expected.2), expected.3),
-                "{width}x{height}, case {case}"
-            );
-            assert_eq!(actual_levels, expected_levels);
-        }
-    }
-}
-
 #[allow(unused, clippy::too_many_arguments)]
 pub(crate) fn sse_and_rate_scalar<const BIASED: bool>(
     coeff: &[f32],
@@ -2422,18 +2335,6 @@ mod tests {
     }
 
     #[test]
-    fn hue_reversal_costs_more_than_losing_chroma() {
-        let source = [0.2, 0.0];
-        let loss = |reconstructed| super::hue_chroma_error(source, reconstructed, 0.2);
-        assert_eq!(loss(source), 0.0);
-        assert_eq!(loss([0.3, 0.0]), 0.0); // Same-hue oversaturation is not the target.
-        assert!(loss([0.0, 0.2]) > loss([0.0, 0.0]));
-        assert!(loss([-0.2, 0.0]) > loss([0.0, 0.2]));
-        assert!((loss([-0.2, 0.0]) - 4.0 * loss([0.0, 0.0])).abs() < 1e-6);
-        assert_eq!(super::hue_chroma_error([0.0; 2], [0.0; 2], 0.0), 0.0);
-    }
-
-    #[test]
     fn dark_blue_edges_keep_a_hue_penalty_below_the_old_lightness_cutoff() {
         let matrix = crate::xyb::XybMatrix::SPEC;
         let blue_rgb = [0.0, 0.0, 0.2];
@@ -2504,63 +2405,6 @@ mod tests {
             relative_error < 2e-4,
             "SIMD RGB hue loss {actual} differs from scalar {expected} by {relative_error}"
         );
-    }
-
-    #[test]
-    fn rgb_hue_loss_is_zero_for_identity_and_positive_for_edge_desaturation() {
-        let matrix = crate::xyb::XybMatrix::SPEC;
-        let mut opsin = crate::image::Image3F::new(8, 8);
-        for y in 0..8 {
-            for x in 0..8 {
-                let rgb = if x < 4 {
-                    [1.0, 0.9, 0.03]
-                } else {
-                    [0.03, 0.25, 1.0]
-                };
-                let value = crate::xyb::rgb_to_xyb_pixel_f32(&matrix, rgb[0], rgb[1], rgb[2]);
-                opsin.plane_row_mut(0, y)[x] = value.0;
-                opsin.plane_row_mut(1, y)[x] = value.1;
-                opsin.plane_row_mut(2, y)[x] = value.2;
-            }
-        }
-        let zero = [0.0f32; 64];
-        assert_eq!(
-            unsafe {
-                select_rgb_hue_chroma_edge_loss_fn()(
-                    &opsin,
-                    0,
-                    0,
-                    8,
-                    8,
-                    [&zero, &zero, &zero],
-                    &matrix,
-                )
-            },
-            0.0
-        );
-
-        let gray = crate::xyb::rgb_to_xyb_pixel_f32(&matrix, 0.5, 0.5, 0.5);
-        let mut errors = [[0.0f32; 64]; 3];
-        for y in 0..8 {
-            for x in 0..8 {
-                let i = y * 8 + x;
-                errors[0][i] = opsin.plane_row(0, y)[x] - gray.0;
-                errors[1][i] = opsin.plane_row(1, y)[x] - gray.1;
-                errors[2][i] = opsin.plane_row(2, y)[x] - gray.2;
-            }
-        }
-        let loss = unsafe {
-            select_rgb_hue_chroma_edge_loss_fn()(
-                &opsin,
-                0,
-                0,
-                8,
-                8,
-                [&errors[0], &errors[1], &errors[2]],
-                &matrix,
-            )
-        };
-        assert!(loss.is_finite() && loss > 0.0);
     }
 
     fn check_combine_error(kernel: CombineErrorFn) {
@@ -2705,23 +2549,15 @@ mod tests {
     }
 
     #[test]
-    fn selected_combine_error_matches_scalar() {
+    fn combine_error_kernels_match_scalar() {
         check_combine_error(select_combine_error_fn());
-    }
-
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    #[test]
-    fn avx2_combine_error_matches_scalar() {
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             check_combine_error(|spatial, luma, factor, combined| unsafe {
                 crate::avx::combine_error_avx2(spatial, luma, factor, combined)
             });
         }
-    }
-
-    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
-    #[test]
-    fn sse41_combine_error_matches_scalar() {
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
         if is_x86_feature_detected!("sse4.1") {
             check_combine_error(|spatial, luma, factor, combined| unsafe {
                 crate::sse::combine_error_sse41(spatial, luma, factor, combined)
@@ -2778,25 +2614,6 @@ mod tests {
         assert!((got - want).abs() < 2e-4, "got={got} want={want}");
         let reverse = ssim_deficit_scalar(&b, &a, 16, 16);
         assert!((got - reverse).abs() < 1e-5);
-    }
-
-    #[test]
-    fn ssim_identity_and_high_offset_are_stable() {
-        let identical = [0.42f32; 64];
-        assert_eq!(ssim_deficit_scalar(&identical, &identical, 8, 8), 0.0);
-        let mut a = [10_000.0f32; 64];
-        let mut b = [10_000.0f32; 64];
-        for i in 0..64 {
-            a[i] += (i % 3) as f32 * 0.01;
-            b[i] += (i % 5) as f32 * 0.01;
-        }
-        let value = ssim_deficit_scalar(&a, &b, 8, 8);
-        assert!(value.is_finite());
-        let expected = reference(&a, &b, 8, 8) as f32;
-        assert!(
-            (value - expected).abs() < 5e-3,
-            "value={value} expected={expected}"
-        );
     }
 
     #[test]

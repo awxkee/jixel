@@ -5557,24 +5557,6 @@ mod tests {
     }
 
     #[test]
-    fn default_speed_is_fast() {
-        assert_eq!(Speed::default(), Speed::Fast);
-        assert_eq!(EncodeConfig::default().speed, Speed::Fast);
-    }
-
-    #[test]
-    fn invisible_fill_defaults_on_and_can_be_disabled() {
-        assert!(EncodeConfig::default().fill_invisible);
-        let config = EncodeConfig::default().with_fill_invisible(false);
-        assert!(!config.fill_invisible);
-        assert!(
-            !EncodeConfigImpl::default()
-                .with_progressive_from(&config)
-                .fill_invisible
-        );
-    }
-
-    #[test]
     fn srgb_linearization_uses_requested_threads() {
         use std::collections::HashSet;
         use std::sync::{Barrier, Mutex};
@@ -5693,41 +5675,6 @@ mod encode_smoke_tests {
         let split = plan.split_for_retry(steps, true).expect("flat art splits");
         let flattened = encode_vector_layers(split, size, size, &config).unwrap();
         assert_eq!(flattened.bytes, encoded.bytes);
-    }
-
-    #[test]
-    fn high_quality_ink_palette_capacity_preserves_the_plain_path() {
-        let rgb = many_ink_half_coverage_fixture();
-        for distance in [0.05, 0.1, 0.3] {
-            let config = EncodeConfig::default()
-                .with_speed(Speed::Medium)
-                .with_distance(distance)
-                .with_num_threads(1)
-                .with_patches(false)
-                .with_vector_layers(false);
-            let inked = encode_image(&rgb, 256, 256, &config).unwrap();
-            let plain = encode_image(&rgb, 256, 256, &config.with_ink_layer(false)).unwrap();
-            assert_eq!(inked, plain, "distance {distance}");
-        }
-    }
-
-    #[test]
-    fn high_quality_ink_budget_cannot_fall_back_to_a_hard_mask() {
-        let rgb = many_ink_half_coverage_fixture();
-        let pool = crate::thread_pool::ThreadPool::new(1);
-        for (distance, accepted) in [(0.6, false), (1.0, true)] {
-            let plan = crate::ink_layer::InkCandidates::new_fast(&rgb, None, 256, 256, &pool)
-                .unwrap()
-                .select(distance, &pool)
-                .unwrap();
-            assert_eq!(plan.inks.len(), 16);
-            let config = EncodeConfig::default()
-                .with_speed(Speed::Medium)
-                .with_distance(distance)
-                .with_num_threads(1);
-            let stack = InkStack::encode(plan, 256, 256, &config, None, 0.0).unwrap();
-            assert_eq!(stack.is_some(), accepted, "distance {distance}");
-        }
     }
 
     /// A 288x32 strip clipped from a screenshot: white page and the bottoms
@@ -6068,17 +6015,6 @@ mod encode_smoke_tests {
     }
 
     #[test]
-    fn level_10_gain_map_raises_the_file_level() {
-        let gain: Vec<u16> = (0..4 * 4).map(|i| (i * 4000) as u16).collect();
-        let gm = crate::GainMap::gray16(gain, 16, 4, 4, gain_map_metadata()).with_lossless(true);
-        let encoded = encode_image(&rgb8(), W, H, &lossy().with_gain_map(gm)).unwrap();
-        assert_eq!(box_payload(&encoded, b"jxll"), Some(&[10u8][..]));
-        let jhgm = box_payload(&encoded, b"jhgm").unwrap();
-        let p = crate::gain_map::parse_jhgm_bundle(jhgm).unwrap();
-        assert_eq!(&p.codestream[..2], &[0xFF, 0x0A]);
-    }
-
-    #[test]
     fn gain_map_rides_along_every_primary_encoder_path() {
         let cfg = lossy().with_gain_map(
             crate::GainMap::rgb8(
@@ -6204,48 +6140,8 @@ mod encode_smoke_tests {
         (0..W * H).map(|i| (i % 65536) as u16).collect()
     }
 
-    fn gray_alpha16() -> Vec<u16> {
-        (0..W * H * 2).map(|i| (i % 65536) as u16).collect()
-    }
-
-    fn rgb10() -> Vec<u16> {
-        (0..W * H * 3).map(|i| (i % 1024) as u16).collect()
-    }
-
-    fn rgba10() -> Vec<u16> {
-        (0..W * H * 4).map(|i| (i % 1024) as u16).collect()
-    }
-
-    fn rgb12() -> Vec<u16> {
-        (0..W * H * 3).map(|i| (i % 4096) as u16).collect()
-    }
-
-    fn rgba12() -> Vec<u16> {
-        (0..W * H * 4).map(|i| (i % 4096) as u16).collect()
-    }
-
-    fn gray10() -> Vec<u16> {
-        (0..W * H).map(|i| (i % 1024) as u16).collect()
-    }
-
-    fn gray_alpha10() -> Vec<u16> {
-        (0..W * H * 2).map(|i| (i % 1024) as u16).collect()
-    }
-
-    fn gray12() -> Vec<u16> {
-        (0..W * H).map(|i| (i % 4096) as u16).collect()
-    }
-
-    fn gray_alpha12() -> Vec<u16> {
-        (0..W * H * 2).map(|i| (i % 4096) as u16).collect()
-    }
-
     fn rgb_f32() -> Vec<f32> {
         (0..W * H * 3).map(|i| (i % 256) as f32 / 255.0).collect()
-    }
-
-    fn rgba_f32() -> Vec<f32> {
-        (0..W * H * 4).map(|i| (i % 256) as f32 / 255.0).collect()
     }
 
     fn gray_f32() -> Vec<f32> {
@@ -6367,118 +6263,10 @@ mod encode_smoke_tests {
         }
     }
 
-    /// Thin anti-aliased dark curves on a smooth gradient: the content class
-    /// splines exist for.
-    #[cfg(feature = "splines")]
-    fn line_art(size: usize) -> Vec<u8> {
-        let mut px = vec![0u8; size * size * 3];
-        for y in 0..size {
-            for x in 0..size {
-                let mut v = 150.0 + 60.0 * (x + y) as f32 / (2 * size) as f32;
-                for k in 0..6 {
-                    let phase = k as f32 * 0.9;
-                    let cy = size as f32 * (0.15 + 0.13 * k as f32)
-                        + 18.0 * (x as f32 * 0.035 + phase).sin();
-                    let d = (y as f32 - cy).abs();
-                    v -= 120.0 * (-0.5 * (d / 0.8).powi(2)).exp();
-                }
-                let i = (y * size + x) * 3;
-                px[i] = v.clamp(0.0, 255.0) as u8;
-                px[i + 1] = (v * 0.92).clamp(0.0, 255.0) as u8;
-                px[i + 2] = (v * 0.85).clamp(0.0, 255.0) as u8;
-            }
-        }
-        px
-    }
-
     fn slow_lossy(distance: f32) -> EncodeConfig {
         EncodeConfig::default()
             .with_distance(distance)
             .with_speed(Speed::Slow)
-    }
-
-    #[test]
-    #[cfg(feature = "splines")]
-    fn splines_reduce_thin_line_art() {
-        const S: usize = 256;
-        let pixels = line_art(S);
-        let plain = encode_image(&pixels, S, S, &slow_lossy(3.0)).unwrap();
-        let with = encode_image(&pixels, S, S, &slow_lossy(3.0).with_splines(true)).unwrap();
-        assert!(
-            with.len() * 100 < plain.len() * 90,
-            "splines should win clearly on thin line art: {} vs {}",
-            with.len(),
-            plain.len()
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "splines")]
-    fn splines_are_inert_without_lines() {
-        const S: usize = 128;
-        let mut pixels = vec![0u8; S * S * 3];
-        for y in 0..S {
-            for x in 0..S {
-                let i = (y * S + x) * 3;
-                pixels[i] = (x * 2) as u8;
-                pixels[i + 1] = (y * 2) as u8;
-                pixels[i + 2] = (x + y) as u8;
-            }
-        }
-        let plain = encode_image(&pixels, S, S, &slow_lossy(2.0)).unwrap();
-        let with = encode_image(&pixels, S, S, &slow_lossy(2.0).with_splines(true)).unwrap();
-        assert_eq!(plain, with);
-    }
-
-    /// Gaussian point sources on a dark, smooth sky: the content class dots
-    /// exist for.
-    #[cfg(feature = "splines")]
-    fn star_field(size: usize) -> Vec<u8> {
-        let mut state = 0x2545_f491_u32;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as f32 / u32::MAX as f32
-        };
-        let mut sky = vec![[0f32; 3]; size * size];
-        for (i, p) in sky.iter_mut().enumerate() {
-            let (x, y) = ((i % size) as f32, (i / size) as f32);
-            *p = [8.0 + 0.03 * x, 10.0 + 0.02 * y, 22.0 + 0.04 * (x + y)];
-        }
-        for _ in 0..size * size / 120 {
-            let (cx, cy) = (
-                6.0 + next() * (size - 12) as f32,
-                6.0 + next() * (size - 12) as f32,
-            );
-            let amp = 40.0 + 200.0 * next() * next();
-            let sigma = 0.6 + 0.4 * next();
-            let tint = [0.8 + 0.2 * next(), 0.9, 1.0];
-            for y in cy as usize - 4..=cy as usize + 4 {
-                for x in cx as usize - 4..=cx as usize + 4 {
-                    let d2 = (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2);
-                    let v = amp * (-0.5 * d2 / (sigma * sigma)).exp();
-                    for (c, t) in sky[y * size + x].iter_mut().zip(tint) {
-                        *c += v * t;
-                    }
-                }
-            }
-        }
-        sky.iter()
-            .flat_map(|p| p.map(|c| c.clamp(0.0, 255.0) as u8))
-            .collect()
-    }
-
-    #[test]
-    #[cfg(feature = "splines")]
-    fn dots_are_inert_without_points() {
-        const S: usize = 128;
-        let pixels = line_art(S);
-        let config = slow_lossy(2.0).with_splines(true);
-        assert_eq!(
-            encode_image(&pixels, S, S, &config).unwrap(),
-            encode_image(&pixels, S, S, &config.clone().with_dots(true)).unwrap()
-        );
     }
 
     /// A tall black plane under a faint smooth alpha: every AC-band residual
@@ -6506,240 +6294,10 @@ mod encode_smoke_tests {
     }
 
     #[test]
-    #[cfg(feature = "splines")]
-    fn dots_only_run_at_slow_speed_and_default_decoding_speed() {
-        const S: usize = 128;
-        let pixels = star_field(S);
-        for config in [
-            EncodeConfig::default()
-                .with_distance(3.0)
-                .with_speed(Speed::Fast),
-            slow_lossy(3.0).with_decoding_speed(DecodingSpeed::Fast),
-        ] {
-            assert_eq!(
-                encode_image(&pixels, S, S, &config).unwrap(),
-                encode_image(&pixels, S, S, &config.clone().with_dots(true)).unwrap()
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "splines")]
-    fn splines_only_run_at_slow_speed_and_default_decoding_speed() {
-        const S: usize = 256;
-        let pixels = line_art(S);
-        let fast = EncodeConfig::default()
-            .with_distance(3.0)
-            .with_speed(Speed::Fast);
-        assert_eq!(
-            encode_image(&pixels, S, S, &fast).unwrap(),
-            encode_image(&pixels, S, S, &fast.clone().with_splines(true)).unwrap()
-        );
-        let quick_decode = slow_lossy(3.0).with_decoding_speed(DecodingSpeed::Fast);
-        assert_eq!(
-            encode_image(&pixels, S, S, &quick_decode).unwrap(),
-            encode_image(&pixels, S, S, &quick_decode.clone().with_splines(true)).unwrap()
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "splines")]
-    fn edge_splines_are_inert_outside_supported_frames() {
-        const S: usize = 96;
-        let pixels = line_art(S);
-        let configurations = [
-            slow_lossy(1.0),
-            slow_lossy(3.0).with_speed(Speed::Fast),
-            slow_lossy(3.0).with_decoding_speed(DecodingSpeed::Fast),
-            slow_lossy(3.0).with_progressive(true),
-            slow_lossy(3.0).with_progressive_dc(true),
-            slow_lossy(3.0).with_coding_transform(CodingTransform::Rgb),
-        ];
-        for config in configurations {
-            let without = encode_image(&pixels, S, S, &config).unwrap();
-            let with = encode_image(&pixels, S, S, &config.with_edge_splines(true)).unwrap();
-            assert_eq!(without, with);
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "splines")]
-    fn edge_splines_leave_a_smooth_image_byte_identical() {
-        const S: usize = 96;
-        let pixels: Vec<u8> = (0..S * S)
-            .flat_map(|i| {
-                let (x, y) = (i % S, i / S);
-                [80 + x as u8 / 3, 100 + y as u8 / 3, 140 + (x + y) as u8 / 5]
-            })
-            .collect();
-        let config = slow_lossy(3.0).with_splines(true);
-        assert_eq!(
-            encode_image(&pixels, S, S, &config).unwrap(),
-            encode_image(&pixels, S, S, &config.with_edge_splines(true)).unwrap()
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "splines")]
-    fn splines_coexist_with_patches() {
-        const S: usize = 256;
-        let pixels = line_art(S);
-        let both = slow_lossy(3.0).with_splines(true).with_patches(true);
-        let plain = encode_image(&pixels, S, S, &slow_lossy(3.0).with_patches(true)).unwrap();
-        let with = encode_image(&pixels, S, S, &both).unwrap();
-        assert!(with.len() < plain.len());
-    }
-
-    #[test]
     fn lossy_patches_are_rate_safe() {
         let plain = encode_image(&rgb8(), W, H, &lossy()).unwrap();
         let checked = encode_image(&rgb8(), W, H, &lossy().with_patches(true)).unwrap();
         assert!(checked.len() <= plain.len());
-    }
-
-    #[test]
-    fn fast_lossy_patches_are_rate_safe_on_unrepeated_ink() {
-        // Saturated line drawings in separate 60-pixel tiles, each broken
-        // by its own gaps: every tile is a singleton glyph, so the whole
-        // image lands in the atlas.
-        const SIZE: usize = 256;
-        let mut pixels = vec![0u8; SIZE * SIZE * 3];
-        for y in 0..SIZE {
-            for x in 0..SIZE {
-                if (x % 8 == 3 || y % 8 == 3) && x % 64 < 60 && y % 64 < 60 {
-                    let blue = if (x / 64 + y / 64) % 2 == 0 { 254 } else { 0 };
-                    pixels[(y * SIZE + x) * 3..][..3].copy_from_slice(&[252, 0, blue]);
-                }
-            }
-        }
-        let mut state = 0x2545_f491u32;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as usize
-        };
-        for _ in 0..60 {
-            let (x0, y0) = (next() % (SIZE - 8), next() % (SIZE - 8));
-            let (w, h) = (2 + next() % 6, 1 + next() % 5);
-            for y in y0..y0 + h {
-                pixels[(y * SIZE + x0) * 3..][..w * 3].fill(0);
-            }
-        }
-        let plain = EncodeConfig::default().with_distance(1.0);
-        let patched = plain.clone().with_patches(true);
-        let plain = encode_image(&pixels, SIZE, SIZE, &plain).unwrap();
-        let patched = encode_image(&pixels, SIZE, SIZE, &patched).unwrap();
-        assert!(
-            patched.len() * 10 <= plain.len() * 11,
-            "{} vs {}",
-            patched.len(),
-            plain.len()
-        );
-    }
-
-    /// Sixty dark 5x7 glyphs on white, set as lines of text off the block
-    /// grid.
-    fn glyph_text_pixels(size: usize) -> Vec<u8> {
-        let mut state = 0x2545_f491u32;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as usize
-        };
-        let glyphs: Vec<[[bool; 5]; 7]> = (0..60)
-            .map(|_| std::array::from_fn(|_| std::array::from_fn(|_| next() % 3 < 2)))
-            .collect();
-        let mut pixels = vec![255u8; size * size * 3];
-        for line in 0..size / 11 {
-            for column in 0..size / 7 - 1 {
-                let glyph = &glyphs[next() % glyphs.len()];
-                let (x0, y0) = (3 + column * 7 + line % 3, 2 + line * 11);
-                for (dy, row) in glyph.iter().enumerate() {
-                    for (dx, &ink) in row.iter().enumerate() {
-                        if ink {
-                            pixels[((y0 + dy) * size + x0 + dx) * 3..][..3].fill(20);
-                        }
-                    }
-                }
-            }
-        }
-        pixels
-    }
-
-    #[test]
-    fn fast_lossy_glyph_patches_shrink_repeated_text() {
-        // The glyph atlas is too large to pay off unless it is coded with
-        // a learned tree and palette, which Fast now uses too.
-        const SIZE: usize = 256;
-        let pixels = glyph_text_pixels(SIZE);
-        let plain = EncodeConfig::default().with_distance(1.0);
-        let patched = plain.clone().with_patches(true);
-        let plain = encode_image(&pixels, SIZE, SIZE, &plain).unwrap();
-        let patched = encode_image(&pixels, SIZE, SIZE, &patched).unwrap();
-        assert!(
-            patched.len() * 5 < plain.len(),
-            "{} vs {}",
-            patched.len(),
-            plain.len()
-        );
-    }
-
-    /// Noise with one 16x16 noise tile repeated on half of the grid.
-    fn repeated_region_pixels() -> Vec<u8> {
-        const PW: usize = 256;
-        const PH: usize = 256;
-        let mut state = 0x89ab_cdefu32;
-        let mut pixels = vec![0u8; PW * PH * 3];
-        for sample in &mut pixels {
-            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            *sample = (state >> 24) as u8;
-        }
-        let tile: Vec<u8> = (0..16)
-            .flat_map(|y| pixels[(y * PW * 3)..(y * PW * 3 + 48)].iter().copied())
-            .collect();
-        for ty in 0..16 {
-            for tx in 0..16 {
-                if (tx + ty) % 2 != 0 {
-                    continue;
-                }
-                for y in 0..16 {
-                    let dst = ((ty * 16 + y) * PW + tx * 16) * 3;
-                    pixels[dst..dst + 48].copy_from_slice(&tile[y * 48..(y + 1) * 48]);
-                }
-            }
-        }
-        pixels
-    }
-
-    #[test]
-    fn lossy_patches_reduce_repeated_regions() {
-        const PW: usize = 256;
-        const PH: usize = 256;
-        let pixels = repeated_region_pixels();
-        let plain = encode_image(&pixels, PW, PH, &lossy().with_patches(false)).unwrap();
-        let patched = encode_image(&pixels, PW, PH, &lossy().with_patches(true)).unwrap();
-        assert!(
-            patched.len() < plain.len(),
-            "lossy patches should win on repeated complex regions: {} >= {}",
-            patched.len(),
-            plain.len()
-        );
-    }
-
-    #[test]
-    fn rgb8_slow_low_quality_lossy() {
-        const SIDE: usize = 64;
-        let pixels: Vec<u8> = (0..SIDE * SIDE * 3).map(|i| (i % 251) as u8).collect();
-        ok(encode_image(
-            &pixels,
-            SIDE,
-            SIDE,
-            &EncodeConfig::default()
-                .with_distance(3.0)
-                .with_speed(Speed::Slow),
-        ));
     }
 
     #[test]
@@ -6771,74 +6329,8 @@ mod encode_smoke_tests {
     }
 
     #[test]
-    fn rgba_lossy_patches_reduce_repeated_regions() {
-        const PW: usize = 256;
-        const PH: usize = 256;
-        let mut pixels = vec![0u8; PW * PH * 4];
-        for (i, px) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            let (x, y) = (i % PW, i / PW);
-            let (tx, ty) = (x % 16, y % 16);
-            // Glyph-like repeated tiles on 3/4 of the grid, noise elsewhere.
-            if (x / 16 + y / 16) % 4 != 0 {
-                // Few distinct colors, so the tile is palette-friendly and the
-                // routing sends it to the modular atlas.
-                px[0] = ((tx / 4) * 40 + (ty / 4) * 17) as u8;
-                px[1] = ((tx / 4) * 25 + (ty / 4) * 31) as u8;
-                px[2] = ((tx / 4) * 11 + (ty / 4) * 45) as u8;
-            } else {
-                let s = (i as u32)
-                    .wrapping_mul(1_664_525)
-                    .wrapping_add(1_013_904_223);
-                px[0] = (s >> 24) as u8;
-                px[1] = (s >> 16) as u8;
-                px[2] = (s >> 8) as u8;
-            }
-            px[3] = 255;
-        }
-        let cfg = |patches: bool| {
-            EncodeConfig::default()
-                .with_lossless(false)
-                .with_distance(1.0)
-                .with_patches(patches)
-        };
-        let plain = encode_image_with_alpha(&pixels, PW, PH, &cfg(false)).unwrap();
-        let patched = encode_image_with_alpha(&pixels, PW, PH, &cfg(true)).unwrap();
-        assert!(
-            patched.len() < plain.len(),
-            "alpha image patches should win: {} >= {}",
-            patched.len(),
-            plain.len()
-        );
-    }
-
-    #[test]
     fn rgb8_lossless() {
         ok(encode_image(&rgb8(), W, H, &lossless()));
-    }
-
-    #[test]
-    fn rgb8_lossless_patches_reduce_repeated_tiles() {
-        const PW: usize = 96;
-        const PH: usize = 64;
-        let mut pixels = vec![0u8; PW * PH * 3];
-        for y in 0..PH {
-            for x in 0..PW {
-                let tx = x % 16;
-                let ty = y % 16;
-                let p = (y * PW + x) * 3;
-                pixels[p] = (tx * 13 + ty * 3) as u8;
-                pixels[p + 1] = (tx * 5 + ty * 11) as u8;
-                pixels[p + 2] = (tx * 7 + ty * 9) as u8;
-            }
-        }
-        let plain = encode_image(&pixels, PW, PH, &lossless().with_patches(false)).unwrap();
-        let patched = encode_image(&pixels, PW, PH, &lossless().with_patches(true)).unwrap();
-        assert!(
-            patched.len() < plain.len(),
-            "patch dictionary should reduce a repeated-tile image: {} >= {}",
-            patched.len(),
-            plain.len()
-        );
     }
 
     #[test]
@@ -6863,47 +6355,6 @@ mod encode_smoke_tests {
         let plain = encode_image(&pixels, PW, PH, &lossless()).unwrap();
         let checked = encode_image(&pixels, PW, PH, &lossless().with_patches(true)).unwrap();
         assert_eq!(checked, plain, "a losing patch candidate must be discarded");
-    }
-
-    #[test]
-    fn rgb8_lossless_slow_adaptive() {
-        ok(encode_image(
-            &rgb8(),
-            W,
-            H,
-            &lossless().with_speed(Speed::Slow),
-        ));
-    }
-
-    #[test]
-    fn fastest_speed_encodes_dct8_only() {
-        // A smooth gradient makes Fast/Slow merge into large transforms, so a
-        // Fastest stream (all 8x8) must differ; both must be valid encodes.
-        const WIDTH: usize = 128;
-        const HEIGHT: usize = 128;
-        let input: Vec<u8> = (0..WIDTH * HEIGHT * 3)
-            .map(|i| (((i / 3) % WIDTH) / 2 + ((i / 3) / WIDTH) / 2) as u8)
-            .collect();
-        let config = lossy().with_distance(2.0);
-        let fastest = encode_image(
-            &input,
-            WIDTH,
-            HEIGHT,
-            &config.clone().with_speed(Speed::Fastest),
-        )
-        .expect("Fastest encode failed");
-        let fast = encode_image(
-            &input,
-            WIDTH,
-            HEIGHT,
-            &config.clone().with_speed(Speed::Fast),
-        )
-        .expect("Fast encode failed");
-        assert!(!fastest.is_empty());
-        assert_ne!(
-            fastest, fast,
-            "Fastest should skip the transform search Fast performs"
-        );
     }
 
     /// A 4-pixel red checkerboard under a slow brightness drift.
@@ -6944,22 +6395,6 @@ mod encode_smoke_tests {
     }
 
     #[test]
-    fn learned_rate_shrinks_a_block_periodic_pattern() {
-        const SIZE: usize = 128;
-        let pixels = checkerboard_rgb(SIZE);
-        let learned = learned_rate_lossy(2.0).with_num_threads(1);
-        let fixed = learned.clone().with_learned_rate(false);
-        let learned = encode_image(&pixels, SIZE, SIZE, &learned).unwrap();
-        let fixed = encode_image(&pixels, SIZE, SIZE, &fixed).unwrap();
-        assert!(
-            learned.len() * 10 < fixed.len() * 8,
-            "{} vs {}",
-            learned.len(),
-            fixed.len()
-        );
-    }
-
-    #[test]
     fn learned_rate_prices_every_transform_of_a_small_image() {
         // Nine 64x64 positions: too few for a table by count, enough by
         // the blocks they cover. Left on the fixed model, the 64x64
@@ -6980,90 +6415,7 @@ mod encode_smoke_tests {
         );
     }
 
-    #[test]
-    fn learned_rate_lets_fine_transforms_compete_with_merges() {
-        // One-pixel lines on black every 8 pixels. IDENTITY codes them in
-        // a few tokens per block; under the fixed model they are only
-        // tried on the blocks the merges left.
-        const SIZE: usize = 128;
-        let mut pixels = Vec::with_capacity(SIZE * SIZE * 3);
-        for y in 0..SIZE {
-            for x in 0..SIZE {
-                let ink = x % 8 == 3 || y % 8 == 3;
-                let magenta = (x / 64 + y / 64) % 2 == 0;
-                pixels.extend_from_slice(&match (ink, magenta) {
-                    (false, _) => [0, 0, 0],
-                    (true, true) => [252, 0, 254],
-                    (true, false) => [252, 0, 0],
-                });
-            }
-        }
-        let learned = learned_rate_lossy(2.0).with_num_threads(1);
-        let fixed = learned.clone().with_learned_rate(false);
-        let learned = encode_image(&pixels, SIZE, SIZE, &learned).unwrap();
-        let fixed = encode_image(&pixels, SIZE, SIZE, &fixed).unwrap();
-        // The source-feature quant field already codes the lines well under
-        // the fixed model (1.6 KB vs 4 KB on the flat field); the learned
-        // prices still take a third off.
-        assert!(
-            learned.len() * 4 < fixed.len() * 3,
-            "{} vs {}",
-            learned.len(),
-            fixed.len()
-        );
-    }
-
-    #[test]
-    fn learned_rate_is_a_slow_speed_tool() {
-        const SIZE: usize = 128;
-        let pixels = checkerboard_rgb(SIZE);
-        for speed in [Speed::UltraFast, Speed::Fastest, Speed::Fast, Speed::Medium] {
-            let base = EncodeConfig::default()
-                .with_distance(2.0)
-                .with_speed(speed)
-                .with_learned_rate(false)
-                .with_num_threads(1);
-            assert_eq!(
-                encode_image(&pixels, SIZE, SIZE, &base).unwrap(),
-                encode_image(&pixels, SIZE, SIZE, &base.clone().with_learned_rate(true)).unwrap(),
-                "{speed:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn rgb8_quality() {
-        ok(encode_image(
-            &rgb8(),
-            W,
-            H,
-            &EncodeConfig::default().with_quality(85.0),
-        ));
-    }
-
-    // --- encode_image_with_alpha (RGBA u8) ---
-
-    #[test]
-    fn rgba8_lossy() {
-        ok(encode_image_with_alpha(&rgba8(), W, H, &lossy()));
-    }
-
-    #[test]
-    fn rgba8_lossless() {
-        ok(encode_image_with_alpha(&rgba8(), W, H, &lossless()));
-    }
-
-    // --- 16-bit RGB / RGBA ---
-
-    #[test]
-    fn rgb16_lossy() {
-        ok(encode_image_16bit(&rgb16(), W, H, &lossy()));
-    }
-
-    #[test]
-    fn rgb16_lossless() {
-        ok(encode_image_16bit(&rgb16(), W, H, &lossless()));
-    }
+    // --- 16-bit RGBA ---
 
     #[test]
     fn rgba16_lossy() {
@@ -7075,70 +6427,11 @@ mod encode_smoke_tests {
         ok(encode_image_with_alpha_16bit(&rgba16(), W, H, &lossless()));
     }
 
-    // --- 10-bit RGB / RGBA ---
-
-    #[test]
-    fn rgb10_lossy() {
-        ok(encode_image_10bit(&rgb10(), W, H, &lossy()));
-    }
-
-    #[test]
-    fn rgb10_lossless() {
-        ok(encode_image_10bit(&rgb10(), W, H, &lossless()));
-    }
-
-    #[test]
-    fn rgba10_lossy() {
-        ok(encode_image_with_alpha_10bit(&rgba10(), W, H, &lossy()));
-    }
-
-    #[test]
-    fn rgba10_lossless() {
-        ok(encode_image_with_alpha_10bit(&rgba10(), W, H, &lossless()));
-    }
-
-    // --- 12-bit RGB / RGBA ---
-
-    #[test]
-    fn rgb12_lossy() {
-        ok(encode_image_12bit(&rgb12(), W, H, &lossy()));
-    }
-
-    #[test]
-    fn rgb12_lossless() {
-        ok(encode_image_12bit(&rgb12(), W, H, &lossless()));
-    }
-
-    #[test]
-    fn rgba12_lossy() {
-        ok(encode_image_with_alpha_12bit(&rgba12(), W, H, &lossy()));
-    }
-
-    #[test]
-    fn rgba12_lossless() {
-        ok(encode_image_with_alpha_12bit(&rgba12(), W, H, &lossless()));
-    }
-
-    // --- float RGB / RGBA ---
+    // --- float RGB ---
 
     #[test]
     fn rgb_f32_lossy() {
         ok(encode_image_f32(&rgb_f32(), W, H, &lossy()));
-    }
-
-    #[test]
-    fn rgb_f16_lossy() {
-        ok(encode_image_f16(&rgb_f32(), W, H, &lossy()));
-    }
-
-    #[test]
-    fn rgba_f32_lossy() {
-        ok(encode_image_with_alpha_f32(&rgba_f32(), W, H, &lossy()));
-    }
-
-    #[test]
-    fn rgba_f16_lossy() {
-        ok(encode_image_with_alpha_f16(&rgba_f32(), W, H, &lossy()));
     }
 
     // --- grayscale u8 ---
@@ -7149,126 +6442,8 @@ mod encode_smoke_tests {
     }
 
     #[test]
-    fn gray8_lossless() {
-        ok(encode_image_gray(&gray8(), W, H, &lossless()));
-    }
-
-    #[test]
-    fn gray_alpha8_lossy() {
-        ok(encode_image_gray_alpha(&gray_alpha8(), W, H, &lossy()));
-    }
-
-    #[test]
     fn gray_alpha8_lossless() {
         ok(encode_image_gray_alpha(&gray_alpha8(), W, H, &lossless()));
-    }
-
-    // --- grayscale 10-bit ---
-
-    #[test]
-    fn gray10_lossy() {
-        ok(encode_image_gray_10bit(&gray10(), W, H, &lossy()));
-    }
-
-    #[test]
-    fn gray10_lossless() {
-        ok(encode_image_gray_10bit(&gray10(), W, H, &lossless()));
-    }
-
-    #[test]
-    fn gray_alpha10_lossy() {
-        ok(encode_image_gray_alpha_10bit(
-            &gray_alpha10(),
-            W,
-            H,
-            &lossy(),
-        ));
-    }
-
-    #[test]
-    fn gray_alpha10_lossless() {
-        ok(encode_image_gray_alpha_10bit(
-            &gray_alpha10(),
-            W,
-            H,
-            &lossless(),
-        ));
-    }
-
-    // --- grayscale 12-bit ---
-
-    #[test]
-    fn gray12_lossy() {
-        ok(encode_image_gray_12bit(&gray12(), W, H, &lossy()));
-    }
-
-    #[test]
-    fn gray12_lossless() {
-        ok(encode_image_gray_12bit(&gray12(), W, H, &lossless()));
-    }
-
-    #[test]
-    fn gray_alpha12_lossy() {
-        ok(encode_image_gray_alpha_12bit(
-            &gray_alpha12(),
-            W,
-            H,
-            &lossy(),
-        ));
-    }
-
-    #[test]
-    fn gray_alpha12_lossless() {
-        ok(encode_image_gray_alpha_12bit(
-            &gray_alpha12(),
-            W,
-            H,
-            &lossless(),
-        ));
-    }
-
-    // --- grayscale 16-bit ---
-
-    #[test]
-    fn gray16_lossy() {
-        ok(encode_image_gray_16bit(&gray16(), W, H, &lossy()));
-    }
-
-    #[test]
-    fn gray16_lossless() {
-        ok(encode_image_gray_16bit(&gray16(), W, H, &lossless()));
-    }
-
-    #[test]
-    fn gray_alpha16_lossy() {
-        ok(encode_image_gray_alpha_16bit(
-            &gray_alpha16(),
-            W,
-            H,
-            &lossy(),
-        ));
-    }
-
-    #[test]
-    fn gray_alpha16_lossless() {
-        ok(encode_image_gray_alpha_16bit(
-            &gray_alpha16(),
-            W,
-            H,
-            &lossless(),
-        ));
-    }
-
-    // --- grayscale float ---
-
-    #[test]
-    fn gray_f32_lossy() {
-        ok(encode_image_gray_f32(&gray_f32(), W, H, &lossy()));
-    }
-
-    #[test]
-    fn gray_f16_lossy() {
-        ok(encode_image_gray_f16(&gray_f32(), W, H, &lossy()));
     }
 
     // --- error paths ---
@@ -7277,14 +6452,6 @@ mod encode_smoke_tests {
     fn empty_width_rejected() {
         assert!(matches!(
             encode_image(&[], 0, H, &lossy()),
-            Err(EncodeError::EmptyImage)
-        ));
-    }
-
-    #[test]
-    fn empty_height_rejected() {
-        assert!(matches!(
-            encode_image(&[], W, 0, &lossy()),
             Err(EncodeError::EmptyImage)
         ));
     }
@@ -7306,15 +6473,6 @@ mod encode_smoke_tests {
         ));
     }
 
-    #[test]
-    fn dimension_too_large_rejected() {
-        let huge = MAX_DIMENSION + 1;
-        assert!(matches!(
-            encode_image(&[], huge, H, &lossy()),
-            Err(EncodeError::DimensionTooLarge { .. })
-        ));
-    }
-
     // --- 1x1 edge cases ---
 
     #[test]
@@ -7330,11 +6488,6 @@ mod encode_smoke_tests {
             1,
             &lossless(),
         ));
-    }
-
-    #[test]
-    fn one_by_one_gray8() {
-        ok(encode_image_gray(&[200u8], 1, 1, &lossy()));
     }
 }
 
@@ -7390,20 +6543,6 @@ mod lossy_alpha_tests {
     }
 
     #[test]
-    fn soft_alpha_is_smaller_than_lossless() {
-        let pixels = rgba(soft);
-        for config in [fast(), fast().with_speed(Speed::Slow)] {
-            let lossy = encode(&pixels, &config).len();
-            let lossless = encode(&pixels, &config.clone().with_alpha_distance(0.0)).len();
-            assert!(
-                lossy * 10 < lossless * 9,
-                "{:?}: lossy alpha {lossy} vs lossless {lossless}",
-                config.speed
-            );
-        }
-    }
-
-    #[test]
     fn lossy_alpha_never_grows_the_file() {
         let noisy = |x: usize, y: usize| {
             let h = (x * 7919 + y * 104_729) % 251;
@@ -7433,114 +6572,6 @@ mod lossy_alpha_tests {
     }
 
     #[test]
-    fn gray_and_deep_alpha_go_lossy_too() {
-        let gray: Vec<u8> = rgba(soft)
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .flat_map(|px| [px[0], px[3]])
-            .collect();
-        let gray_lossy = encode_image_gray_alpha(&gray, W, H, &fast()).unwrap();
-        let gray_lossless =
-            encode_image_gray_alpha(&gray, W, H, &fast().with_alpha_distance(0.0)).unwrap();
-        assert!(gray_lossy.len() < gray_lossless.len());
-
-        let deep: Vec<u16> = rgba(soft).iter().map(|&v| u16::from(v) * 257).collect();
-        let deep_lossy = encode_image_with_alpha_16bit(&deep, W, H, &fast()).unwrap();
-        let deep_lossless =
-            encode_image_with_alpha_16bit(&deep, W, H, &fast().with_alpha_distance(0.0)).unwrap();
-        assert!(deep_lossy.len() < deep_lossless.len());
-    }
-
-    #[test]
-    fn multi_group_alpha_keeps_values_where_the_palette_breaks_gradients() {
-        // 64 values over 3..=199 pass the palette gate, but sorted indices
-        // lose the plane's exact Gradient prediction (11 KB through them).
-        let (w, h) = (512, 64);
-        let mut rgba = Vec::with_capacity(w * h * 4);
-        for y in 0..h {
-            for x in 0..w {
-                let a = 80 + 17 * (x % 8) as i32 - 11 * (y % 8) as i32;
-                rgba.extend([120, 60, 200, a as u8]);
-            }
-        }
-        let config = EncodeConfig::default()
-            .with_speed(Speed::Fast)
-            .with_alpha_distance(0.0);
-        assert!(encode_image_with_alpha(&rgba, w, h, &config).unwrap().len() < 6000);
-    }
-
-    #[test]
-    fn color_under_partial_alpha_codes_coarser() {
-        // A textured glow whose alpha never reaches 0 or 1: only the
-        // alpha-aware quant field tells the two encodes apart.
-        let (w, h) = (256, 256);
-        let mut rgba = Vec::with_capacity(w * h * 4);
-        for y in 0..h {
-            for x in 0..w {
-                let r = (fast_hypot(x as f32 - 128.0, y as f32 - 128.0) / 128.0).min(1.0);
-                let a = (8.0 + 200.0 * (1.0 - r)) as u8;
-                let t = ((x * 7 + y * 13) % 64) as u8;
-                rgba.extend([120 + t, 80 + t / 2, 200 - t, a]);
-            }
-        }
-        let config = EncodeConfig::default()
-            .with_speed(Speed::Fast)
-            .with_distance(1.5);
-        let weighted = encode_image_with_alpha(&rgba, w, h, &config).unwrap().len();
-        let flat = encode_image_with_alpha(&rgba, w, h, &config.with_fill_invisible(false))
-            .unwrap()
-            .len();
-        assert!(weighted * 10 < flat * 9, "{weighted} vs {flat}");
-    }
-
-    #[test]
-    fn slow_lossy_alpha_codes_anti_aliased_cutouts_through_few_levels() {
-        // Flat color under three discs with 1.5 px anti-aliased rims: the
-        // squeeze spends its alpha bits on the rims, the lossy palette keeps
-        // a few rim levels (2263 B squeezed when this was written).
-        let (w, h) = (320, 288);
-        let mut rgba = Vec::with_capacity(w * h * 4);
-        for y in 0..h {
-            for x in 0..w {
-                let a = [
-                    (90.0, 90.0, 60.0),
-                    (220.0, 150.0, 80.0),
-                    (120.0, 220.0, 45.0),
-                ]
-                .iter()
-                .map(|&(cx, cy, r): &(f32, f32, f32)| {
-                    let d = fast_hypot(x as f32 - cx, y as f32 - cy) - r;
-                    (0.5 - d / 1.5).clamp(0.0, 1.0)
-                })
-                .fold(0.0f32, f32::max);
-                rgba.extend([200, 60, 90, (a * 255.0 + 0.5) as u8]);
-            }
-        }
-        let config = EncodeConfig::default()
-            .with_speed(Speed::Slow)
-            .with_distance(3.0);
-        let bytes = encode_image_with_alpha(&rgba, w, h, &config).unwrap().len();
-        assert!(bytes < 1900, "{bytes}");
-        // Lossy modular frames code the levels through a Palette transform
-        // after the squeeze (3277 B squeezed at d1.5 when this was written).
-        let config = EncodeConfig::default()
-            .with_speed(Speed::Slow)
-            .with_distance(1.5)
-            .with_coding_transform(crate::CodingTransform::YCbCr)
-            .with_lossy_modular(crate::LossyModular::Force);
-        let bytes = encode_image_with_alpha(&rgba, w, h, &config).unwrap().len();
-        assert!(bytes < 2800, "{bytes}");
-        // Fast codes the levels through its gradient lookup-table tree
-        // (3519 B squeezed at d1.5 when this was written).
-        let config = EncodeConfig::default()
-            .with_speed(Speed::Fast)
-            .with_distance(1.5);
-        let bytes = encode_image_with_alpha(&rgba, w, h, &config).unwrap().len();
-        assert!(bytes < 3150, "{bytes}");
-    }
-
-    #[test]
     fn vertical_first_requires_forced_xyb_modular() {
         let (w, h) = (37, 29);
         let pixels: Vec<u8> = (0..w * h)
@@ -7566,70 +6597,6 @@ mod lossy_alpha_tests {
         assert_eq!(
             encode(&config),
             encode(&config.clone().with_modular_vertical_first(true)),
-        );
-    }
-
-    #[test]
-    fn patch_epf_follows_the_patch_speeds() {
-        let config = EncodeConfig::default().with_num_threads(1);
-        assert!(!lossy_context(&config, 1.5, XybMatrix::SPEC, 65536).patch_epf);
-        let config = config.with_speed(Speed::MediumSlow);
-        assert!(!lossy_context(&config, 1.5, XybMatrix::SPEC, 65536).patch_epf);
-        let config = config.with_speed(Speed::Slow);
-        assert!(lossy_context(&config, 1.5, XybMatrix::SPEC, 65536).patch_epf);
-        let config = config.with_patch_epf(false);
-        assert!(!lossy_context(&config, 1.5, XybMatrix::SPEC, 65536).patch_epf);
-    }
-
-    #[test]
-    fn function_fields_portable_is_opt_in() {
-        let config = EncodeConfig::default();
-        assert!(!config.function_fields_portable);
-        assert!(!lossy_context(&config, 1.5, XybMatrix::SPEC, 65536).function_fields_portable);
-        let portable = config.with_function_fields_portable(true);
-        assert!(lossy_context(&portable, 1.5, XybMatrix::SPEC, 65536).function_fields_portable);
-    }
-
-    #[test]
-    fn function_fields_default_on_where_supported() {
-        for (speed, supported) in [
-            (Speed::Fast, false),
-            (Speed::Medium, true),
-            (Speed::Slow, true),
-            (Speed::ExtraSlow, true),
-        ] {
-            let config = EncodeConfig::default()
-                .with_speed(speed)
-                .with_num_threads(1);
-            assert!(config.function_fields);
-            assert_eq!(
-                lossy_context(&config, 1.5, XybMatrix::SPEC, 65536).function_fields,
-                supported,
-                "{speed:?}"
-            );
-            let off = config.with_function_fields(false);
-            assert!(!lossy_context(&off, 1.5, XybMatrix::SPEC, 65536).function_fields);
-        }
-        let config = EncodeConfig::default()
-            .with_speed(Speed::Slow)
-            .with_num_threads(1);
-        assert!(
-            !lossy_context(
-                &config.clone().with_progressive(true),
-                1.5,
-                XybMatrix::SPEC,
-                65536
-            )
-            .function_fields
-        );
-        assert!(
-            !lossy_context(
-                &config,
-                1.5,
-                XybMatrix::SPEC,
-                crate::function_fields::MAX_PIXELS + 1
-            )
-            .function_fields
         );
     }
 }

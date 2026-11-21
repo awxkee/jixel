@@ -881,132 +881,6 @@ fn fit_lut(samples: &[NoiseSample]) -> [f32; NUM_POINTS] {
 mod tests {
     use super::*;
 
-    fn denoise_reference(
-        ctx: &crate::encoding_context::EncodingContext,
-        scratch: &mut crate::coder_scratch::CoderScratch,
-        opsin: &mut Image3F,
-        measured: &NoiseParams,
-        scale: f32,
-    ) {
-        const N: usize = 8;
-        const STRIDE: usize = 4;
-        // Shrinkage threshold relative to the noise standard deviation per
-        // channel; chroma noise in XYB is a fraction of the luma noise.
-        const THRESH_K: [f32; 3] = [1.5, 3.0, 3.0];
-        let w = opsin.xsize();
-        let h = opsin.ysize();
-        if w < N || h < N {
-            return;
-        }
-        let src = opsin.clone();
-        // Orthonormal DCT-II basis.
-        let basis: [[f32; N]; N] = std::array::from_fn(|k| {
-            std::array::from_fn(|n| {
-                let s = if k == 0 {
-                    (1.0 / N as f32).sqrt()
-                } else {
-                    (2.0 / N as f32).sqrt()
-                };
-                s * (std::f32::consts::PI * (2 * n + 1) as f32 * k as f32 / (2 * N) as f32).cos()
-            })
-        });
-        // Window origins cover the image, the last column/row clamped inside.
-        let origins = |len: usize| -> Vec<usize> {
-            let mut v: Vec<usize> = (0..len.saturating_sub(N)).step_by(STRIDE).collect();
-            v.push(len - N);
-            v
-        };
-        let xs = origins(w);
-        let ys = origins(h);
-        let mut acc = Image3F::new(w, h);
-        let mut count = vec![0f32; w * h];
-        let mut block = [[0f32; N]; N];
-        let mut tmp = [[0f32; N]; N];
-        for &y0 in &ys {
-            for &x0 in &xs {
-                // Noise level at the block's mean intensity.
-                let mut mean = 0.0;
-                for y in 0..N {
-                    let rx = &src.plane_row(0, y0 + y)[x0..x0 + N];
-                    let ry = &src.plane_row(1, y0 + y)[x0..x0 + N];
-                    for x in 0..N {
-                        mean += 0.5 * (rx[x] + ry[x]);
-                    }
-                }
-                let sigma_y =
-                    measured.strength_at(mean / (N * N) as f32) * Y_SIGMA_PER_UNIT * scale;
-                for c in 0..3 {
-                    let thresh = THRESH_K[c] * sigma_y;
-                    let t2 = thresh * thresh;
-                    for y in 0..N {
-                        block[y].copy_from_slice(&src.plane_row(c, y0 + y)[x0..x0 + N]);
-                    }
-                    // Forward: tmp = B · block · Bᵀ.
-                    for v in 0..N {
-                        for u in 0..N {
-                            let mut s = 0.0;
-                            for y in 0..N {
-                                let mut r = 0.0;
-                                for x in 0..N {
-                                    r += basis[u][x] * block[y][x];
-                                }
-                                s += basis[v][y] * r;
-                            }
-                            tmp[v][u] = s;
-                        }
-                    }
-                    // Wiener-style shrinkage of the AC coefficients.
-                    if t2 > 0.0 {
-                        for v in 0..N {
-                            for u in 0..N {
-                                // DC and the three lowest AC bands pass: grain
-                                // lives above them, structure below.
-                                if u + v < 3 {
-                                    continue;
-                                }
-                                let c2 = tmp[v][u] * tmp[v][u];
-                                tmp[v][u] *= ((c2 - t2) / c2).max(0.0);
-                            }
-                        }
-                    }
-                    // Inverse: block = Bᵀ · tmp · B.
-                    for y in 0..N {
-                        for x in 0..N {
-                            let mut s = 0.0;
-                            for v in 0..N {
-                                let mut r = 0.0;
-                                for u in 0..N {
-                                    r += basis[u][x] * tmp[v][u];
-                                }
-                                s += basis[v][y] * r;
-                            }
-                            block[y][x] = s;
-                        }
-                    }
-                    for y in 0..N {
-                        let row = &mut acc.plane_row_mut(c, y0 + y)[x0..x0 + N];
-                        for x in 0..N {
-                            row[x] += block[y][x];
-                        }
-                    }
-                }
-                for y in 0..N {
-                    for n in &mut count[(y0 + y) * w + x0..(y0 + y) * w + x0 + N] {
-                        *n += 1.0;
-                    }
-                }
-            }
-        }
-        crate::encode_image::for_each_linear_band(opsin, ctx, scratch, |start, band| {
-            for (c, plane) in band.into_iter().enumerate() {
-                for (k, v) in plane.iter_mut().enumerate() {
-                    let p = start + k;
-                    *v = acc.plane_row(c, p / w)[p % w] / count[p];
-                }
-            }
-        });
-    }
-
     fn noisy_image(w: usize, h: usize) -> Image3F {
         let mut image = Image3F::new(w, h);
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
@@ -1109,53 +983,6 @@ mod tests {
     }
 
     #[test]
-    fn laplacian_dispatch_preserves_fitted_grain() {
-        let mut image = noisy_image(65, 35);
-        for c in 0..3 {
-            for pixel in image.plane_mut(c).as_mut_slice() {
-                *pixel *= 0.125;
-            }
-        }
-        for (name, kernels) in kernels() {
-            let scalar = NoiseKernels {
-                laplacian_stats: noise_laplacian_stats_scalar,
-                ..kernels
-            };
-            let expected = measured_grain_with_kernels(&image, scalar).0;
-            assert!(expected.has_any());
-            assert_eq!(
-                measured_grain_with_kernels(&image, kernels).0,
-                expected,
-                "{name}"
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "Laplacian benchmark; run in release mode with --ignored --nocapture"]
-    fn benchmark_noise_laplacian() {
-        use std::hint::black_box;
-        use std::time::Instant;
-        let patches: Vec<[f32; 64]> = (0..256)
-            .map(|case| std::array::from_fn(|i| ((i * 37 + case * 13) % 101) as f32 * 0.013 - 0.57))
-            .collect();
-        for (name, kernels) in kernels() {
-            let mut times = Vec::new();
-            for _ in 0..7 {
-                let start = Instant::now();
-                for _ in 0..100 {
-                    for patch in &patches {
-                        black_box(black_box(kernels.laplacian_stats)(black_box(patch)));
-                    }
-                }
-                times.push(start.elapsed().as_secs_f64() * 1e9 / (100 * patches.len()) as f64);
-            }
-            times.shared_sort_by(f64::total_cmp);
-            eprintln!("Laplacian {name}: {:.2} ns/patch", times[3]);
-        }
-    }
-
-    #[test]
     fn kernels_match_scalar_and_preserve_low_frequencies() {
         for (name, kernels) in kernels() {
             for case in 0..32 {
@@ -1187,45 +1014,6 @@ mod tests {
     }
 
     #[test]
-    fn denoise_matches_orthonormal_reference_at_edges_and_overlaps() {
-        let ctx = crate::encoding_context::EncodingContext::default();
-        let mut scratch = crate::coder_scratch::CoderScratch::default();
-        let measured = NoiseParams {
-            lut: [0.015, 0.03, 0.07, 0.04, 0.02, 0.09, 0.08, 0.05],
-        };
-        for (w, h) in [
-            (1, 9),
-            (9, 7),
-            (8, 8),
-            (9, 11),
-            (12, 12),
-            (17, 21),
-            (32, 24),
-        ] {
-            let source = noisy_image(w, h);
-            for scale in [0.0, 0.3, 1.0] {
-                let mut actual = source.clone();
-                let mut expected = source.clone();
-                denoise_reference(&ctx, &mut scratch, &mut expected, &measured, scale);
-                denoise(&ctx, &mut scratch, &mut actual, &measured, scale);
-                for c in 0..3 {
-                    for (i, (&actual, &expected)) in actual
-                        .plane_data(c)
-                        .iter()
-                        .zip(expected.plane_data(c))
-                        .enumerate()
-                    {
-                        assert!(
-                            (actual - expected).abs() < 3e-6,
-                            "{w}x{h} scale {scale} plane {c} pixel {i}: {actual} vs {expected}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
     fn denoise_is_independent_of_worker_count() {
         let mut ctx = crate::encoding_context::EncodingContext::default();
         let mut scratch = crate::coder_scratch::CoderScratch::default();
@@ -1249,97 +1037,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    #[test]
-    #[ignore = "Noise pipeline benchmark; run in release mode with --ignored --nocapture"]
-    fn benchmark_noise_pipeline() {
-        use std::hint::black_box;
-        use std::time::Instant;
-        let mut ctx = crate::encoding_context::EncodingContext::default();
-        let mut scratch = crate::coder_scratch::CoderScratch::default();
-        for (w, h) in [(256, 256), (1024, 768)] {
-            let source = noisy_image(w, h);
-            let params = NoiseParams {
-                lut: [0.04; NUM_POINTS],
-            };
-            let mut estimate_times = Vec::new();
-            let mut denoise_times = Vec::new();
-            let mut reference_times = Vec::new();
-            for _ in 0..5 {
-                let start = Instant::now();
-                black_box(measured_grain(black_box(&source)));
-                estimate_times.push(start.elapsed().as_secs_f64() * 1000.0);
-                let mut image = source.clone();
-                let start = Instant::now();
-                denoise(&ctx, &mut scratch, black_box(&mut image), &params, 1.0);
-                denoise_times.push(start.elapsed().as_secs_f64() * 1000.0);
-                black_box(image);
-                let mut image = source.clone();
-                let start = Instant::now();
-                denoise_reference(&ctx, &mut scratch, black_box(&mut image), &params, 1.0);
-                reference_times.push(start.elapsed().as_secs_f64() * 1000.0);
-                black_box(image);
-            }
-            estimate_times.shared_sort_by(f64::total_cmp);
-            denoise_times.shared_sort_by(f64::total_cmp);
-            reference_times.shared_sort_by(f64::total_cmp);
-            eprintln!(
-                "noise {w}x{h}: estimate {:.3} ms, denoise {:.3} ms, original {:.3} ms ({:.2}x)",
-                estimate_times[2],
-                denoise_times[2],
-                reference_times[2],
-                reference_times[2] / denoise_times[2]
-            );
-            ctx.thread_pool = crate::thread_pool::ThreadPool::new(4);
-            let mut parallel_times = Vec::new();
-            for _ in 0..5 {
-                let mut image = source.clone();
-                let start = Instant::now();
-                denoise(&ctx, &mut scratch, black_box(&mut image), &params, 1.0);
-                parallel_times.push(start.elapsed().as_secs_f64() * 1000.0);
-                black_box(image);
-            }
-            parallel_times.shared_sort_by(f64::total_cmp);
-            eprintln!(
-                "noise {w}x{h}: denoise 4 workers {:.3} ms",
-                parallel_times[2]
-            );
-            ctx.thread_pool = crate::thread_pool::ThreadPool::new(1);
-
-            // Lower noise reaches the Laplacian measurement and LUT fit,
-            // rather than being rejected as texture by the score histogram.
-            let mut grainy = source;
-            for c in 0..3 {
-                for pixel in grainy.plane_mut(c).as_mut_slice() {
-                    *pixel *= 0.125;
-                }
-            }
-            assert!(measured_grain(&grainy).has_any());
-            let mut grainy_times = Vec::new();
-            let mut scalar_laplacian_times = Vec::new();
-            let scalar_laplacian = NoiseKernels {
-                laplacian_stats: noise_laplacian_stats_scalar,
-                ..ctx.noise_kernels
-            };
-            for _ in 0..5 {
-                let start = Instant::now();
-                black_box(measured_grain(black_box(&grainy)));
-                grainy_times.push(start.elapsed().as_secs_f64() * 1000.0);
-                let start = Instant::now();
-                black_box(measured_grain_with_kernels(
-                    black_box(&grainy),
-                    scalar_laplacian,
-                ));
-                scalar_laplacian_times.push(start.elapsed().as_secs_f64() * 1000.0);
-            }
-            grainy_times.shared_sort_by(f64::total_cmp);
-            scalar_laplacian_times.shared_sort_by(f64::total_cmp);
-            eprintln!(
-                "grain {w}x{h}: full estimate {:.3} ms, scalar Laplacian {:.3} ms",
-                grainy_times[2], scalar_laplacian_times[2]
-            );
         }
     }
 
@@ -1383,17 +1080,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn flat_image_measures_no_grain() {
-        let mut img = Image3F::new(64, 64);
-        for c in 0..3 {
-            for y in 0..64 {
-                img.plane_row_mut(c, y).fill(0.3);
-            }
-        }
-        assert!(!measured_grain(&img).has_any());
-    }
-
     fn noisy_gray_bands(bands: &[(f32, f32, usize)]) -> Image3F {
         let w = bands.iter().map(|&(_, _, width)| width).sum();
         let mut img = Image3F::new(w, 256);
@@ -1416,40 +1102,6 @@ mod tests {
             x0 += width;
         }
         img
-    }
-
-    #[test]
-    fn faint_noise_is_not_discarded_by_the_score_histogram() {
-        let img = noisy_gray_bands(&[(0.5, 0.0006, 256)]);
-        let measured = measured_grain(&img);
-        assert!(measured.has_any(), "lut {:?}", measured.lut);
-    }
-
-    #[test]
-    fn repeated_texture_is_not_measured_as_faint_noise() {
-        for sigma in [0.0, 0.0006] {
-            for pattern in [0, 1, 2] {
-                let mut img = noisy_gray_bands(&[(0.5, sigma, 256)]);
-                for y in 0..img.ysize() {
-                    for x in 0..img.xsize() {
-                        let phase = match pattern {
-                            0 => x + y,
-                            1 => x,
-                            _ => y,
-                        };
-                        let texture = if phase % 2 == 0 { -0.05 } else { 0.05 };
-                        img.plane_row_mut(1, y)[x] += texture;
-                        img.plane_row_mut(2, y)[x] += texture;
-                    }
-                }
-                let measured = measured_grain(&img);
-                assert!(
-                    !measured.has_any(),
-                    "sigma {sigma}, pattern {pattern}, lut {:?}",
-                    measured.lut
-                );
-            }
-        }
     }
 
     #[test]

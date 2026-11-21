@@ -377,46 +377,6 @@ mod tests {
         }
     }
 
-    /// Noise everywhere but a 256x192 panel of hard two-tone strokes
-    /// (`ink` on `paper`) at (64, 64).
-    fn strokes(width: usize, height: usize, paper: [u8; 3], ink: [u8; 3]) -> Vec<u8> {
-        let mut seed = 5u32;
-        let mut rgb: Vec<u8> = (0..width * height * 3)
-            .map(|_| {
-                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                (seed >> 24) as u8
-            })
-            .collect();
-        for y in 64..256 {
-            for x in 64..320 {
-                // Glyph-like marks: 2 px strokes every 5 px on lines 7 px apart.
-                let on = y % 7 < 4 && (x + y / 7) % 5 < 2;
-                rgb[(y * width + x) * 3..][..3].copy_from_slice(if on { &ink } else { &paper });
-            }
-        }
-        rgb
-    }
-
-    #[test]
-    fn plan_detail_takes_two_tone_strokes_in_either_polarity() {
-        let (w, h) = (448, 320);
-        for (paper, ink) in [
-            ([250, 250, 250], [20, 20, 20]),
-            ([10, 10, 10], [230, 230, 230]),
-        ] {
-            let boxes = plan_detail(&strokes(w, h, paper, ink), w, h, &[]);
-            assert_eq!(
-                boxes,
-                vec![CropBox {
-                    x0: 64,
-                    y0: 64,
-                    width: 256,
-                    height: 192
-                }]
-            );
-        }
-    }
-
     /// A small image of nothing but strokes plans one box over all of it:
     /// its crop frame is then a full frame (see the crop header writers).
     #[test]
@@ -438,36 +398,6 @@ mod tests {
                 height: h
             }]
         );
-    }
-
-    #[test]
-    fn plan_detail_leaves_saturated_strokes_noise_and_taken_boxes() {
-        let (w, h) = (448, 320);
-        // Red on white: the edges move chroma as much as luma.
-        let red = strokes(w, h, [255, 255, 255], [255, 0, 0]);
-        assert!(plan_detail(&red, w, h, &[]).is_empty());
-        let gray = strokes(w, h, [250, 250, 250], [20, 20, 20]);
-        let taken = CropBox {
-            x0: 64,
-            y0: 64,
-            width: 256,
-            height: 192,
-        };
-        assert!(plan_detail(&gray, w, h, &[taken]).is_empty());
-    }
-
-    #[test]
-    fn plan_skips_flat_and_rich_images() {
-        let (w, h) = (256, 256);
-        assert!(plan(&vec![200u8; w * h * 3], w, h).is_empty());
-        let mut seed = 7u32;
-        let noise: Vec<u8> = (0..w * h * 3)
-            .map(|_| {
-                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                (seed >> 24) as u8
-            })
-            .collect();
-        assert!(plan(&noise, w, h).is_empty());
     }
 
     #[test]

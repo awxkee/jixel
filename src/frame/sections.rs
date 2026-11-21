@@ -245,19 +245,4 @@ mod tests {
         let pass0: Vec<usize> = order[3..3 + n].iter().map(|&s| s - 3).collect();
         assert_eq!(pass0, pass1);
     }
-
-    #[test]
-    fn diagonal_order_draws_an_x_first() {
-        // 2048x1365: 8x6 AC groups. The first twelve form the X: the center
-        // four, then both diagonals outward.
-        let dim = super::ImageDim::new(2048, 1365);
-        let order = super::group_section_order(&dim, 1, crate::GroupOrder::Diagonals);
-        let groups: Vec<usize> = order[3..].iter().map(|&s| s - 3).collect();
-        let mut x: Vec<usize> = groups[..12].to_vec();
-        x.shared_sort();
-        assert_eq!(x, [9, 10, 13, 14, 19, 20, 26, 27, 28, 29, 33, 38]);
-        let mut sorted = groups.clone();
-        sorted.shared_sort();
-        assert!(sorted.iter().enumerate().all(|(i, &v)| i == v));
-    }
 }

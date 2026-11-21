@@ -69,7 +69,7 @@ impl<T: Copy + Default> Plane<T> {
         })
     }
 
-    #[cfg(any(test, feature = "extraslow"))]
+    #[cfg(feature = "extraslow")]
     fn resize(&mut self, xsize: usize, ysize: usize) {
         self.data.resize(xsize * ysize, T::default());
         self.xsize = xsize;
@@ -105,22 +105,6 @@ impl<T: Copy + Default> Plane<T> {
     pub(crate) fn row_mut(&mut self, y: usize) -> &mut [T] {
         let w = self.xsize;
         &mut self.data[y * w..(y + 1) * w]
-    }
-
-    /// Borrow one row immutably and a different one mutably. Useful for
-    /// replicating a row to fill padding.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn two_rows_mut_safe(&mut self, y_src: usize, y_dst: usize) -> (&[T], &mut [T]) {
-        let w = self.xsize;
-        debug_assert!(y_src != y_dst);
-        if y_src < y_dst {
-            let (a, b) = self.data.split_at_mut(y_dst * w);
-            (&a[y_src * w..(y_src + 1) * w], &mut b[..w])
-        } else {
-            let (a, b) = self.data.split_at_mut(y_src * w);
-            (&b[..w], &mut a[y_dst * w..(y_dst + 1) * w])
-        }
     }
 }
 
@@ -172,7 +156,7 @@ impl<T: Copy + Default> Image3<T> {
     }
 
     /// Reuse pixel storage for a new image that the caller will overwrite.
-    #[cfg(any(test, feature = "extraslow"))]
+    #[cfg(feature = "extraslow")]
     pub(crate) fn resize(&mut self, xsize: usize, ysize: usize) {
         for plane in &mut self.planes {
             plane.resize(xsize, ysize);

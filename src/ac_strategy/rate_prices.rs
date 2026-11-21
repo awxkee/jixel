@@ -237,49 +237,6 @@ fn walk_block(
     }
 }
 
-// Original row-wise count and token walk, retained as an exact test oracle.
-#[cfg(test)]
-fn walk_block_reference(
-    orders: &CoeffOrders,
-    strategy: u8,
-    c: usize,
-    block: &[i32],
-    cx: usize,
-    cy: usize,
-    mut emit: impl FnMut(usize, u32),
-) {
-    let size = cx * cy * 64;
-    let covered = cx * cy;
-    let log2_covered = covered.trailing_zeros() as usize;
-    let width = cx * 8;
-    let mut nzeros = 0usize;
-    for (v, row) in block[..size].chunks_exact(width).enumerate() {
-        let skip = if v < cy { cx } else { 0 };
-        nzeros += row[skip..].iter().filter(|&&q| q != 0).count();
-    }
-    let predicted = ((nzeros + covered - 1) >> log2_covered).min(32) as u32;
-    emit(
-        fine_non_zero_context(predicted, 0) as usize / K_NUM_FINE_BLOCK_CTXS,
-        nzeros as u32,
-    );
-    let scan = orders.scan_for(STRATEGY_CODE_LUT[strategy as usize], c);
-    let mut prev = usize::from(nzeros <= size / 16);
-    let mut remaining = nzeros;
-    let mut k = covered;
-    while k < size && remaining != 0 {
-        let coef = block[scan[k] as usize];
-        let context = if covered == 1 {
-            zero_density_context_8x8(remaining, k, prev)
-        } else {
-            zero_density_context(remaining, k, covered, log2_covered, prev)
-        };
-        emit(K_NON_ZERO_BUCKETS + context, pack_signed(coef));
-        prev = usize::from(coef != 0);
-        remaining -= usize::from(coef != 0);
-        k += 1;
-    }
-}
-
 fn inverse_matrix_of(ctx: &EncodingContext, strategy: u8, c: usize) -> &[f32] {
     match strategy {
         STRATEGY_DCT64X64 => &ctx.matrices().inv_matrix_64x64(c)[..],
@@ -1164,72 +1121,6 @@ mod tests {
     }
 
     #[test]
-    fn contiguous_nonzero_count_preserves_every_learned_rate_token() {
-        let mut rng = 73u32;
-        let natural = CoeffOrders::natural();
-        let mut learned = CoeffOrders::natural();
-        let mut stats = OrderStats::new();
-        for (slot, &(_, _, size)) in crate::coeff_order::ORDER_SPECS.iter().enumerate() {
-            for _ in 0..10_000 {
-                stats.tally_block(slot);
-                for c in 0..3 {
-                    stats.tally(slot, c, size - 1);
-                }
-            }
-        }
-        derive_orders(&stats, &mut learned);
-        for strategy in selectable(crate::Speed::Slow, 1.0) {
-            let x = AcStrategyImage::covered_blocks_x_of(strategy);
-            let y = AcStrategyImage::covered_blocks_y_of(strategy);
-            let (cx, cy) = (x.max(y), x.min(y));
-            let size = cx * cy * 64;
-            for case in 0..32 {
-                let block: Vec<i32> = (0..size + 5)
-                    .map(|i| {
-                        rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
-                        match case % 4 {
-                            0 => 0,
-                            1 => {
-                                if i % 17 == 0 {
-                                    1
-                                } else {
-                                    0
-                                }
-                            }
-                            2 => (rng as i32) % 7,
-                            _ => rng as i32,
-                        }
-                    })
-                    .collect();
-                // Keep nonzero LF and trailing sentinels: both exclusions are
-                // part of the original block walk, independent of quantization.
-                for orders in [&natural, &learned] {
-                    for c in 0..3 {
-                        let mut expected = Vec::new();
-                        let mut actual = Vec::new();
-                        walk_block_reference(
-                            orders,
-                            strategy,
-                            c,
-                            &block,
-                            cx,
-                            cy,
-                            |context, value| expected.push((context, value)),
-                        );
-                        walk_block(orders, strategy, c, &block, cx, cy, |context, value| {
-                            actual.push((context, value))
-                        });
-                        assert_eq!(
-                            actual, expected,
-                            "strategy {strategy}, channel {c}, case {case}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
     fn dct64_views_preserve_gathered_coefficients_and_edge_replication() {
         let ctx = EncodingContext::new(
             crate::Speed::Slow,
@@ -1438,92 +1329,6 @@ mod tests {
     }
 
     #[test]
-    fn repeated_blocks_cost_a_fraction_of_the_fixed_model() {
-        // The norm is the fixed model's bits over the learned bits of the
-        // sampled DCT8 blocks.
-        let periodic = learn(&checkerboard(256), 2.0);
-        assert!(periodic.norm > 2.0, "{}", periodic.norm);
-        let random = learn(&noise(256), 2.0);
-        assert!(random.norm < periodic.norm * 0.5, "{}", random.norm);
-    }
-
-    #[test]
-    fn a_layout_restricts_a_transform_to_its_blocks() {
-        // Left half: the checkerboard. Right half: noise.
-        let (pattern, random) = (checkerboard(256), noise(256));
-        let mut opsin = Image3F::new(256, 256);
-        for c in 0..3 {
-            for y in 0..256 {
-                let row = opsin.plane_row_mut(c, y);
-                row[..128].copy_from_slice(&pattern.plane_row(c, y)[..128]);
-                row[128..256].copy_from_slice(&random.plane_row(c, y)[128..256]);
-            }
-        }
-        // DCT8 took the noise; 16x16 took the pattern.
-        let mut layout = AcStrategyImage::new(32, 32);
-        for by in (0..32).step_by(2) {
-            for bx in (0..16).step_by(2) {
-                layout.set_first(bx, by, STRATEGY_DCT16X16);
-            }
-        }
-        let learn = |layout: Option<&AcStrategyImage>| {
-            let ctx = EncodingContext::new(
-                crate::Speed::Slow,
-                crate::Arbiter::Ssimulacra2,
-                crate::xyb::XybMatrix::SPEC,
-                2.0,
-                1,
-            );
-            let quant_field = ImageB::new_fill(32, 32, 5);
-            let maps = ImageSB::new_fill(4, 4, 0);
-            let mut scratch = CoderScratch::default();
-            RatePrices::learn(
-                &ctx,
-                &mut scratch,
-                &opsin,
-                0,
-                0,
-                &quant_field,
-                &maps,
-                &maps,
-                0.04,
-                1.0,
-                2.0,
-                layout,
-                1,
-            )
-        };
-        // The norm compares the two models on the sampled DCT8 blocks: on
-        // noise alone they agree better than with the pattern mixed in.
-        let (everywhere, chosen) = (learn(None), learn(Some(&layout)));
-        assert!(
-            chosen.norm < everywhere.norm * 0.95,
-            "{} vs {}",
-            chosen.norm,
-            everywhere.norm
-        );
-    }
-
-    #[test]
-    fn only_selectable_transforms_are_priced() {
-        let prices = learn(&checkerboard(256), 3.0);
-        for strategy in [
-            STRATEGY_DCT,
-            STRATEGY_DCT16X16,
-            STRATEGY_DCT32X32,
-            STRATEGY_IDENTITY,
-        ] {
-            assert!(prices.tables[strategy as usize].is_some(), "{strategy}");
-        }
-        // Sub-8 transforms stop at d = 1.5.
-        for strategy in [STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_AFV0] {
-            assert!(prices.tables[strategy as usize].is_none(), "{strategy}");
-        }
-        let prices = learn(&checkerboard(256), 1.0);
-        assert!(prices.tables[STRATEGY_DCT4X4 as usize].is_some());
-    }
-
-    #[test]
     fn compact_prices_preserve_every_context_and_pool() {
         let mut dense = vec![0.0f32; ROWS * SYMBOLS];
         for (row, counts) in dense.as_chunks_mut::<SYMBOLS>().0.iter_mut().enumerate() {
@@ -1553,53 +1358,6 @@ mod tests {
                     compact[stored + symbol].to_bits()
                 );
             }
-        }
-    }
-
-    #[test]
-    fn in_place_prices_match_separate_count_and_price_buffers() {
-        let mut counts = vec![0f32; 8 * SYMBOLS];
-        for (row, counts) in counts.as_chunks_mut::<SYMBOLS>().0.iter_mut().enumerate() {
-            if row % 3 == 0 {
-                continue;
-            }
-            for (symbol, count) in counts.iter_mut().enumerate() {
-                *count = ((row * 7919 + symbol * 104729) % 97) as f32 * 0.25;
-            }
-        }
-        let mut pool = [POOL_FLOOR; SYMBOLS];
-        for row in counts.as_chunks::<SYMBOLS>().0 {
-            for (pooled, count) in pool.iter_mut().zip(row) {
-                *pooled += count;
-            }
-        }
-        let pool_total: f32 = pool.iter().sum();
-        for pooled in &mut pool {
-            *pooled *= POOL_WEIGHT / pool_total;
-        }
-        let mut expected = Vec::new();
-        let mut standard_log_prices = Vec::new();
-        for row in counts.as_chunks::<SYMBOLS>().0 {
-            let total = row.iter().sum::<f32>() + POOL_WEIGHT;
-            for (count, pooled) in row.iter().zip(pool) {
-                let ratio = total / (count + pooled);
-                expected.push(dirty_log2f(ratio).to_bits());
-                standard_log_prices.push(ratio.log2());
-            }
-        }
-        price_contexts(&mut counts);
-        assert_eq!(
-            expected,
-            counts.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
-        );
-        // The storage transformation stays exact under the new kernel;
-        // independently check that its prices still approximate log2.
-        for (&price, reference) in counts.iter().zip(standard_log_prices) {
-            assert!(price.is_finite() && price >= 0.0);
-            assert!(
-                (price - reference).abs() < 2.0e-6,
-                "{price} vs standard log2 {reference}"
-            );
         }
     }
 

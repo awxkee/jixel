@@ -492,18 +492,6 @@ impl PredictorCosts {
     }
 }
 
-/// Evaluate all Slow-mode predictors in one traversal and choose the lowest
-/// order-0 residual entropy. Weighted remains the deterministic tie-breaker.
-#[cfg(test)]
-pub(crate) fn choose_predictor_for_plane(
-    get: impl Fn(usize, usize) -> i32,
-    w: usize,
-    h: usize,
-    use_wp: bool,
-) -> u32 {
-    choose_predictor_for_plane_with_wp(get, w, h, WpParams::DEFAULT, use_wp)
-}
-
 pub(crate) fn choose_predictor_for_rows<'a, T: Sample + 'a>(
     get_row: impl Fn(usize) -> &'a [T],
     w: usize,
@@ -519,46 +507,6 @@ where
     let mut costs = SqueezePredictorCost::default();
     costs.add_rows(get_row, w, h, use_wp);
     costs.predictor(use_wp)
-}
-
-#[cfg(test)]
-pub(super) fn choose_predictor_for_plane_with_wp(
-    get: impl Fn(usize, usize) -> i32,
-    w: usize,
-    h: usize,
-    wp_params: WpParams,
-    use_wp: bool,
-) -> u32 {
-    if w == 0 || h == 0 {
-        return fixed_predictor(use_wp);
-    }
-    let disabled = !use_wp;
-    let mut wp = WpState::with_params(w, wp_params);
-    let mut costs = PredictorCosts::default();
-    for gy in 0..h {
-        for gx in 0..w {
-            let value = get(gx, gy) as i64;
-            let neighbors = predictor_neighbors(&get, gx, gy, w);
-            let weighted = if disabled {
-                0
-            } else {
-                wp.predict(
-                    gx,
-                    gy,
-                    neighbors.top,
-                    neighbors.left,
-                    neighbors.top_right,
-                    neighbors.top_left,
-                    neighbors.top_top,
-                )
-            };
-            costs.add(value, neighbors, weighted);
-            if !disabled {
-                wp.update(value, gx, gy);
-            }
-        }
-    }
-    costs.best_predictor(use_wp)
 }
 
 pub(in crate::lossless) fn choose_predictors_with_wp(

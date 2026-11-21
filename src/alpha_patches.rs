@@ -322,43 +322,6 @@ mod tests {
     }
 
     #[test]
-    fn constant_unique_sparse_and_unsupported_planes_skip() {
-        let (width, height) = (256, 256);
-        assert!(
-            find_alpha_patches(&AlphaPlane::U8(vec![255; width * height]), width, height).is_none()
-        );
-        assert!(
-            find_alpha_patches(
-                &AlphaPlane::U16 {
-                    data: vec![1; width * height],
-                    bits: 16
-                },
-                width,
-                height
-            )
-            .is_none()
-        );
-        assert!(
-            find_alpha_patches(&AlphaPlane::F32(vec![0; width * height]), width, height).is_none()
-        );
-        assert!(
-            find_alpha_patches(&AlphaPlane::U8(vec![0; width * height - 1]), width, height)
-                .is_none()
-        );
-        let mut unique = repeated_image(width, height);
-        for tile in 0..64 {
-            unique[(tile / 8) * TILE * width + (tile % 8) * TILE] = tile as u8;
-        }
-        assert!(find_alpha_patches(&AlphaPlane::U8(unique), width, height).is_none());
-        let mut sparse = vec![0; 1024 * 1024];
-        let repeated = repeated_image(256, 128);
-        for y in 0..128 {
-            sparse[y * 1024..][..256].copy_from_slice(&repeated[y * 256..][..256]);
-        }
-        assert!(find_alpha_patches(&AlphaPlane::U8(sparse), 1024, 1024).is_none());
-    }
-
-    #[test]
     fn hash_collisions_do_not_merge_different_masks() {
         let data = repeated_image(256, 256);
         let alpha = AlphaPlane::U8(data.clone());

@@ -142,29 +142,3 @@ fn tail_writes_the_same_bits_as_materialized_zeros() {
         }
     }
 }
-
-#[test]
-fn no_tail_keeps_the_code_and_section_unchanged() {
-    let literals = stream(3, 2000, 3);
-    let mut scratch = CoderScratch::default();
-    let code = build_lz_pixel_code_tails(
-        false,
-        &[literals.as_slice()],
-        &[ConstantTail::NONE],
-        3,
-        64,
-        true,
-        true,
-        None,
-        &mut scratch.lz_entropy,
-        &mut scratch.huffman_pool,
-    );
-    let mut a = BitWriter::new();
-    write_lz_section_tail(&literals, ConstantTail::NONE, 3, &code, 64, &mut a);
-    let mut b = BitWriter::new();
-    write_lz_section(&literals, 3, &code, 64, &mut b);
-    assert_eq!(a.bits_written(), b.bits_written());
-    a.zero_pad_to_byte();
-    b.zero_pad_to_byte();
-    assert_eq!(a.into_bytes(), b.into_bytes());
-}

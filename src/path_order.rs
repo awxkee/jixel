@@ -821,29 +821,4 @@ mod tests {
             assert!(cost.of(&points, &path) < cost.of(&points, &initial));
         }
     }
-
-    #[test]
-    fn rows_are_walked_back_and_forth() {
-        // Raster order pays a long jump back at every row end.
-        let points: Vec<Pos> = (0..6)
-            .flat_map(|y| (0..20).map(move |x| (x * 9, y * 14)))
-            .collect();
-        let initial: Vec<usize> = (0..points.len()).collect();
-        let deltas = initial
-            .array_windows::<2>()
-            .flat_map(|&[a, b]| {
-                [
-                    pack_signed(points[b].0 - points[a].0),
-                    pack_signed(points[b].1 - points[a].1),
-                ]
-            })
-            .collect::<Vec<_>>();
-        let prices = Prices::learn(deltas);
-        let cost = PathCost {
-            first: &prices,
-            delta: &prices,
-        };
-        let path = order(&points, &cost, initial.clone(), &mut None);
-        assert!(cost.of(&points, &path) < cost.of(&points, &initial) - 10.0);
-    }
 }

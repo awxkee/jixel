@@ -276,13 +276,8 @@ pub(super) fn order_of_path(path: &[usize]) -> Vec<i32> {
 
 /// Order colors by spatial adjacency rather than by color: grow a chain from
 /// the most-connected color, at each step attaching the unused color with the
-/// most co-occurrences to whichever chain end it touches more.
-#[cfg(test)]
-pub(super) fn cooccurrence_chain(n: usize, cooc: &[u32]) -> Vec<i32> {
-    order_of_path(&cooccurrence_chain_path(n, cooc))
-}
-
-/// The `cooccurrence_chain` as the list of canonical colors in chain order.
+/// most co-occurrences to whichever chain end it touches more. Returns the
+/// canonical colors in chain order.
 pub(super) fn cooccurrence_chain_path(n: usize, cooc: &[u32]) -> Vec<usize> {
     let total: Vec<u64> = (0..n)
         .map(|i| cooc[i * n..(i + 1) * n].iter().map(|&v| v as u64).sum())

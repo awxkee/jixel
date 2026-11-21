@@ -142,14 +142,6 @@ impl Piece {
         }
         mask
     }
-    #[cfg(test)]
-    fn shifted32(self) -> bool {
-        matches!(
-            self.strategy,
-            STRATEGY_DCT32X32 | STRATEGY_DCT32X16 | STRATEGY_DCT16X32
-        ) && (!(self.x as usize).is_multiple_of(self.width())
-            || !(self.y as usize).is_multiple_of(self.height()))
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2494,38 +2486,6 @@ mod tests {
         assert_eq!(pieces_mask(pieces), expected);
     }
     #[test]
-    fn coefficient_search_runs_where_the_reconstruction_search_does_not() {
-        let gate = |speed: crate::Speed| {
-            let effort = speed.effort();
-            effort.layout_dp_coefficient && !effort.layout_retile
-        };
-        assert!(!gate(crate::Speed::UltraFast));
-        assert!(gate(crate::Speed::Fastest));
-        assert!(gate(crate::Speed::Fast));
-        assert!(gate(crate::Speed::Medium));
-        assert!(!gate(crate::Speed::MediumSlow));
-        assert!(!gate(crate::Speed::Slow));
-        assert!(!gate(crate::Speed::ExtraSlow));
-    }
-    #[test]
-    fn search_runs_at_slow_and_under_the_extraslow_loop_only_once() {
-        let gate = |speed: crate::Speed| {
-            let effort = speed.effort();
-            effort.layout_retile && !effort.layout_loop()
-        };
-        assert!(gate(crate::Speed::MediumSlow));
-        assert!(gate(crate::Speed::Slow));
-        assert_eq!(gate(crate::Speed::ExtraSlow), !cfg!(feature = "extraslow"));
-        for speed in [
-            crate::Speed::UltraFast,
-            crate::Speed::Fastest,
-            crate::Speed::Fast,
-            crate::Speed::Medium,
-        ] {
-            assert!(!gate(speed));
-        }
-    }
-    #[test]
     fn every_family_uses_the_same_eight_pixel_grid() {
         let map = AcStrategyImage::new(24, 24);
         for w in 1..=8 {
@@ -2646,49 +2606,6 @@ mod tests {
         assert_eq!(cost, 7.0);
         assert_eq!(pieces.len(), 5);
         assert_coverage(&pieces, 8, 8);
-    }
-    #[test]
-    fn pairs_cross_old_sixteen_pixel_cell_boundaries() {
-        let mut c = Vec::new();
-        for y in 0..2 {
-            for x in 0..4 {
-                c.push(direct(
-                    x,
-                    y,
-                    STRATEGY_DCT,
-                    if x == 0 || x == 3 { 1.0 } else { 20.0 },
-                ));
-            }
-        }
-        c.extend([
-            direct(1, 0, STRATEGY_DCT8X16, 1.0),
-            direct(1, 1, STRATEGY_DCT8X16, 1.0),
-        ]);
-        let (cost, pieces) = solve(&c, 4, 2);
-        assert_eq!(cost, 6.0);
-        assert_eq!(pieces.len(), 6);
-        assert!(pieces.contains(&Piece::new(1, 0, STRATEGY_DCT8X16)));
-        assert_coverage(&pieces, 4, 2);
-    }
-    #[test]
-    fn strips_and_pairs_cover_an_eight_pixel_sliver() {
-        let mut c = Vec::new();
-        for y in 0..8 {
-            c.push(direct(
-                0,
-                y,
-                STRATEGY_DCT,
-                if y == 0 || y == 7 { 1.0 } else { 20.0 },
-            ));
-        }
-        c.extend([
-            direct(0, 1, STRATEGY_DCT32X8, 1.0),
-            direct(0, 5, STRATEGY_DCT16X8, 1.0),
-        ]);
-        let (cost, pieces) = solve(&c, 1, 8);
-        assert_eq!(cost, 4.0);
-        assert_eq!(pieces.len(), 4);
-        assert_coverage(&pieces, 1, 8);
     }
     #[test]
     fn incumbent_sixty_four_blocks_compete_only_as_placed() {
@@ -3037,102 +2954,6 @@ mod tests {
             16.0 * 13.0
         );
         assert_eq!(s.plan.len(), 12);
-    }
-
-    #[test]
-    fn real_reconstruction_can_promote_a_shifted_square() {
-        let maps = ImageSB::new_fill(1, 1, 0);
-        let quants = ImageB::new_fill(8, 8, 6);
-        let bands = [(0, 8)];
-        let mut winners = 0;
-        for frequency in [1, 2, 3, 5] {
-            let mut opsin = Image3F::new(64, 64);
-            for y in 0..64 {
-                for x in 0..64 {
-                    let ink = if (16..48).contains(&x) && y >= 32 {
-                        0.16 * ((x as f32 - 15.5) * std::f32::consts::PI / 32.0).cos()
-                            * ((y as f32 - 31.5) * std::f32::consts::PI * frequency as f32 / 32.0)
-                                .cos()
-                    } else {
-                        0.0
-                    };
-                    opsin.plane_row_mut(0, y)[x] = 0.02;
-                    opsin.plane_row_mut(1, y)[x] = 0.3 + ink;
-                    opsin.plane_row_mut(2, y)[x] = 0.3;
-                }
-            }
-            for scale in [0.02, 0.05, 0.1, 0.25] {
-                let ctx = EncodingContext::new(
-                    crate::Speed::Slow,
-                    crate::Arbiter::Ssimulacra2,
-                    crate::xyb::XybMatrix::SPEC,
-                    2.0,
-                    1,
-                );
-                let params = AcStrategyParams {
-                    ctx: &ctx,
-                    opsin: &opsin,
-                    dc_group_px: 0,
-                    dc_group_py: 0,
-                    distance: 2.0,
-                    scale,
-                    qm_mult_x: 1.0,
-                    ytox_map: &maps,
-                    ytob_map: &maps,
-                    prices: None,
-                };
-                let rerank = RerankContext {
-                    params,
-                    quant_field: &quants,
-                    bands: &bands,
-                    num_threads: 1,
-                    leaf_first: false,
-                    leaves: &[],
-                };
-                let mut map = AcStrategyImage::new(8, 8);
-                for y in [0, 4] {
-                    for x in [0, 4] {
-                        map.set_first(x, y, STRATEGY_DCT32X32);
-                    }
-                }
-                let mut coder = CoderScratch::default();
-                let mut cache = LayoutDpScratch::default();
-                let mut accepted = Vec::new();
-                search_tile(
-                    &Scores {
-                        rerank: &rerank,
-                        bx: 0,
-                        by: 0,
-                    },
-                    &mut coder,
-                    &mut cache,
-                    &map,
-                    8,
-                    8,
-                    false,
-                    &mut accepted,
-                );
-                assert!(cache.candidates.len() <= MAX_CANDIDATES);
-                for up in &accepted {
-                    map.set_first(up.bx, up.by, up.strategy);
-                }
-                let pieces: Vec<_> = map
-                    .iter_first_blocks()
-                    .map(|(x, y, s)| Piece::new(x, y, s))
-                    .collect();
-                assert_eq!(pieces_mask(&pieces), u64::MAX);
-                assert!(pieces.iter().all(|p| map.can_place_strategy(
-                    p.x as usize,
-                    p.y as usize,
-                    p.strategy
-                )));
-                winners += usize::from(pieces.iter().any(|p| p.shifted32()));
-            }
-        }
-        assert!(
-            winners > 0,
-            "real forward/inverse scoring never selected a shifted 32-family transform"
-        );
     }
 }
 

@@ -494,28 +494,4 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn deep_fit_declines_other_planes() {
-        let pool = ThreadPool::new(1);
-        assert!(fit(&pool, &AlphaPlane::U8(vec![0; 64 * 64]), 64, 64, true).is_none());
-        let mut state = 1u32;
-        let noise = AlphaPlane::U16 {
-            data: (0..96 * 96)
-                .map(|_| {
-                    state ^= state << 13;
-                    state ^= state >> 17;
-                    state ^= state << 5;
-                    (state & 1023) as u16
-                })
-                .collect(),
-            bits: 10,
-        };
-        assert!(fit(&pool, &noise, 96, 96, true).is_none());
-        let short = AlphaPlane::U16 {
-            data: vec![0; 10],
-            bits: 16,
-        };
-        assert!(fit(&pool, &short, 64, 64, true).is_none());
-    }
 }

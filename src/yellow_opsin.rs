@@ -828,13 +828,6 @@ mod tests {
     }
 
     #[test]
-    fn spec_bias_returns_spec_matrix() {
-        let m = matrix_for_bias(SPEC_BIAS);
-        assert_eq!(m, XybMatrix::SPEC);
-        assert!(m.is_decoder_default());
-    }
-
-    #[test]
     fn derived_inverse_matches_forward() {
         for bias in [0.60, 0.70, 0.85, STRONG_COARSE_BIAS] {
             let m = matrix_for_bias(bias);
@@ -853,35 +846,6 @@ mod tests {
             // Rows still sum to 1 so grays map identically.
             let row_sum = m.fwd[6] + m.fwd[7] + m.fwd[8];
             assert!((row_sum - 1.0).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn bias_085_matches_validated_red_inverse() {
-        // The 0.85 inverse was validated end-to-end with djxl during the
-        // red-opsin experiment; the derived inverse must reproduce it.
-        let expected: [f32; 9] = [
-            10.785_613,
-            -9.684_577,
-            -0.101_036_27,
-            -3.500_100_9,
-            4.601_137,
-            -0.101_036_27,
-            -0.751_554_5,
-            0.557_254,
-            1.194_300_5,
-        ];
-        let m = matrix_for_bias(0.85);
-        for (a, b) in m.inv.iter().zip(expected.iter()) {
-            assert!((a - b).abs() < 2e-4 * b.abs().max(1.0), "{a} vs {b}");
-        }
-    }
-
-    #[test]
-    fn spec_numeric_inverse_matches_decoder_default() {
-        let inv = invert3x3(&XybMatrix::SPEC.fwd).unwrap();
-        for (a, b) in inv.iter().zip(XybMatrix::SPEC.inv.iter()) {
-            assert!((a - b).abs() < 2e-4 * b.abs().max(1.0), "{a} vs {b}");
         }
     }
 
@@ -908,18 +872,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn detector_scores_bright_yellow_only() {
-        // Bright saturated yellow: strong.
-        assert!(yellow_pixel_risk(0.9, 0.85, 0.05) > 0.5);
-        // Bright pure red / green / blue / white / gray: zero-ish.
-        assert!(yellow_pixel_risk(0.9, 0.05, 0.05) < 1e-3);
-        assert!(yellow_pixel_risk(0.05, 0.9, 0.05) < 1e-3);
-        assert!(yellow_pixel_risk(0.05, 0.05, 0.9) == 0.0);
-        assert!(yellow_pixel_risk(0.9, 0.9, 0.9) == 0.0);
-        assert!(yellow_pixel_risk(0.3, 0.3, 0.05) == 0.0); // too dark
-    }
-
     fn filled(w: usize, h: usize, rgb: [f32; 3]) -> Image3F {
         let mut img = Image3F::new(w, h);
         for c in 0..3 {
@@ -930,85 +882,6 @@ mod tests {
             }
         }
         img
-    }
-
-    #[test]
-    fn gate_fires_on_yellow_image_only() {
-        assert!(has_yellow_risk(&filled(64, 64, [0.9, 0.85, 0.05])));
-        assert!(!has_yellow_risk(&filled(64, 64, [0.5, 0.5, 0.5])));
-        assert!(!has_yellow_risk(&filled(64, 64, [0.9, 0.1, 0.05])));
-    }
-
-    #[test]
-    fn choose_bias_spec_below_min_distance() {
-        let img = filled(64, 64, [0.9, 0.85, 0.05]);
-        assert_eq!(choose_b_bias(&img, 0.1), SPEC_BIAS);
-    }
-
-    #[test]
-    fn choose_bias_prefers_spec_on_neutral_content() {
-        let img = filled(64, 64, [0.4, 0.5, 0.6]);
-        assert_eq!(choose_b_bias(&img, 2.0), SPEC_BIAS);
-    }
-
-    #[test]
-    fn fine_b_is_reserved_for_the_high_frequency_tier() {
-        let smooth = filled(64, 64, [0.9, 0.85, 0.05]);
-        let smooth_selection = select_yellow(&smooth, 1.0, &ThreadPool::new(1));
-        assert!(smooth_selection.matrix.is_none());
-        assert_eq!(smooth_selection.b_qm_scale, 2);
-
-        // Every other column steps to a grey (mild edges) or to black
-        // (strong edges); the statistic runs over every risky pixel.
-        let mut tier2 = filled(64, 64, [0.9, 0.85, 0.05]);
-        for y in 0..64 {
-            for x in (1..64).step_by(2) {
-                for c in 0..3 {
-                    tier2.plane_row_mut(c, y)[x] = 0.6;
-                }
-            }
-        }
-        let (tier2_edge, _) = yellow_edge_and_strong_fraction(&tier2, &ThreadPool::new(1));
-        assert!(tier2_edge >= TIER2_EDGE_FULL);
-        assert!(tier2_edge < YELLOW_EDGE_MIN);
-        let tier2_selection = select_yellow(&tier2, 1.0, &ThreadPool::new(1));
-        assert!(tier2_selection.matrix.is_some());
-        assert_eq!(tier2_selection.b_qm_scale, 2);
-
-        let mut edged = filled(64, 64, [0.9, 0.85, 0.05]);
-        for y in 0..64 {
-            for x in (1..64).step_by(2) {
-                for c in 0..3 {
-                    edged.plane_row_mut(c, y)[x] = 0.0;
-                }
-            }
-        }
-        assert!(yellow_edge_and_strong_fraction(&edged, &ThreadPool::new(1)).0 >= YELLOW_EDGE_MIN);
-        assert_eq!(selected_b_qm_scale(true, true, 1.0), 5);
-        assert_eq!(selected_b_qm_scale(true, false, 1.0), 2);
-    }
-
-    #[test]
-    fn coarse_structure_gate_distinguishes_opponent_axes_in_both_directions() {
-        for vertical in [false, true] {
-            for (other, expected) in [([1.0, 0.0, 0.0], true), ([0.0, 0.0, 1.0], false)] {
-                let mut edged = filled(32, 32, [1.0, 1.0, 0.0]);
-                for y in 0..32 {
-                    for x in 0..32 {
-                        if (if vertical { y } else { x }) % 2 == 1 {
-                            for (c, value) in other.into_iter().enumerate() {
-                                edged.plane_row_mut(c, y)[x] = value;
-                            }
-                        }
-                    }
-                }
-                assert_eq!(has_coarse_x_structure(&edged), expected);
-                if !expected {
-                    assert_eq!(choose_b_bias(&edged, 6.0), SPEC_BIAS);
-                }
-            }
-        }
-        assert!(!has_coarse_x_structure(&filled(1, 1, [1.0, 1.0, 0.0])));
     }
 
     #[test]

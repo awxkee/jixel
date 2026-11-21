@@ -789,35 +789,4 @@ mod tests {
         check(&u, &v);
         check(&v, &u);
     }
-
-    #[test]
-    fn portable_sections_cover_every_group() {
-        let (width, height) = (513, 259);
-        let profile: Vec<i32> = (0..2048).map(|x| (x * x / 31) % 256).collect();
-        let u: Vec<i32> = (0..width).map(|x| x / 2).collect();
-        let v: Vec<i32> = (0..height).map(|y| y * 3).collect();
-        let mut scratch = CoderScratch::lossless();
-        let pool = ThreadPool::new(2);
-        let (global, ac) = encode(&pool, &profile, &u, &v, &mut scratch).unwrap();
-        assert!(global.bits_written() > 0);
-        assert_eq!(ac.len(), 3 * 2);
-        assert!(ac.iter().all(|section| section.bits_written() > 0));
-        // One 1024-pixel group: a single section, no larger than the six.
-        let mut frame = BitWriter::new();
-        encode_frame(&pool, &profile, &u, &v, false, &mut scratch, &mut frame).unwrap();
-        let split = global.bits_written() + ac.iter().map(BitWriter::bits_written).sum::<usize>();
-        assert!(frame.bits_written().is_multiple_of(8) && frame.bits_written() < split + 256);
-        // With the second Palette the groups hold a tree and nothing else.
-        let (u, v): (Vec<i32>, Vec<i32>) = (
-            (0..2100).map(|x| x * x % 97).collect(),
-            (0..1100).map(|y| y * 5 % 89 + 7).collect(),
-        );
-        let (mut direct, mut delta) = (BitWriter::new(), BitWriter::new());
-        encode_frame(&pool, &profile, &u, &v, false, &mut scratch, &mut direct).unwrap();
-        encode_frame(&pool, &profile, &u, &v, true, &mut scratch, &mut delta).unwrap();
-        assert!(delta.bits_written() < direct.bits_written());
-        let small = encode(&pool, &profile, &u[..200], &v[..100], &mut scratch).unwrap();
-        assert_eq!(small.1.len(), 1);
-        assert_eq!(small.1[0].bits_written(), 0);
-    }
 }

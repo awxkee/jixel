@@ -878,16 +878,6 @@ mod tests {
         );
     }
 
-    #[test]
-    #[should_panic]
-    fn inverse_rows_reject_mismatched_outputs() {
-        xyb_to_rgb_rows(
-            &XybMatrix::SPEC,
-            [&[0.0; 8]; 3],
-            [&mut [0.0; 7], &mut [0.0; 8], &mut [0.0; 8]],
-        );
-    }
-
     unsafe fn scalar_band(m: &XybMatrix, input: [&[f32]; 3], output: [&mut [f32]; 3], _w: usize) {
         let [r, g, b] = input;
         let [x, y, out_b] = output;

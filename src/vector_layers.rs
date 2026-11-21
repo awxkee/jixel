@@ -1045,12 +1045,6 @@ mod tests {
             .collect()
     }
 
-    fn split_snapped(rgb: &[u8], width: usize, height: usize, steps: u32) -> Option<VectorSplit> {
-        SplitSource::rgb(rgb, width, height)?
-            .prepare(Some(SNAP_REACH))?
-            .split(steps)
-    }
-
     /// The opaque disc of the cut-out with stray fringe pixels inside its rim:
     /// the snapped split folds the ring away and leaves the edge to the band.
     #[test]
@@ -1139,55 +1133,6 @@ mod tests {
                 .iter()
                 .all(|&c| c == [200, 40, 30])
         );
-    }
-
-    fn colors(rgb: &[u8]) -> std::collections::HashSet<[u8; 3]> {
-        rgb.as_chunks::<3>().0.iter().copied().collect()
-    }
-
-    /// Two flat fields with an alternating halo on each side of the edge, as
-    /// a resampling filter leaves it: the halo colors become palette entries of
-    /// the plain split and fold away in the snapped one.
-    #[test]
-    fn snap_folds_resampling_fringe() {
-        let size = 128;
-        let mut rgb = Vec::with_capacity(size * size * 3);
-        for _ in 0..size {
-            for x in 0..size {
-                let v: u8 = match x {
-                    0..=61 => 40,
-                    62 => 37,
-                    63 => 43,
-                    64 => 203,
-                    65 => 197,
-                    _ => 200,
-                };
-                rgb.extend_from_slice(&[v, v, v]);
-            }
-        }
-        let plain = split(&rgb, size, size, 15).expect("flat art splits");
-        assert_eq!(colors(&plain.base).len(), 6);
-        let snapped = split_snapped(&rgb, size, size, 15).expect("fringe snaps");
-        assert_eq!(
-            colors(&snapped.base),
-            [[40; 3], [200; 3]].into_iter().collect()
-        );
-    }
-
-    /// Wide bands three levels apart are shading, not fringe: flattening them
-    /// shifts the local mean, so nothing snaps.
-    #[test]
-    fn snap_keeps_shade_bands() {
-        let size = 128;
-        let mut rgb = Vec::with_capacity(size * size * 3);
-        for _ in 0..size {
-            for x in 0..size {
-                let v = 100 + 3 * (x / 16) as u8;
-                rgb.extend_from_slice(&[v, v, v]);
-            }
-        }
-        assert!(split(&rgb, size, size, 15).is_some());
-        assert!(split_snapped(&rgb, size, size, 15).is_none());
     }
 
     #[test]

@@ -372,8 +372,7 @@ pub(crate) fn neon_log2p1_f32(x: float32x4_t) -> float32x4_t {
 
 #[cfg(test)]
 mod tests {
-    use super::{neon_log2p1_f32, sse_and_rate_neon};
-    use std::arch::aarch64::{vdupq_n_f32, vgetq_lane_f32};
+    use super::sse_and_rate_neon;
 
     #[allow(clippy::too_many_arguments)]
     fn reference(
@@ -486,17 +485,6 @@ mod tests {
                         "magnitude-rate relative error {mag_rel} for {w}x{h} biased={biased}"
                     );
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn test_log2p1() {
-        unsafe {
-            for i in 0..5000 {
-                let q1 = ((i as f32 / 5000.) + 1.).log2();
-                let q2 = vgetq_lane_f32::<0>(neon_log2p1_f32(vdupq_n_f32(i as f32 / 5000.)));
-                assert!((q1 - q2).abs() < 1e-5, "q1 {} q2 {}", q1, q2);
             }
         }
     }

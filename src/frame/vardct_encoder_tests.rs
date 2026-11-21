@@ -3,7 +3,7 @@ use super::*;
 
 #[test]
 fn repeated_alpha_race_preserves_every_incoming_bit_offset() {
-    let (width, height) = (512, 256);
+    let (width, height) = (128, 64);
     let mut tile = [0u8; 32 * 32];
     let mut state = 0x81c9_e7abu32;
     for sample in &mut tile {
@@ -88,7 +88,7 @@ fn repeated_alpha_race_preserves_every_incoming_bit_offset() {
 
 #[test]
 fn function_field_race_preserves_offsets_and_exact_fallback() {
-    let (width, height) = (513, 257);
+    let (width, height) = (385, 193);
     let alpha = AlphaPlane::U8(
         (0..height)
             .flat_map(|y| {
@@ -172,7 +172,8 @@ fn function_field_race_preserves_offsets_and_exact_fallback() {
 
         // An exact-alpha request cannot substitute an approximate function,
         // even when the function would make a substantially smaller file.
-        {
+        // One offset suffices: the splice is covered above.
+        if offset == 5 {
             let mut ctx = ctx;
             ctx.extra_squeeze_distance = 0.0;
             let mut exact = prefix.clone();

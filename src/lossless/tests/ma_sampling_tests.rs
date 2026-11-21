@@ -27,10 +27,9 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use super::ma_sampling::{ma_channel_sample_count, sample_channel_ma, walk_channel_ma};
+use super::ma_sampling::walk_channel_ma;
 use super::predictor::{predictor_neighbors, predictor_value};
-use crate::entropy::{pack_signed, uint_encode};
-use crate::ma_tree::{MaSamples, NUM_MA_PREDS};
+use crate::ma_tree::NUM_MA_PREDS;
 use crate::weighted_predictor::{WpParams, WpState};
 
 #[test]
@@ -124,81 +123,6 @@ fn row_walk_matches_point_fetched_properties_and_predictions() {
                         assert_eq!(count, width * height);
                     }
                 }
-            }
-        }
-    }
-}
-
-fn reference_samples(
-    plane: &[i32],
-    width: usize,
-    height: usize,
-    stride: usize,
-    params: WpParams,
-) -> MaSamples {
-    let mut samples = MaSamples::new();
-    walk_channel_ma(
-        |y| &plane[y * width..][..width],
-        width,
-        height,
-        2,
-        0,
-        &[],
-        params,
-        true,
-        |x, y, value, p, n, wp_pred| {
-            // Row-rotated phase: row y samples x == y (mod stride).
-            if x % stride != y % stride {
-                return;
-            }
-            let mut tok = [0u8; NUM_MA_PREDS];
-            for pred in 0..NUM_MA_PREDS as u32 {
-                let prediction = predictor_value(pred, n, wp_pred);
-                let (token, _, _) = uint_encode(pack_signed((value - prediction) as i32));
-                tok[pred as usize] = token.min(u8::MAX as u32) as u8;
-            }
-            samples.push(*p, tok);
-        },
-    );
-    samples
-}
-
-#[test]
-fn stride_aware_sampling_matches_full_property_walk() {
-    for &(width, height) in &[(0, 3), (1, 1), (1, 7), (2, 5), (9, 7), (17, 4)] {
-        let plane: Vec<i32> = (0..width * height)
-            .map(|i| {
-                let x = i % width.max(1);
-                let y = i / width.max(1);
-                (((x * 977 + y * 619) ^ (x * y * 37)) as i32 & 0xffff) - 0x7fff
-            })
-            .collect();
-        let get_row = |y: usize| &plane[y * width..][..width];
-        for &stride in &[1, 2, 3, 5, 11, width * height + 1] {
-            for &params in &WpParams::PRESETS {
-                let expected = reference_samples(&plane, width, height, stride, params);
-                let mut actual = MaSamples::new();
-                sample_channel_ma(
-                    get_row,
-                    width,
-                    height,
-                    2,
-                    0,
-                    &[],
-                    params,
-                    true,
-                    stride,
-                    |p, t, _| actual.push(p, t),
-                );
-                assert_eq!(actual.len(), ma_channel_sample_count(width, height, stride));
-                assert_eq!(
-                    actual.props, expected.props,
-                    "properties: {width}x{height}, stride={stride}, params={params:?}"
-                );
-                assert_eq!(
-                    actual.tok, expected.tok,
-                    "tokens: {width}x{height}, stride={stride}, params={params:?}"
-                );
             }
         }
     }

@@ -315,77 +315,6 @@ pub(crate) static K_COEFF_ORDER_32X16: [u16; 512] = [
     414, 415, 445, 475, 505, 506, 476, 446, 447, 477, 507, 508, 478, 479, 509, 510, 511,
 ];
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        CHANNEL_ROW, K_COMPACT_BLOCK_CONTEXT_MAP, K_NUM_AC_STRATEGY_CODES, K_NUM_BLOCK_CTXS,
-        K_NUM_ORDERS, K_STRATEGY_ORDER, block_context,
-    };
-
-    /// The encoder must derive exactly the contexts the signaled map implies, or
-    /// the decoder reads different histograms. Channel order differs between the
-    /// two (local X,Y,B vs the map's Y,X,B), which is the easy thing to get wrong.
-    #[test]
-    fn derived_block_context_matches_the_signaled_map() {
-        for code in 0..K_NUM_AC_STRATEGY_CODES as u8 {
-            let order = K_STRATEGY_ORDER[code as usize] as usize;
-            for (c, row) in CHANNEL_ROW.iter().enumerate() {
-                assert_eq!(
-                    block_context(c, code),
-                    K_COMPACT_BLOCK_CONTEXT_MAP[row * K_NUM_ORDERS + order] as u32,
-                    "channel {c} code {code}"
-                );
-            }
-        }
-        // Y contexts live below the chroma ones and every context is in range.
-        for code in 0..K_NUM_AC_STRATEGY_CODES as u8 {
-            let luma_ctxs = K_NUM_BLOCK_CTXS as u32 / 2;
-            assert!(block_context(1, code) < luma_ctxs);
-            for c in [0usize, 2] {
-                assert!((luma_ctxs..K_NUM_BLOCK_CTXS as u32).contains(&block_context(c, code)));
-            }
-        }
-    }
-
-    /// Properties the block-context map must satisfy whatever grouping it uses,
-    /// so that changing `K_COMPACT_BLOCK_CONTEXT_MAP` cannot silently break the
-    /// invariants the AC context arithmetic relies on.
-    #[test]
-    fn block_context_map_invariants() {
-        // Luma and chroma never share a context, and chroma X and B always do.
-        for code in 0..K_NUM_AC_STRATEGY_CODES as u8 {
-            let (x, y, b) = (
-                block_context(0, code),
-                block_context(1, code),
-                block_context(2, code),
-            );
-            assert_eq!(x, b, "X and B differ for code {code}");
-            assert_ne!(x, y, "luma and chroma share a context for code {code}");
-            assert!(y < K_NUM_BLOCK_CTXS as u32 && x < K_NUM_BLOCK_CTXS as u32);
-        }
-        // Codes of the same transform order are indistinguishable by design.
-        for a in 0..K_NUM_AC_STRATEGY_CODES as u8 {
-            for b in 0..K_NUM_AC_STRATEGY_CODES as u8 {
-                if K_STRATEGY_ORDER[a as usize] == K_STRATEGY_ORDER[b as usize] {
-                    for c in 0..3 {
-                        assert_eq!(block_context(c, a), block_context(c, b));
-                    }
-                }
-            }
-        }
-        // Every declared context is reachable, or the count is overstated and
-        // the AC context arithmetic reserves histograms that never get tokens.
-        let used: std::collections::BTreeSet<u32> = (0..K_NUM_AC_STRATEGY_CODES as u8)
-            .flat_map(|code| (0..3).map(move |c| block_context(c, code)))
-            .collect();
-        assert_eq!(
-            used.len(),
-            K_NUM_BLOCK_CTXS,
-            "unreachable block contexts: {used:?}"
-        );
-    }
-}
-
 /// The signaled block-context layout decided per image after tokenization.
 ///
 /// Tokens are produced on the fine layout (every base context split by the
@@ -708,66 +637,72 @@ where
 }
 
 #[cfg(test)]
-mod planner_cache_tests {
-    use super::*;
+mod tests {
+    use super::{
+        CHANNEL_ROW, K_COMPACT_BLOCK_CONTEXT_MAP, K_NUM_AC_STRATEGY_CODES, K_NUM_BLOCK_CTXS,
+        K_NUM_ORDERS, K_STRATEGY_ORDER, block_context,
+    };
 
-    fn planner_tokens(pattern: usize, repeats: usize) -> Vec<crate::entropy::Token> {
-        let mut tokens = Vec::new();
-        for fine in 0..K_NUM_FINE_BLOCK_CTXS {
-            for i in 0..repeats {
-                let value = match pattern {
-                    0 => 0,
-                    1 => (fine % 2) as u32 * 511,
-                    2 => (fine % 2) as u32 * 511 + (i / 4 % 3) as u32,
-                    3 => {
-                        if fine < 20 {
-                            (fine % 2) as u32 * 511
-                        } else {
-                            (i / 4 % 3) as u32
-                        }
-                    }
-                    4 => ((fine * 17 + i / 4 * 7) % 5) as u32,
-                    _ => ((fine % 2 * (fine / 2 + 1) * 37 + i / 4 % 7) % 1024) as u32,
-                };
-                tokens.push(crate::entropy::Token::new(fine as u32, value));
+    /// The encoder must derive exactly the contexts the signaled map implies, or
+    /// the decoder reads different histograms. Channel order differs between the
+    /// two (local X,Y,B vs the map's Y,X,B), which is the easy thing to get wrong.
+    #[test]
+    fn derived_block_context_matches_the_signaled_map() {
+        for code in 0..K_NUM_AC_STRATEGY_CODES as u8 {
+            let order = K_STRATEGY_ORDER[code as usize] as usize;
+            for (c, row) in CHANNEL_ROW.iter().enumerate() {
+                assert_eq!(
+                    block_context(c, code),
+                    K_COMPACT_BLOCK_CONTEXT_MAP[row * K_NUM_ORDERS + order] as u32,
+                    "channel {c} code {code}"
+                );
             }
         }
-        tokens
+        // Y contexts live below the chroma ones and every context is in range.
+        for code in 0..K_NUM_AC_STRATEGY_CODES as u8 {
+            let luma_ctxs = K_NUM_BLOCK_CTXS as u32 / 2;
+            assert!(block_context(1, code) < luma_ctxs);
+            for c in [0usize, 2] {
+                assert!((luma_ctxs..K_NUM_BLOCK_CTXS as u32).contains(&block_context(c, code)));
+            }
+        }
     }
 
+    /// Properties the block-context map must satisfy whatever grouping it uses,
+    /// so that changing `K_COMPACT_BLOCK_CONTEXT_MAP` cannot silently break the
+    /// invariants the AC context arithmetic relies on.
     #[test]
-    fn cached_plans_preserve_split_merge_choices_and_ties() {
-        // Recorded from the planner before caching. These cover rejected
-        // proposals, tied gains and chained merges through groups 12/13/14.
-        let split_map = [
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 11, 11, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14,
-            15, 15, 15, 15, 15, 15,
-        ];
-        let mixed_map = [
-            0, 1, 2, 3, 4, 5, 6, 6, 7, 7, 8, 9, 10, 10, 11, 11, 12, 12, 12, 12, 13, 13, 13, 13, 14,
-            14, 15, 15, 15, 15,
-        ];
-        for pattern in 0..6 {
-            for repeats in [0, 128, 8192] {
-                let tokens = planner_tokens(pattern, repeats);
-                let changed = repeats == 8192 && !matches!(pattern, 0 | 4);
-                for chunk_size in [4096, tokens.len().max(1)] {
-                    let plan = plan_block_ctx_map(tokens.chunks(chunk_size), 123);
-                    let expected = if !changed {
-                        AcCtxPlan::baseline().fine_to_final
-                    } else if pattern == 5 {
-                        mixed_map
-                    } else {
-                        split_map
-                    };
-                    assert_eq!(
-                        plan.fine_to_final, expected,
-                        "pattern={pattern}, repeats={repeats}"
-                    );
-                    assert_eq!(plan.nbc, if changed { 16 } else { 15 });
-                    assert_eq!(plan.qf_threshold, changed.then_some(123));
+    fn block_context_map_invariants() {
+        // Luma and chroma never share a context, and chroma X and B always do.
+        for code in 0..K_NUM_AC_STRATEGY_CODES as u8 {
+            let (x, y, b) = (
+                block_context(0, code),
+                block_context(1, code),
+                block_context(2, code),
+            );
+            assert_eq!(x, b, "X and B differ for code {code}");
+            assert_ne!(x, y, "luma and chroma share a context for code {code}");
+            assert!(y < K_NUM_BLOCK_CTXS as u32 && x < K_NUM_BLOCK_CTXS as u32);
+        }
+        // Codes of the same transform order are indistinguishable by design.
+        for a in 0..K_NUM_AC_STRATEGY_CODES as u8 {
+            for b in 0..K_NUM_AC_STRATEGY_CODES as u8 {
+                if K_STRATEGY_ORDER[a as usize] == K_STRATEGY_ORDER[b as usize] {
+                    for c in 0..3 {
+                        assert_eq!(block_context(c, a), block_context(c, b));
+                    }
                 }
             }
         }
+        // Every declared context is reachable, or the count is overstated and
+        // the AC context arithmetic reserves histograms that never get tokens.
+        let used: std::collections::BTreeSet<u32> = (0..K_NUM_AC_STRATEGY_CODES as u8)
+            .flat_map(|code| (0..3).map(move |c| block_context(c, code)))
+            .collect();
+        assert_eq!(
+            used.len(),
+            K_NUM_BLOCK_CTXS,
+            "unreachable block contexts: {used:?}"
+        );
     }
 }

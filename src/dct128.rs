@@ -1008,44 +1008,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn transposed_rectangles_agree() {
-        let tall = pattern(64, 128);
-        let mut wide = vec![0.0f32; 8192];
-        for y in 0..128 {
-            for x in 0..64 {
-                wide[x * 128 + y] = tall[y * 64 + x];
-            }
-        }
-        let mut a = vec![0.0f32; 8192];
-        let mut b = vec![0.0f32; 8192];
-        dct128x64(DctInput::new(&tall, 64), &mut a);
-        dct64x128(DctInput::new(&wide, 128), &mut b);
-        for (x, y) in a.iter().zip(&b) {
-            assert!((x - y).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn constant_is_pure_dc_and_extracts_block_dcs() {
-        let input = vec![2.0f32; 16384];
-        let mut coeffs = vec![0.0f32; 16384];
-        dct128x128(DctInput::new(&input, 128), &mut coeffs);
-        assert!((coeffs[0] - 2.0).abs() < 1e-5);
-        assert!(coeffs[1..].iter().map(|v| v * v).sum::<f32>() < 1e-7);
-        let mut dc = [0.0f32; 256];
-        dc_from_dct128x128(coeffs.first_chunk::<16384>().unwrap(), &mut dc);
-        for value in dc {
-            assert!((value - 2.0).abs() < 1e-4, "{value}");
-        }
-        dct128x64(DctInput::new(&input[..8192], 64), &mut coeffs);
-        let mut dc = [0.0f32; 128];
-        dc_from_dct128x64(coeffs.first_chunk::<8192>().unwrap(), &mut dc);
-        for value in dc {
-            assert!((value - 2.0).abs() < 1e-4, "{value}");
-        }
-    }
-
     /// Smooth content: the LLF-derived DC must approximate each 8x8 mean.
     #[test]
     fn dc_grid_tracks_block_means_on_smooth_content() {

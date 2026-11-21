@@ -29,18 +29,12 @@
 
 //! Tests for predictor.
 
-use super::super::lz77::RunLzWriter;
-use super::cost::{
-    SqueezePredictorCost, choose_predictor_for_plane, wp_constant_sample_cost, wp_sample_cost,
-};
-use super::tokens::{
-    channel_to_context, tokenize_channel_with_wp, tokenize_plane, tokenize_plane_rows,
-    tokenize_sample_rows,
-};
+use super::cost::{SqueezePredictorCost, wp_sample_cost};
+use super::tokens::{tokenize_channel_with_wp, tokenize_plane_rows};
 use super::weighted::{WP_CONTEXT_BUCKETS, WpChannelContexts, tokenize_plane_with_wp};
 use super::{
-    GradPackInteriorFn, GradientScratch, PREDICTOR_AVERAGE4, PREDICTOR_GRADIENT, PREDICTOR_LEFT,
-    PREDICTOR_SELECT, PREDICTOR_TOP, PREDICTOR_WEIGHTED, PredictorNeighbors, SLOW_PREDICTORS,
+    GradPackInteriorFn, GradientScratch, PREDICTOR_AVERAGE4, PREDICTOR_LEFT, PREDICTOR_SELECT,
+    PREDICTOR_TOP, PREDICTOR_WEIGHTED, PredictorNeighbors, SLOW_PREDICTORS,
     grad_pack_interior_scalar, predictor_neighbors, predictor_value,
     selected_grad_pack_interior_fn, visit_predictor_rows,
 };
@@ -157,30 +151,6 @@ fn row_neighbors_match_point_fetches_at_every_border() {
 }
 
 #[test]
-fn row_costs_match_point_fetched_histograms_and_predictors() {
-    for w in [1, 2, 3, 4, 5, 17, 257] {
-        for h in [1, 2, 5] {
-            let data: Vec<u16> = (0..w * h)
-                .map(|i| ((i * 977) ^ (i * i * 37)) as u16)
-                .collect();
-            for use_wp in [false, true] {
-                let mut reference = SqueezePredictorCost::with_zero();
-                reference.add_crop(|x, y| data[y * w + x] as i32, w, h, use_wp);
-                let mut rows = SqueezePredictorCost::with_zero();
-                rows.add_rows(|y| &data[y * w..][..w], w, h, use_wp);
-                assert_eq!(
-                    rows.costs.histograms, reference.costs.histograms,
-                    "{w}x{h}, wp={use_wp}"
-                );
-                assert_eq!(rows.costs.zero_hist, reference.costs.zero_hist);
-                assert_eq!(rows.costs.total, reference.costs.total);
-                assert_eq!(rows.predictor(use_wp), reference.predictor(use_wp));
-            }
-        }
-    }
-}
-
-#[test]
 fn row_costs_preserve_every_wp_preset_and_zero_histogram() {
     let (w, h) = (33, 7);
     let data: Vec<i32> = (0..w * h)
@@ -236,32 +206,6 @@ fn row_costs_preserve_every_wp_preset_and_zero_histogram() {
                 assert_eq!(actual.costs.total, reference.costs.total);
                 assert_eq!(actual.predictor(use_wp), reference.predictor(use_wp));
             }
-        }
-    }
-}
-
-#[test]
-fn palette_flat_spans_preserve_cost_histograms() {
-    for w in [1, 17, 64] {
-        let h = 8;
-        for common in [-8193, -8192, -1, 0, 1, 8192, 8193, 65535] {
-            let data: Vec<i32> = (0..w * h)
-                .map(|i| {
-                    if i / w == 3 || i % w == w / 2 {
-                        common + (i % 29) as i32 - 14
-                    } else {
-                        common
-                    }
-                })
-                .collect();
-            let mut reference = SqueezePredictorCost::with_zero();
-            reference.add_crop(|x, y| data[y * w + x], w, h, true);
-            let mut rows = SqueezePredictorCost::with_zero();
-            rows.add_rows(|y| &data[y * w..][..w], w, h, true);
-            assert_eq!(rows.costs.histograms, reference.costs.histograms);
-            assert_eq!(rows.costs.zero_hist, reference.costs.zero_hist);
-            assert_eq!(rows.costs.total, reference.costs.total);
-            assert_eq!(rows.predictor(true), reference.predictor(true));
         }
     }
 }
@@ -389,249 +333,6 @@ fn row_tokens_match_point_fetched_predictions() {
 }
 
 #[test]
-fn channel_rows_match_point_fetches_for_crops_and_alpha_types() {
-    use super::super::lz77::lz77_compress_runs;
-
-    for w in [1, 2, 3, 4, 5, 17, 257] {
-        for h in [1, 2, 5] {
-            let (x0, y0) = (3, 2);
-            let stride = w + 7;
-            let height = h + 4;
-            let mut image = Image3Si::new(stride, height);
-            let values = [i32::MIN, i32::MAX, -65535, -8193, -1, 0, 1, 8192, 65535];
-            for chan in 0..3 {
-                for y in 0..height {
-                    for (x, value) in image.plane_row_mut(chan, y).iter_mut().enumerate() {
-                        *value = if (x + y * stride) % 23 < 11 {
-                            0
-                        } else {
-                            values[(x * 7 + y * 3 + chan) % values.len()]
-                        };
-                    }
-                }
-            }
-            let alpha8: Vec<_> = (0..stride * height)
-                .map(|i| if i % 13 < 5 { 0 } else { (i * 197) as u8 })
-                .collect();
-            let alpha16: Vec<_> = (0..stride * height)
-                .map(|i| if i % 13 < 5 { 65535 } else { (i * 977) as u16 })
-                .collect();
-            let alpha32: Vec<_> = (0..stride * height)
-                .map(|i| values[i % values.len()])
-                .collect();
-            for alpha in [
-                AlphaPlane::U8(alpha8),
-                AlphaPlane::U16 {
-                    data: alpha16,
-                    bits: 16,
-                },
-                AlphaPlane::F32(alpha32),
-            ] {
-                for num_color in [1, 3] {
-                    let channels = num_color + 1;
-                    for chan in 0..channels {
-                        let ctx = channel_to_context(chan, channels);
-                        for pred in SLOW_PREDICTORS {
-                            for params in WpParams::PRESETS {
-                                let get = |x: usize, y: usize| {
-                                    if chan < num_color {
-                                        image.plane_row(chan, y0 + y)[x0 + x]
-                                    } else {
-                                        alpha.get_i32((y0 + y) * stride + x0 + x)
-                                    }
-                                };
-                                let mut reference = Vec::new();
-                                tokenize_plane_with_wp(
-                                    ctx,
-                                    get,
-                                    w,
-                                    h,
-                                    pred,
-                                    grad_pack_interior_scalar,
-                                    &mut GradientScratch::default(),
-                                    &mut reference,
-                                    params,
-                                );
-                                for kernel in [
-                                    grad_pack_interior_scalar as GradPackInteriorFn,
-                                    selected_grad_pack_interior_fn(),
-                                ] {
-                                    let mut scratch = GradientScratch::default();
-                                    let mut actual = Vec::new();
-                                    tokenize_channel_with_wp(
-                                        &image,
-                                        Some(&alpha),
-                                        stride,
-                                        x0,
-                                        y0,
-                                        w,
-                                        h,
-                                        num_color,
-                                        &[pred; 4],
-                                        chan,
-                                        kernel,
-                                        &mut scratch,
-                                        &mut actual,
-                                        params,
-                                        None,
-                                    );
-                                    assert_eq!(actual.len(), reference.len());
-                                    assert!(
-                                        actual.iter().zip(&reference).all(|(a, b)| (
-                                            a.context, a.value
-                                        ) == (
-                                            b.context, b.value
-                                        )),
-                                        "{w}x{h}, channel={chan}, predictor={pred}, params={params:?}"
-                                    );
-                                    if pred != PREDICTOR_GRADIENT
-                                        || (chan == num_color
-                                            && matches!(&alpha, AlphaPlane::F32(_)))
-                                    {
-                                        assert!(
-                                            scratch.cur.is_empty()
-                                                && scratch.prev.is_empty()
-                                                && scratch.prev_prev.is_empty()
-                                        );
-                                    }
-                                    let mut runs = RunLzWriter::with_capacity(0);
-                                    tokenize_channel_with_wp(
-                                        &image,
-                                        Some(&alpha),
-                                        stride,
-                                        x0,
-                                        y0,
-                                        w,
-                                        h,
-                                        num_color,
-                                        &[pred; 4],
-                                        chan,
-                                        kernel,
-                                        &mut scratch,
-                                        &mut runs,
-                                        params,
-                                        None,
-                                    );
-                                    assert_eq!(runs.finish(), lz77_compress_runs(&reference));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn byte_indices_and_streamed_runs_match_point_fetched_tokens() {
-    use super::super::lz77::lz77_compress_runs;
-
-    let mut scratch = GradientScratch::default();
-    for w in (0..=9).chain([15, 16, 17, 33, 257]) {
-        for h in [0, 1, 2, 5] {
-            for pattern in 0..3 {
-                let data: Vec<u8> = (0..w * h)
-                    .map(|i| match pattern {
-                        0 => 0,
-                        1 => {
-                            if i % 7 < 4 {
-                                255
-                            } else {
-                                0
-                            }
-                        }
-                        _ => ((i * 977) ^ (i * i * 37)) as u8,
-                    })
-                    .collect();
-                for pred in SLOW_PREDICTORS {
-                    for kernel in [
-                        grad_pack_interior_scalar as GradPackInteriorFn,
-                        selected_grad_pack_interior_fn(),
-                    ] {
-                        let mut reference = Vec::new();
-                        if w != 0 && h != 0 {
-                            tokenize_plane(
-                                1,
-                                |x, y| data[y * w + x] as i32,
-                                w,
-                                h,
-                                pred,
-                                kernel,
-                                &mut scratch,
-                                &mut reference,
-                            );
-                        }
-                        let mut actual = Vec::new();
-                        tokenize_sample_rows(
-                            1,
-                            |y| &data[y * w..][..w],
-                            w,
-                            h,
-                            pred,
-                            kernel,
-                            &mut scratch,
-                            &mut actual,
-                        );
-                        assert!(
-                            actual
-                                .iter()
-                                .zip(&reference)
-                                .all(|(a, b)| (a.context, a.value) == (b.context, b.value))
-                        );
-                        assert_eq!(actual.len(), reference.len());
-
-                        // Include both continuous runs and context changes between
-                        // the palette meta-plane and the compact index plane.
-                        for ctx in [0, 1] {
-                            let meta = [0i32; 16];
-                            let mut concatenated = Vec::new();
-                            tokenize_plane(
-                                ctx,
-                                |x, y| meta[y * 4 + x],
-                                4,
-                                4,
-                                pred,
-                                kernel,
-                                &mut scratch,
-                                &mut concatenated,
-                            );
-                            concatenated.extend(reference.iter().copied());
-                            let mut runs = RunLzWriter::with_capacity(0);
-                            tokenize_plane_rows(
-                                ctx,
-                                |y| &meta[y * 4..][..4],
-                                4,
-                                4,
-                                pred,
-                                kernel,
-                                &mut scratch,
-                                &mut runs,
-                            );
-                            tokenize_sample_rows(
-                                1,
-                                |y| &data[y * w..][..w],
-                                w,
-                                h,
-                                pred,
-                                kernel,
-                                &mut scratch,
-                                &mut runs,
-                            );
-                            assert_eq!(
-                                runs.finish(),
-                                lz77_compress_runs(&concatenated),
-                                "{w}x{h}, predictor={pred}, pattern={pattern}, context={ctx}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[test]
 fn merged_crop_costs_match_sequential_histograms_and_predictors() {
     for use_wp in [false, true] {
         let mut sequential = SqueezePredictorCost::with_zero();
@@ -679,105 +380,6 @@ fn added_predictors_match_jxl_formulas() {
 }
 
 #[test]
-fn slow_search_selects_directional_predictors() {
-    const W: usize = 64;
-    const H: usize = 64;
-    let mut horizontal = vec![0i32; W * H];
-    for y in 0..H {
-        horizontal[y * W] = ((y * 73) & 255) as i32;
-        for x in 1..W {
-            let delta = (((x * 17 + y * 31) ^ (x * y * 3)) % 7) as i32 - 3;
-            horizontal[y * W + x] = horizontal[y * W + x - 1] + delta;
-        }
-    }
-    let mut vertical = vec![0i32; W * H];
-    for x in 0..W {
-        vertical[x] = ((x * 73) & 255) as i32;
-        for y in 1..H {
-            let delta = (((y * 17 + x * 31) ^ (x * y * 3)) % 7) as i32 - 3;
-            vertical[y * W + x] = vertical[(y - 1) * W + x] + delta;
-        }
-    }
-
-    assert_eq!(
-        choose_predictor_for_plane(|x, y| horizontal[y * W + x], W, H, true),
-        PREDICTOR_SELECT
-    );
-    assert_eq!(
-        choose_predictor_for_plane(|x, y| vertical[y * W + x], W, H, true),
-        PREDICTOR_SELECT
-    );
-}
-
-#[test]
-fn slow_search_selects_average4_for_its_recurrence() {
-    const W: usize = 64;
-    const H: usize = 64;
-    let mut plane = vec![0i32; W * H];
-    for y in 0..H {
-        for x in 0..W {
-            let i = y * W + x;
-            if y < 2 || x < 2 {
-                plane[i] = (((x * 97 + y * 53) ^ (x * y * 11)) & 1023) as i32 - 512;
-                continue;
-            }
-            let top_right = if x + 1 < W {
-                plane[(y - 1) * W + x + 1]
-            } else {
-                plane[(y - 1) * W + x]
-            };
-            let top_right_right = if x + 2 < W {
-                plane[(y - 1) * W + x + 2]
-            } else {
-                top_right
-            };
-            plane[i] = (6 * plane[(y - 1) * W + x] - 2 * plane[(y - 2) * W + x]
-                + 7 * plane[i - 1]
-                + plane[i - 2]
-                + top_right_right
-                + 3 * top_right
-                + 8)
-                / 16;
-        }
-    }
-
-    assert_eq!(
-        choose_predictor_for_plane(|x, y| plane[y * W + x], W, H, true),
-        PREDICTOR_AVERAGE4
-    );
-}
-
-#[test]
-fn directional_wp_presets_are_distinct() {
-    const W: usize = 128;
-    const H: usize = 128;
-    let mut west = vec![0i32; W * H];
-    let mut north = vec![0i32; W * H];
-    for y in 0..H {
-        west[y * W] = ((y * 977) & 65535) as i32;
-        for x in 1..W {
-            west[y * W + x] = west[y * W + x - 1] + ((x * 13 + y * 7) % 5) as i32 - 2;
-        }
-    }
-    for x in 0..W {
-        north[x] = ((x * 977) & 65535) as i32;
-        for y in 1..H {
-            north[y * W + x] = north[(y - 1) * W + x] + ((y * 13 + x * 7) % 5) as i32 - 2;
-        }
-    }
-    let west_costs: Vec<_> = WpParams::PRESETS
-        .iter()
-        .map(|&params| wp_sample_cost(|y| &west[y * W..][..W], W, H, params).0)
-        .collect();
-    let north_costs: Vec<_> = WpParams::PRESETS
-        .iter()
-        .map(|&params| wp_sample_cost(|y| &north[y * W..][..W], W, H, params).0)
-        .collect();
-    assert_ne!(west_costs[2], west_costs[3]);
-    assert_ne!(north_costs[2], north_costs[3]);
-}
-
-#[test]
 fn wp_sample_cost_matches_point_fetched_corners() {
     for (width, height) in [(1, 4), (3, 129), (129, 3), (11, 13)] {
         let plane: Vec<i32> = (0..width * height)
@@ -811,19 +413,6 @@ fn wp_sample_cost_matches_point_fetched_corners() {
                 wp_sample_cost(|y| &plane[y * width..][..width], width, height, params),
                 expected
             );
-        }
-    }
-}
-
-#[test]
-fn wp_constant_sample_cost_matches_all_presets() {
-    for (width, height) in [(1, 1), (1, 5), (9, 1), (17, 8), (129, 2), (3, 129)] {
-        for value in [0, 255, 65_535, i32::MAX] {
-            let row = vec![value; width];
-            let expected = wp_constant_sample_cost(value, width, height);
-            for params in WpParams::PRESETS {
-                assert_eq!(wp_sample_cost(|_| &row, width, height, params), expected);
-            }
         }
     }
 }

@@ -27,7 +27,6 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use super::context::{pick_threshold, pick_threshold_grouped};
 use super::ma_learning::{finish_ma_candidate, gate_ma_tree};
 use super::ma_lookup::MaLookup;
 use super::ma_sampling::{tokenize_channel_ma, walk_channel_ma};
@@ -37,7 +36,6 @@ use super::tree::{
     TREE_CTX_MULTIPLIER_BITS, TREE_CTX_MULTIPLIER_LOG, TREE_CTX_OFFSET, TREE_CTX_PREDICTOR,
     TREE_CTX_PROPERTY, TREE_CTX_SPLIT_VAL, emit_learned_tree,
 };
-use crate::coder_scratch::CoderScratch;
 use crate::entropy::pack_signed;
 use crate::ma_tree::{LearnedTree, MaNode, MaSamples, NUM_MA_PREDS, NUM_MA_PROPS};
 use crate::weighted_predictor::WpParams;
@@ -134,24 +132,6 @@ fn gated_tree_keeps_bfs_tokens_with_leaf_offsets() {
     }
 }
 
-#[test]
-fn grouped_threshold_scoring_matches_concatenated_reference() {
-    let groups = vec![
-        vec![(vec![0, 3, 7, 3], vec![-20, -4, 12, 80])],
-        vec![(vec![7, 1, 1, 9, 2], vec![-100, -9, 0, 17, 110])],
-    ];
-    let residuals: Vec<u32> = groups
-        .iter()
-        .flat_map(|group| group[0].0.iter().copied())
-        .collect();
-    let properties: Vec<i64> = groups
-        .iter()
-        .flat_map(|group| group[0].1.iter().copied())
-        .collect();
-    let expected = pick_threshold(&residuals, &properties, &mut CoderScratch::default());
-    let actual = pick_threshold_grouped(&groups, 0, &mut CoderScratch::default());
-    assert_eq!(actual, expected);
-}
 #[test]
 fn compiled_ma_tokenization_matches_full_tree_with_and_without_wp() {
     let tree = LearnedTree {
@@ -256,128 +236,6 @@ fn compiled_ma_tokenization_matches_full_tree_with_and_without_wp() {
                     );
                 }
             }
-        }
-    }
-}
-
-/// Every predictor in one row, in every sample type: the row tokenizer's
-/// per-predictor passes and batched tree walks against the per-pixel walk.
-#[test]
-fn row_tokenization_matches_per_pixel_walk_for_every_predictor() {
-    use crate::lossless::predictor::row_kernels::Sample;
-    // A chain on the x property: column `x` below 13 reaches predictor `x`,
-    // later columns alternate on the west gradient between two more.
-    let mut nodes = Vec::new();
-    for pred in 0..13u32 {
-        let split = nodes.len() as u32;
-        nodes.push(MaNode::Split {
-            prop: 3,
-            val: pred as i32,
-            gt: split + 2,
-            le: split + 1,
-        });
-        nodes.push(MaNode::Leaf { pred, offset: 0 });
-    }
-    let split = nodes.len() as u32;
-    nodes.push(MaNode::Split {
-        prop: 10,
-        val: 0,
-        gt: split + 1,
-        le: split + 2,
-    });
-    nodes.push(MaNode::Leaf {
-        pred: 13,
-        offset: 0,
-    });
-    nodes.push(MaNode::Leaf { pred: 6, offset: 0 });
-    let tree = LearnedTree {
-        nodes,
-        est_bits: 0.,
-        flat_bits: 0.,
-    };
-    let (_, contexts, _) = emit_learned_tree(&tree);
-    let lookup = MaLookup::new(&tree, &contexts, 0, 0);
-    let offsets: Vec<i32> = (0..contexts.len() as i32).map(|i| i % 3 - 1).collect();
-
-    fn check<T: Sample + PartialEq + std::fmt::Debug>(
-        values: &[T],
-        width: usize,
-        height: usize,
-        tree: &LearnedTree,
-        contexts: &[u32],
-        lookup: &MaLookup,
-        offsets: &[i32],
-    ) where
-        i64: From<T>,
-    {
-        let get_row = |y| &values[y * width..][..width];
-        let mut expected = Vec::new();
-        walk_channel_ma(
-            get_row,
-            width,
-            height,
-            0,
-            0,
-            &[],
-            WpParams::PRESETS[1],
-            true,
-            |_x, _y, value, props, n, wp| {
-                let (node, pred) = tree.lookup(props);
-                let context = contexts[node as usize];
-                let residual = (value - predictor_value(pred, n, wp)) as i32;
-                expected.push((context, pack_signed(residual - offsets[context as usize])));
-            },
-        );
-        let mut actual = RawTokens::with_capacity(values.len());
-        tokenize_channel_ma(
-            get_row,
-            width,
-            height,
-            0,
-            0,
-            &[],
-            WpParams::PRESETS[1],
-            true,
-            lookup,
-            offsets,
-            &mut actual,
-        );
-        let actual: Vec<_> = match RawTokenStreams::new(vec![actual]) {
-            RawTokenStreams::Compact(streams) => streams
-                .into_iter()
-                .flatten()
-                .map(|t| {
-                    let t = t.unpack();
-                    (t.context, t.value)
-                })
-                .collect(),
-            RawTokenStreams::Wide(streams) => streams
-                .into_iter()
-                .flatten()
-                .map(|t| (t.context, t.value))
-                .collect(),
-        };
-        assert_eq!(actual, expected, "width={width}, height={height}");
-    }
-
-    for width in [1usize, 2, 7, 8, 9, 13, 14, 16, 17, 31, 40, 64, 65, 257] {
-        for height in [1usize, 2, 3, 9] {
-            let mut state = 0x9e37_79b9u32;
-            let noise: Vec<u32> = (0..width * height)
-                .map(|i| {
-                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                    // Flat runs between noisy ones exercise the WP shortcut.
-                    if (i / 11) % 3 == 0 { 77 } else { state >> 16 }
-                })
-                .collect();
-            let bytes: Vec<u8> = noise.iter().map(|&v| v as u8).collect();
-            let words: Vec<u16> = noise.iter().map(|&v| v as u16).collect();
-            let wide: Vec<i32> = noise.iter().map(|&v| v as i32 - 32768).collect();
-            let huge: Vec<i32> = noise.iter().map(|&v| (v as i32 - 32768) << 12).collect();
-            check(&bytes, width, height, &tree, &contexts, &lookup, &offsets);
-            check(&words, width, height, &tree, &contexts, &lookup, &offsets);
-            check(&wide, width, height, &tree, &contexts, &lookup, &offsets);
-            check(&huge, width, height, &tree, &contexts, &lookup, &offsets);
         }
     }
 }

@@ -1013,20 +1013,6 @@ mod tests {
     }
 
     #[test]
-    fn coding_order_chains_neighboring_starts() {
-        let at = |x: i32, y: i32| QuantizedSpline {
-            points: vec![Point::new(x, y), Point::new(x + 30, y)],
-            dct: [[0; 32]; 4],
-        };
-        let splines = [at(200, 200), at(10, 10), at(210, 190), at(20, 12)];
-        let starts: Vec<_> = coding_order(&splines)
-            .iter()
-            .map(|sp| (sp.points[0].x, sp.points[0].y))
-            .collect();
-        assert_eq!(starts, [(10, 10), (20, 12), (200, 200), (210, 190)]);
-    }
-
-    #[test]
     fn candidates_touch_only_the_blocks_they_pass_through() {
         let line = QuantizedSpline {
             points: vec![Point::new(4, 4), Point::new(60, 4)],

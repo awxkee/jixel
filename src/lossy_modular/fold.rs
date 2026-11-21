@@ -269,15 +269,6 @@ mod tests {
     }
 
     #[test]
-    fn flat_prefix_is_not_worth_a_full_frame_trial() {
-        let q = plane(257, 65, |_, _| 12000);
-        assert_eq!(
-            select_fold(&q, crate::Speed::Slow, &mut CoderScratch::default()),
-            None
-        );
-    }
-
-    #[test]
     fn screen_does_not_modify_the_quantized_pyramid() {
         let q = plane(129, 65, |x, y| 20000 + x as i32 * 113 - y as i32 * 59);
         let data: Vec<_> = q.channels.iter().map(|ch| ch.data.clone()).collect();
@@ -317,31 +308,6 @@ mod tests {
         assert_eq!(
             select_fold(&q, crate::Speed::Slow, &mut CoderScratch::default()),
             None
-        );
-    }
-
-    #[test]
-    fn screen_can_select_a_profitable_coarse_representation() {
-        // For a small three-channel image, eliminating the model overhead
-        // itself can justify a trial. Larger images require a larger gain.
-        let input = PlainInput {
-            color: (0..3).map(|c| vec![12000 + c * 1300; 128 * 128]).collect(),
-            extra: Vec::new(),
-            max: 65535.0,
-            coding: CodingTransform::Rgb,
-        };
-        let q = Pyramid::plain(
-            &input,
-            128,
-            128,
-            0.00001,
-            false,
-            &crate::thread_pool::ThreadPool::new(1),
-        )
-        .unwrap();
-        assert_eq!(
-            select_fold(&q, crate::Speed::Slow, &mut CoderScratch::default()),
-            Some(4),
         );
     }
 

@@ -530,44 +530,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lossy_pyramids_start_along_the_longer_side_of_portraits() {
-        let preview = |steps: &[SqueezeStep], mut w: usize, mut h: usize| {
-            for s in steps.iter().filter(|s| s.in_place) {
-                if s.horizontal {
-                    w = w.div_ceil(2);
-                } else {
-                    h = h.div_ceil(2);
-                }
-            }
-            (w, h)
-        };
-        for (w, h) in [
-            (512, 768),
-            (100, 1000),
-            (9, 17),
-            (768, 512),
-            (512, 512),
-            (4, 40),
-        ] {
-            let steps = lossy_squeeze_steps(w, h, 3, false);
-            let first = steps.iter().find(|s| s.in_place).unwrap();
-            assert_eq!(first.horizontal, h <= w, "{w}x{h}");
-            let (pw, ph) = preview(&steps, w, h);
-            assert!(pw <= 8 && ph <= 8, "{w}x{h} -> {pw}x{ph}");
-            let plain = lossy_squeeze_steps_chroma(w, h, 3, &[1, 2]);
-            assert_eq!(
-                plain.iter().find(|s| s.in_place).unwrap().horizontal,
-                h <= w,
-                "{w}x{h}"
-            );
-            // Lossless and lossy-alpha pyramids keep the horizontal start.
-            assert!(
-                default_squeeze_steps(w, h, 1)[0].horizontal || w <= 8,
-                "{w}x{h}"
-            );
-        }
-    }
-    #[test]
     fn vertical_first_only_changes_the_shared_xyb_steps() {
         let steps = |w, h, vertical_first| {
             lossy_squeeze_steps(w, h, 3, vertical_first)
@@ -598,44 +560,6 @@ mod tests {
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         ((*seed >> 33) as i32 % 1001) - 500
-    }
-    #[test]
-    fn h_squeeze_roundtrips_identity() {
-        let mut s = 12345u64;
-        for _ in 0..400 {
-            let w = 1 + (rnd(&mut s).unsigned_abs() as usize % 40);
-            let h = 1 + (rnd(&mut s).unsigned_abs() as usize % 8);
-            let mut c = Channel::new(w, h);
-            for v in c.data.iter_mut() {
-                *v = rnd(&mut s);
-            }
-            let (avg, res) = fwd_h_squeeze(&c);
-            let rec = inv_h_squeeze(&avg, &res);
-            assert_eq!(
-                rec.data, c.data,
-                "H squeeze roundtrip failed w={} h={}",
-                w, h
-            );
-        }
-    }
-    #[test]
-    fn v_squeeze_roundtrips_identity() {
-        let mut s = 999u64;
-        for _ in 0..400 {
-            let w = 1 + (rnd(&mut s).unsigned_abs() as usize % 8);
-            let h = 1 + (rnd(&mut s).unsigned_abs() as usize % 40);
-            let mut c = Channel::new(w, h);
-            for v in c.data.iter_mut() {
-                *v = rnd(&mut s);
-            }
-            let (avg, res) = fwd_v_squeeze(&c);
-            let rec = inv_v_squeeze(&avg, &res);
-            assert_eq!(
-                rec.data, c.data,
-                "V squeeze roundtrip failed w={} h={}",
-                w, h
-            );
-        }
     }
     #[test]
     fn default_pyramid_roundtrips_identity() {

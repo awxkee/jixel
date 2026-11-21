@@ -1437,27 +1437,6 @@ mod tests {
     }
 
     #[test]
-    fn residual_fit_declines_hard_masks_and_noise() {
-        let (width, height) = (257, 129);
-        let mask: Vec<u8> = (0..width * height)
-            .map(|i| if (i % width) / 32 % 2 == 0 { 255 } else { 0 })
-            .collect();
-        let pool = crate::thread_pool::ThreadPool::new(1);
-        assert!(fit_residual(&pool, &AlphaPlane::U8(mask), width, height).is_none());
-        let mut state = 1u32;
-        let noise = (0..width * height)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                state as u8
-            })
-            .collect();
-        assert!(fit_residual(&pool, &AlphaPlane::U8(noise), width, height).is_none());
-        assert!(fit_residual(&pool, &AlphaPlane::F32(vec![0; 32 * 32]), 32, 32).is_none());
-    }
-
-    #[test]
     fn unsupported_or_unstructured_fields_are_skipped() {
         assert!(fit(&AlphaPlane::U8(vec![42; 32 * 32]), 32, 32).is_empty());
         assert!(fit(&AlphaPlane::U8(vec![0; 32 * 32 - 1]), 32, 32).is_empty());

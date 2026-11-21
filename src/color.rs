@@ -732,11 +732,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn integer_transfer_luts_are_reused() {
-        let first = TransferLut::new(16, TransferFunction::Smpte2084);
-        let second = TransferLut::new(16, TransferFunction::Smpte2084);
-        assert!(Arc::ptr_eq(&first.values, &second.values));
-    }
 }

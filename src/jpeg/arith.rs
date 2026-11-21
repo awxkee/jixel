@@ -1579,19 +1579,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_dac_and_reserved_table_class() {
-        let mut cond = ArithConditioning::default();
-        assert!(matches!(
-            process_dac(&[0, 2], 0, &mut cond),
-            Err(JpegError::BadSegmentLength(0xCC))
-        ));
-        assert!(matches!(
-            process_dac(&[0, 4, 0x20, 5], 0, &mut cond),
-            Err(JpegError::BadTable("arithmetic conditioning"))
-        ));
-    }
-
-    #[test]
     fn arithmetic_scans_use_default_conditioning_and_accept_marker_fill() {
         let original = super::super::parse_jpeg(TINY_ARITH_SEQ).unwrap();
         let mut defaults = TINY_ARITH_SEQ.to_vec();

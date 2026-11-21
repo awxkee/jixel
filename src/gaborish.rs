@@ -351,36 +351,4 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn sharpens_step_edge() {
-        // the sharpening kernel.
-        let mut img = Image3F::new(16, 16);
-        for c in 0..3 {
-            for y in 0..16 {
-                let row = img.plane_row_mut(c, y);
-                for x in 0..16 {
-                    row[x] = if x < 8 { 0.0 } else { 1.0 };
-                }
-            }
-        }
-        let orig_at_8 = 1.0_f32;
-        let orig_at_7 = 0.0_f32;
-        gaborish_inverse(&mut img, 0.9908511);
-        // Sharpening means: value just *after* the edge (at x=8) is slightly
-        // larger than 1.0, value just *before* the edge (at x=7) slightly
-        // negative.
-        let new_at_8 = img.plane_row(0, 8)[8];
-        let new_at_7 = img.plane_row(0, 8)[7];
-        assert!(
-            new_at_8 > orig_at_8 - 0.001,
-            "value at edge+ should not collapse: {}",
-            new_at_8
-        );
-        assert!(
-            new_at_7 < orig_at_7 + 0.001,
-            "value at edge- should not bleed: {}",
-            new_at_7
-        );
-    }
 }

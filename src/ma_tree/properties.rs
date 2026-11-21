@@ -188,14 +188,6 @@ impl MaProperties {
     }
 
     #[cfg(test)]
-    pub(crate) fn swap(&mut self, a: usize, b: usize) {
-        match self {
-            Self::Narrow(rows) => rows.swap(a, b),
-            Self::Wide(rows) => rows.swap(a, b),
-        }
-    }
-
-    #[cfg(test)]
     pub(crate) fn reverse(&mut self) {
         match self {
             Self::Narrow(rows) => rows.reverse(),

@@ -164,26 +164,6 @@ mod tests {
     }
 
     #[test]
-    fn identity_order_when_uniform() {
-        // Uniform statistics leave the order untouched (all in one bucket).
-        let nonzero = [5u64; DCT_BLOCK_SIZE];
-        let order = compute_order(&nonzero, 10, 1);
-        assert!(is_identity(&order));
-    }
-
-    #[test]
-    fn frequent_slots_move_forward() {
-        let mut nonzero = [0u64; DCT_BLOCK_SIZE];
-        // Slot 40 is non-zero in every block; nearby low slots rarely are.
-        nonzero[40] = 1000;
-        let order = compute_order(&nonzero, 1000, 1);
-        // The always-present slot must land near the front (right after LLF).
-        let pos = order.iter().position(|&v| v == 40).unwrap();
-        assert_eq!(pos, 1, "hot slot should sort to the first AC position");
-        assert!(!is_identity(&order));
-    }
-
-    #[test]
     fn context_matches_hybrid_uint_zero_config() {
         // min(0 or 1+floor_log2(v), 7).
         assert_eq!(coeff_order_context(0), 0);

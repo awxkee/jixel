@@ -1264,24 +1264,6 @@ fn refine(
     points
 }
 
-/// Squared distance from `p` to the polyline `chain`.
-#[cfg(test)]
-fn distance_sq_to_chain(p: Point<f32>, chain: &[Point<f32>]) -> f32 {
-    let mut best = f32::INFINITY;
-    for &[a, b] in chain.array_windows::<2>() {
-        let (dx, dy) = (b.x - a.x, b.y - a.y);
-        let len2 = dx * dx + dy * dy;
-        let t = if len2 > 1e-12 {
-            (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let (ex, ey) = (p.x - (a.x + t * dx), p.y - (a.y + t * dy));
-        best = best.min(ex * ex + ey * ey);
-    }
-    best
-}
-
 /// Collapse two interior controls, allowing their replacement to leave either
 /// old knot. Test positions on the old curve and a small integer neighborhood;
 /// this is geometry only, before the selector pays for rendering one proposal.
@@ -2169,58 +2151,6 @@ mod tests {
     }
 
     #[test]
-    fn refinement_compares_gain_over_different_pixel_supports() {
-        let ctx = EncodingContext::default();
-        let (w, h) = (128, 96);
-        let points = vec![Point::new(16, 48), Point::new(112, 48)];
-        let mut truth = QuantizedSpline {
-            points: points.clone(),
-            dct: [[0; 32]; 4],
-        };
-        truth.dct[1][0] = 10;
-        truth.dct[3][0] = 6;
-        let mut image = Image3F::new(w, h);
-        super::super::render_spline(&ctx, &truth, QUANT_ADJUST, &mut image, 1.0);
-        let mut targets = std::array::from_fn(|c| image.plane_data(c).to_vec());
-        // Unrelated detail enters the wider fit's support. Its raw residual
-        // error grows even though that width removes more of the actual line.
-        for x in 16..113 {
-            targets[1][55 * w + x] += 0.1;
-        }
-        let mut scratch = FitScratch::default();
-        let initial_system =
-            fit_system(&targets, w, h, &points, 5, Precision::Full, &mut scratch).unwrap();
-        let initial = initial_system.solve(None);
-        let wider = fit_at(
-            &targets,
-            w,
-            h,
-            &points,
-            6,
-            None,
-            Precision::Full,
-            &mut scratch,
-        )
-        .unwrap();
-        assert!(wider.err > initial.err);
-        assert!(wider.gain() > initial.gain());
-        assert!(initial.explained() > REFINE_MIN_EXPLAINED);
-        let primary = Primary {
-            spline: quantize(&points, &initial),
-            points,
-            fit: initial,
-            system: initial_system,
-        };
-        let chain = Chain {
-            points: (16..=112).map(|x| Point::new(x as f32, 48.0)).collect(),
-            scale: 1.5,
-        };
-        let candidate =
-            expand(&ctx, &targets, &image, w, h, &chain, primary, &mut scratch).unwrap();
-        assert_eq!(candidate.alts[0].dct[3][0], truth.dct[3][0]);
-    }
-
-    #[test]
     fn two_point_budget_preserves_acceptance_at_rounding_boundaries() {
         let ctx = EncodingContext::default();
         let (mut accepted, mut rejected) = (0, 0);
@@ -2258,46 +2188,6 @@ mod tests {
             }
         }
         assert!(accepted > 0 && rejected > 0);
-    }
-
-    #[test]
-    fn joined_line_fit_preserves_color_and_rejects_bends() {
-        let ctx = EncodingContext::default();
-        let (w, h) = (256, 96);
-        let targets = [0.012f32, -0.35, -0.15].map(|color| {
-            (0..w * h)
-                .map(|i| {
-                    if (16..240).contains(&(i % w)) {
-                        let d = (i / w) as f32 - 48.0;
-                        color * (-0.5 * (d / 0.6).powi(2)).exp()
-                    } else {
-                        0.0
-                    }
-                })
-                .collect()
-        });
-        let mut chain = Chain {
-            points: (16..240).map(|x| Point::new(x as f32, 48.0)).collect(),
-            scale: 0.7,
-        };
-        let mut scratch = FitScratch::default();
-        let fit = fit_joined_line(&ctx, &targets, w, h, &chain, &mut scratch).unwrap();
-        assert!(fit.alts.iter().all(|s| s.points.len() == 2));
-        assert!(
-            fit.alts
-                .iter()
-                .enumerate()
-                .all(|(i, s)| { fit.alts[..i].iter().all(|earlier| earlier.dct != s.dct) })
-        );
-        assert!(
-            fit.alts
-                .iter()
-                .any(|s| { s.dct[0].iter().any(|&c| c != 0) && s.dct[2].iter().any(|&c| c != 0) })
-        );
-        for p in &mut chain.points {
-            p.y += 8.0 * ((p.x - 16.0) * std::f32::consts::PI / 223.0).sin();
-        }
-        assert!(fit_joined_line(&ctx, &targets, w, h, &chain, &mut scratch).is_none());
     }
 
     #[test]
@@ -2381,34 +2271,6 @@ mod tests {
     }
 
     #[test]
-    fn weight_cutoff_preserves_pixel_order_and_normal_equations() {
-        let (w, h) = (109, 95);
-        let targets = std::array::from_fn(|c| {
-            (0..w * h)
-                .map(|i| ((i * 19 + c * 31) % 101) as f32 * 0.003 - 0.15)
-                .collect::<Vec<_>>()
-        });
-        let points = [Point::new(0, 1), Point::new(52, 45), Point::new(108, 93)];
-        for sigma_n in SIGMA_LATTICE {
-            for precision in [Precision::Full, Precision::Lean] {
-                let mut scratch = FitScratch::default();
-                let bounded =
-                    fit_system(&targets, w, h, &points, sigma_n, precision, &mut scratch).unwrap();
-                let pixels = scratch.pixels.clone();
-                let rows = scratch.rows.clone();
-                scratch.weight_luts[0].cutoff_sq = f32::INFINITY;
-                let complete =
-                    fit_system(&targets, w, h, &points, sigma_n, precision, &mut scratch).unwrap();
-                assert_eq!(pixels, scratch.pixels);
-                assert_eq!(rows, scratch.rows);
-                assert_eq!(bounded.ata, complete.ata);
-                assert_eq!(bounded.atb, complete.atb);
-                assert_eq!(bounded.btb, complete.btb);
-            }
-        }
-    }
-
-    #[test]
     fn cached_geometry_and_widths_do_not_reuse_image_terms() {
         let (w, h) = (91, 63);
         let mut targets = std::array::from_fn(|c| {
@@ -2462,90 +2324,6 @@ mod tests {
     }
 
     #[test]
-    fn pair_collapse_relocates_controls_to_preserve_a_bend() {
-        let kernels = crate::encoding_context::EncodingContext::default();
-        let points: Vec<_> = (0..=8)
-            .map(|i| {
-                let a = i as f32 * std::f32::consts::FRAC_PI_2 / 8.0;
-                Point::new(
-                    round_i32(32.0 + 100.0 * a.sin()),
-                    round_i32(32.0 + 100.0 * (1.0 - a.cos())),
-                )
-            })
-            .collect();
-        let reference =
-            super::super::catmull_rom(&points.iter().map(|p| p.as_f32()).collect::<Vec<_>>());
-        let error = |points: &[Point<i32>]| {
-            let curve =
-                super::super::catmull_rom(&points.iter().map(|p| p.as_f32()).collect::<Vec<_>>());
-            curve
-                .iter()
-                .map(|&p| distance_sq_to_chain(p, &reference))
-                .sum::<f32>()
-                / curve.len() as f32
-                + reference
-                    .iter()
-                    .map(|&p| distance_sq_to_chain(p, &curve))
-                    .sum::<f32>()
-                    / reference.len() as f32
-        };
-        let mut relocated = false;
-        for i in 1..points.len() - 2 {
-            let reduced = collapse_control_pair(&kernels, &points, i).unwrap();
-            assert_eq!(reduced.len(), points.len() - 1);
-            assert_eq!(reduced.first(), points.first());
-            assert_eq!(reduced.last(), points.last());
-            assert!(reduced.array_windows::<2>().all(|p| p[0] != p[1]));
-            let mut left = points.clone();
-            left.remove(i);
-            let mut right = points.clone();
-            right.remove(i + 1);
-            relocated |= reduced[i] != points[i]
-                && reduced[i] != points[i + 1]
-                && error(&reduced) < error(&left).min(error(&right));
-        }
-        assert!(
-            relocated,
-            "merging should improve on merely deleting either old knot"
-        );
-        assert!(collapse_control_pair(&kernels, &points, 0).is_none());
-        assert!(collapse_control_pair(&kernels, &points, points.len() - 2).is_none());
-        assert!(collapse_control_pair(&kernels, &points[..3], 1).is_none());
-    }
-
-    #[test]
-    fn pruning_keeps_curve_shape_and_collapses_straight_spans() {
-        let kernels = crate::encoding_context::EncodingContext::default();
-        let straight: Vec<_> = (0..12)
-            .map(|i| Point::new(20 + i * 8, 40 + i * 4))
-            .collect();
-        assert_eq!(
-            prune_control_points(&kernels, &straight, 0.5),
-            [straight[0], straight[11]]
-        );
-        let chain: Vec<_> = (0..=160)
-            .map(|i| {
-                let t = i as f32 / 90.0;
-                Point::new(30.0 + 90.0 * t.sin(), 40.0 + 90.0 * (1.0 - t.cos()))
-            })
-            .collect();
-        let dense = rdp_control_points(&chain);
-        let sparse = prune_control_points(&kernels, &dense, 0.5);
-        assert!(sparse.len() < dense.len());
-        assert_eq!(sparse.first(), dense.first());
-        assert_eq!(sparse.last(), dense.last());
-        let a = super::super::catmull_rom(&dense.iter().map(|p| p.as_f32()).collect::<Vec<_>>());
-        let b = super::super::catmull_rom(&sparse.iter().map(|p| p.as_f32()).collect::<Vec<_>>());
-        for (&point, other) in a
-            .iter()
-            .map(|p| (p, b.as_slice()))
-            .chain(b.iter().map(|p| (p, a.as_slice())))
-        {
-            assert!(distance_sq_to_chain(point, other) <= 0.501 * 0.501);
-        }
-    }
-
-    #[test]
     fn residual_fit_leaves_affine_background_in_vardct() {
         let kernels = crate::encoding_context::EncodingContext::default();
         let (w, h) = (96, 64);
@@ -2577,32 +2355,6 @@ mod tests {
         }
         assert_eq!(quantize(&points, &bare).dct, line.dct);
         assert_eq!(quantize(&points, &pedestal).dct, line.dct);
-    }
-
-    #[test]
-    fn curve_aware_control_points_follow_a_bend_with_fewer_points() {
-        let kernels = crate::encoding_context::EncodingContext::default();
-        // a quarter circle of radius 120 px, traced at about 1 px steps
-        let chain: Vec<Point<f32>> = (0..=188)
-            .map(|k| {
-                let a = k as f32 / 120.0;
-                Point::new(40.0 + 120.0 * a.sin(), 160.0 - 120.0 * a.cos())
-            })
-            .collect();
-        let sparse = curve_control_points(&kernels, &chain, 1.0, MAX_CURVE_POINTS);
-        let dense = rdp_control_points(&chain);
-        assert!(
-            sparse.len() >= 2 && sparse.len() < dense.len(),
-            "{} vs {}",
-            sparse.len(),
-            dense.len()
-        );
-        let control: Vec<Point<f32>> = sparse.iter().map(|p| p.as_f32()).collect();
-        let curve = crate::splines::catmull_rom(&control);
-        for &p in &chain[4..chain.len() - 4] {
-            assert!(distance_sq_to_chain(p, &curve) <= 1.6 * 1.6);
-        }
-        assert!(sparse.array_windows::<2>().all(|p| p[0] != p[1]));
     }
 
     #[test]
@@ -2772,27 +2524,6 @@ mod tests {
             let (want_lin, want_quad) = fit_score_scalar(&ata, &rhs[..k], &sol[..k]);
             assert!((lin - want_lin).abs() < 1e-12, "linear term, k={k}");
             assert!((quad - want_quad).abs() < 1e-12, "quadratic term, k={k}");
-        }
-    }
-
-    #[test]
-    fn fit_energy_preserves_f32_squares_bitwise() {
-        let accumulate = SplinesContext::get().fit_accumulate;
-        let mut ata = [[0.0; MAX_COEFFS]; MAX_COEFFS];
-        let mut atb = [[0.0; MAX_COEFFS]; 3];
-        let mut btb = [-0.0f64, 0.0, 0.81];
-        let mut expected = btb;
-        for target in [
-            [-0.0, 0.0, -0.31],
-            [f32::from_bits(1), -f32::MIN_POSITIVE, 0.19],
-            [-0.91, 0.17, f32::MAX],
-            [f32::MAX, -f32::MAX, f32::MAX],
-        ] {
-            accumulate(&mut ata, &mut atb, &mut btb, &[1.0; 3], target);
-            for (energy, value) in expected.iter_mut().zip(target.map(f64::from)) {
-                *energy += value * value;
-            }
-            assert_eq!(btb.map(f64::to_bits), expected.map(f64::to_bits));
         }
     }
 

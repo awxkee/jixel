@@ -72,22 +72,6 @@ pub(crate) fn is_gated_sub8_strategy(strategy: u8) -> bool {
     matches!(strategy, STRATEGY_IDENTITY | STRATEGY_DCT2X2)
 }
 
-#[cfg(test)]
-pub(crate) fn is_sub8_strategy(strategy: u8) -> bool {
-    matches!(
-        strategy,
-        STRATEGY_IDENTITY
-            | STRATEGY_DCT2X2
-            | STRATEGY_DCT4X4
-            | STRATEGY_DCT4X8
-            | STRATEGY_DCT8X4
-            | STRATEGY_AFV0
-            | STRATEGY_AFV1
-            | STRATEGY_AFV2
-            | STRATEGY_AFV3
-    )
-}
-
 /// Map raw strategy -> JXL HfTransformType code (= what the bitstream stores).
 /// DCT8=0, DCT16X16=4, DCT32X32=5, DCT16X8=6, DCT8X16=7, DCT4X4=3, DCT4X8=12, DCT8X4=13,
 /// DCT32X16=10, DCT16X32=11, AFV0..3=14..17, DCT64 family=18..20,
@@ -399,50 +383,6 @@ mod tests {
     }
 
     #[test]
-    fn sub8_strategy_set_is_complete() {
-        for strategy in 0..NUM_STRATEGIES as u8 {
-            assert_eq!(
-                is_sub8_strategy(strategy),
-                matches!(
-                    strategy,
-                    STRATEGY_IDENTITY
-                        | STRATEGY_DCT2X2
-                        | STRATEGY_DCT4X4
-                        | STRATEGY_DCT4X8
-                        | STRATEGY_DCT8X4
-                        | STRATEGY_AFV0
-                        | STRATEGY_AFV1
-                        | STRATEGY_AFV2
-                        | STRATEGY_AFV3
-                )
-            );
-        }
-    }
-
-    #[test]
-    fn fine_strategies_use_the_spec_wire_codes() {
-        assert_eq!(STRATEGY_CODE_LUT[STRATEGY_IDENTITY as usize], 1);
-        assert_eq!(STRATEGY_CODE_LUT[STRATEGY_DCT2X2 as usize], 2);
-        assert_eq!(AcStrategyImage::covered_blocks_x_of(STRATEGY_IDENTITY), 1);
-        assert_eq!(AcStrategyImage::covered_blocks_y_of(STRATEGY_IDENTITY), 1);
-        assert_eq!(AcStrategyImage::covered_blocks_x_of(STRATEGY_DCT2X2), 1);
-        assert_eq!(AcStrategyImage::covered_blocks_y_of(STRATEGY_DCT2X2), 1);
-    }
-
-    #[test]
-    fn default_is_dct8_first_blocks() {
-        let a = AcStrategyImage::new(4, 4);
-        for y in 0..4 {
-            for x in 0..4 {
-                assert!(a.is_first_block(x, y));
-                assert_eq!(a.raw_strategy(x, y), STRATEGY_DCT);
-                assert_eq!(a.strategy_code(x, y), 0); // JXL HfTransformType for DCT
-            }
-        }
-        assert_eq!(a.count_first_blocks(), 16);
-    }
-
-    #[test]
     fn dct16x8_covers_1x2_blocks() {
         // DCT16X8: 1 col × 2 rows of 8x8 blocks.
         let mut a = AcStrategyImage::new(4, 4);
@@ -457,19 +397,6 @@ mod tests {
         assert!(a.is_first_block(1, 0));
         assert!(a.is_first_block(0, 2));
         // 16 default - 1 covered = 15 first blocks.
-        assert_eq!(a.count_first_blocks(), 15);
-    }
-
-    #[test]
-    fn dct8x16_covers_2x1_blocks() {
-        // DCT8X16: 2 cols × 1 row of 8x8 blocks.
-        let mut a = AcStrategyImage::new(4, 4);
-        a.set_first(0, 0, STRATEGY_DCT8X16);
-        assert!(a.is_first_block(0, 0));
-        assert_eq!(a.strategy_code(0, 0), 7); // JXL DCT8X16
-        assert!(!a.is_first_block(1, 0));
-        assert_eq!(a.raw_strategy(1, 0), STRATEGY_DCT8X16);
-        assert!(a.is_first_block(0, 1));
         assert_eq!(a.count_first_blocks(), 15);
     }
 

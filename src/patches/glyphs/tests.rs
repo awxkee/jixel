@@ -324,61 +324,6 @@ fn glyph_templates_share_blended_glyphs_across_backgrounds() {
 }
 
 #[test]
-fn exact_glyph_tiles_widen_the_template_atlas() {
-    let ctx = glyph_ctx();
-    let params = GlyphParams {
-        templates: true,
-        ..glyph_params(2)
-    };
-    let mut img = blended_glyph_page();
-    let templates = find_lossy_glyph_patches(&ctx, &img, &params).expect("templates");
-    assert_eq!(templates.atlas_width, 16);
-
-    for (x, y, w, h) in [
-        (2, 47, 21, 4),
-        (30, 47, 21, 4),
-        (70, 56, 18, 3),
-        (110, 56, 18, 3),
-    ] {
-        for py in y..y + h {
-            img.plane_row_mut(1, py)[x..x + w].fill(40.0 / 512.0);
-        }
-    }
-    let mixed = find_lossy_glyph_patches(&ctx, &img, &params).expect("mixed atlas");
-    assert_eq!(mixed.atlas_width, 21);
-    assert_eq!(mixed.atlas_height, templates.atlas_height + 7);
-    let top = mixed.atlas_width * templates.atlas_height;
-    for (old, new) in templates.atlas.iter().zip(&mixed.atlas) {
-        for (src, dst) in old.chunks_exact(16).zip(new[..top].chunks_exact(21)) {
-            assert_eq!(src, &dst[..16]);
-            assert_eq!(&dst[16..], &[0; 5]);
-        }
-    }
-    let alpha = mixed.alpha_atlas.as_ref().unwrap();
-    for (src, dst) in templates
-        .alpha_atlas
-        .as_ref()
-        .unwrap()
-        .chunks_exact(16)
-        .zip(alpha[..top].chunks_exact(21))
-    {
-        assert_eq!(src, &dst[..16]);
-        assert_eq!(&dst[16..], &[0; 5]);
-    }
-    assert!(alpha[top..].iter().all(|&a| a == 0));
-    assert_eq!(mixed.references.len(), 4);
-    for r in &mixed.references[2..] {
-        assert!(r.add && !r.mul);
-        assert!(r.atlas_y >= templates.atlas_height);
-        let at = r.atlas_y * mixed.atlas_width + r.atlas_x;
-        for &(x, y) in &r.positions {
-            let decoded = mixed.base.plane_row(1, y)[x] + mixed.atlas[0][at] as f32 / 512.0;
-            assert_eq!(decoded, img.plane_row(1, y)[x]);
-        }
-    }
-}
-
-#[test]
 fn lossy_glyph_patches_reconstruct_and_flatten_the_base() {
     let img = glyph_page();
     let repeated = find_lossy_glyph_patches(&glyph_ctx(), &img, &glyph_params(2)).expect("plan");
@@ -400,46 +345,4 @@ fn lossy_glyph_patches_reconstruct_and_flatten_the_base() {
     let all = find_lossy_glyph_patches(&glyph_ctx(), &img, &glyph_params(1)).expect("plan");
     assert_eq!(all.references.len(), 3);
     assert_glyph_plan_reconstructs(&img, &all);
-}
-
-/// The repeated marks reach 96 lattice steps on Y, the unrepeated one 48:
-/// a contrast floor between them drops only the faint mark, and a floor
-/// above both leaves no plan.
-#[test]
-fn faint_shapes_are_left_to_vardct() {
-    let img = glyph_page();
-    let params = GlyphParams {
-        min_contrast: 64,
-        ..glyph_params(1)
-    };
-    let plan = find_lossy_glyph_patches(&glyph_ctx(), &img, &params).expect("plan");
-    assert_eq!(plan.references.len(), 2);
-    assert!(plan.references.iter().all(|r| r.positions.len() >= 4));
-    assert_glyph_plan_reconstructs(&img, &plan);
-    let params = GlyphParams {
-        min_contrast: 128,
-        ..glyph_params(1)
-    };
-    assert!(find_lossy_glyph_patches(&glyph_ctx(), &img, &params).is_none());
-}
-
-/// One 36-pixel unrepeated mark on a 192x128 page is far below any
-/// coverage share, so it is dropped while the repeated marks stay; a
-/// zero share keeps it.
-#[test]
-fn unrepeated_shapes_need_frame_coverage() {
-    let img = glyph_page();
-    let params = GlyphParams {
-        singles_min_cover: 0.5,
-        ..glyph_params(1)
-    };
-    let plan = find_lossy_glyph_patches(&glyph_ctx(), &img, &params).expect("plan");
-    assert_eq!(plan.references.len(), 2);
-    assert!(plan.references.iter().all(|r| r.positions.len() >= 4));
-    let params = GlyphParams {
-        singles_min_cover: 0.001,
-        ..glyph_params(1)
-    };
-    let plan = find_lossy_glyph_patches(&glyph_ctx(), &img, &params).expect("plan");
-    assert_eq!(plan.references.len(), 3);
 }

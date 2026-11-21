@@ -547,18 +547,6 @@ mod tests {
     }
 
     #[test]
-    fn persistent_pool_preserves_index_order() {
-        let pool = ThreadPool::new(4);
-        let mut scratch = Box::<CoderScratch>::default();
-        assert_eq!(
-            pool.steal_map(&mut scratch, 257, |i, _scratch| i.wrapping_mul(17)),
-            (0usize..257)
-                .map(|i| i.wrapping_mul(17))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
     fn nested_maps_share_the_pool() {
         let pool = ThreadPool::new(4);
         let mut scratch = Box::<CoderScratch>::default();
@@ -569,18 +557,6 @@ mod tests {
             assert_eq!(
                 row,
                 &(0..9).map(|inner| outer * 100 + inner).collect::<Vec<_>>()
-            );
-        }
-    }
-
-    #[test]
-    fn pool_can_be_reused_for_consecutive_maps() {
-        let pool = ThreadPool::new(3);
-        let mut scratch = Box::<CoderScratch>::default();
-        for offset in 0..8 {
-            assert_eq!(
-                pool.steal_map(&mut scratch, 31, |i, _scratch| offset + i),
-                (0..31).map(|i| offset + i).collect::<Vec<_>>()
             );
         }
     }

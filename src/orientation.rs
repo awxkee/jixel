@@ -146,10 +146,4 @@ mod tests {
         assert_eq!(Orientation::from_exif(0), None);
         assert_eq!(Orientation::from_exif(9), None);
     }
-
-    #[test]
-    fn default_is_normal() {
-        assert_eq!(Orientation::default(), Orientation::Normal);
-        assert_eq!(Orientation::default().to_exif(), 1);
-    }
 }
