@@ -31,12 +31,13 @@
 //! rectangle inside flat UI and text is coded as its own cropped kReplace
 //! frame with its own tree, palette and RCT, and the base frame shows the
 //! rectangle filled with its border color, so the base keeps the palette and
-//! tree of the UI around it.
+//! tree of the surrounding UI.
 
 use crate::encode_image::AlphaPlane;
 use crate::image::Image3Si;
+use crate::patches::ContentHashMap;
 use crate::shared_sort::SharedSort;
-use std::collections::HashMap;
+use crate::thread_pool::ThreadPool;
 
 /// Classification tile.
 const TILE: usize = 32;
@@ -93,24 +94,32 @@ fn unpack(key: u64) -> [i32; 4] {
     ]
 }
 
-fn pixel_keys(linear: &Image3Si, alpha: Option<&[u8]>) -> Vec<u64> {
+fn pixel_keys(linear: &Image3Si, alpha: Option<&[u8]>, pool: &ThreadPool) -> Vec<u64> {
     let (w, h) = (linear.xsize(), linear.ysize());
-    let mut keys = Vec::with_capacity(w * h);
-    for y in 0..h {
+    let mut keys = vec![0u64; w * h];
+    let mut rows: Vec<&mut [u64]> = keys.chunks_exact_mut(w).collect();
+    pool.for_each_mut(&mut rows, |y, row| {
         let (p0, p1, p2) = (
             linear.plane_row(0, y),
             linear.plane_row(1, y),
             linear.plane_row(2, y),
         );
         let a = alpha.map(|a| &a[y * w..][..w]);
-        keys.extend((0..w).map(|x| pack([p0[x], p1[x], p2[x]], a.map_or(0, |a| i32::from(a[x])))));
-    }
+        for (x, key) in row.iter_mut().enumerate() {
+            *key = pack([p0[x], p1[x], p2[x]], a.map_or(0, |a| i32::from(a[x])));
+        }
+    });
+    drop(rows);
     keys
 }
 
 /// Rectangles of the rich (gradient or photo-like) tiles, in frame order,
 /// or `None` when the image has none worth a frame or is rich throughout.
-pub(crate) fn plan(linear: &Image3Si, alpha: Option<&AlphaPlane>) -> Option<Vec<Region>> {
+pub(crate) fn plan(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    pool: &ThreadPool,
+) -> Option<Vec<Region>> {
     let alpha = match alpha {
         None => None,
         Some(AlphaPlane::U8(a)) => Some(a.as_slice()),
@@ -120,17 +129,29 @@ pub(crate) fn plan(linear: &Image3Si, alpha: Option<&AlphaPlane>) -> Option<Vec<
     if w < 2 * TILE || h < 2 * TILE {
         return None;
     }
-    let keys = pixel_keys(linear, alpha);
-    let mut counts: HashMap<u64, u32> = HashMap::with_capacity(4096);
+    let keys = pixel_keys(linear, alpha, pool);
+    let mut counts: ContentHashMap<u32> =
+        ContentHashMap::with_capacity_and_hasher(4096, Default::default());
     for &k in &keys {
         *counts.entry(k).or_insert(0) += 1;
     }
-    let rare: Vec<bool> = keys.iter().map(|k| counts[k] < RARE_COUNT).collect();
+    // The counts are complete: the per-pixel lookups and the tile rows are
+    // independent and run on the pool.
+    const RARE_CHUNK: usize = 1 << 16;
+    let mut rare = vec![false; keys.len()];
+    let mut rare_chunks: Vec<&mut [bool]> = rare.chunks_mut(RARE_CHUNK).collect();
+    pool.for_each_mut(&mut rare_chunks, |chunk, out| {
+        for (pixel, key) in out.iter_mut().zip(&keys[chunk * RARE_CHUNK..]) {
+            *pixel = counts[key] < RARE_COUNT;
+        }
+    });
+    drop(rare_chunks);
     let (tiles_x, tiles_y) = (w.div_ceil(TILE), h.div_ceil(TILE));
     let mut rich = vec![false; tiles_x * tiles_y];
-    let mut tile_keys = Vec::with_capacity(TILE * TILE);
-    for ty in 0..tiles_y {
-        for tx in 0..tiles_x {
+    let mut rich_rows: Vec<&mut [bool]> = rich.chunks_exact_mut(tiles_x).collect();
+    pool.for_each_mut(&mut rich_rows, |ty, rich_row| {
+        let mut tile_keys = Vec::with_capacity(TILE * TILE);
+        for (tx, rich) in rich_row.iter_mut().enumerate() {
             tile_keys.clear();
             let mut rare_count = 0usize;
             for y in ty * TILE..((ty + 1) * TILE).min(h) {
@@ -141,10 +162,11 @@ pub(crate) fn plan(linear: &Image3Si, alpha: Option<&AlphaPlane>) -> Option<Vec<
             let n = tile_keys.len() as f32;
             tile_keys.sort_unstable();
             tile_keys.dedup();
-            rich[ty * tiles_x + tx] = rare_count as f32 >= RICH_RARE_SHARE * n
+            *rich = rare_count as f32 >= RICH_RARE_SHARE * n
                 || tile_keys.len() as f32 >= RICH_DISTINCT_SHARE * n;
         }
-    }
+    });
+    drop(rich_rows);
     if !rich.contains(&true) {
         return None;
     }
@@ -305,7 +327,7 @@ fn grow(rect: &mut Rect, keys: &[u64], fill: u64, w: usize, h: usize) {
 /// to the smallest key); the rectangle's own top-left pixel when the ring
 /// is empty.
 fn ring_mode(keys: &[u64], rect: Rect, w: usize, h: usize) -> u64 {
-    let mut counts: HashMap<u64, u32> = HashMap::new();
+    let mut counts: ContentHashMap<u32> = ContentHashMap::default();
     let mut add = |x: usize, y: usize| *counts.entry(keys[y * w + x]).or_insert(0) += 1;
     let (x0, x1) = (rect[0].saturating_sub(1), (rect[2] + 1).min(w));
     for x in x0..x1 {
@@ -442,7 +464,7 @@ mod tests {
     #[test]
     fn finds_the_gradient_rectangle_and_fills_it_with_the_border_color() {
         let img = screenshot(300, 200, (70, 50, 120, 90));
-        let regions = plan(&img, None).expect("one region");
+        let regions = plan(&img, None, &ThreadPool::new(2)).expect("one region");
         assert_eq!(regions.len(), 1);
         let r = regions[0];
         assert_eq!((r.x0, r.y0, r.width, r.height), (70, 50, 120, 90));
@@ -457,16 +479,37 @@ mod tests {
 
     #[test]
     fn flat_images_and_rich_images_have_no_regions() {
-        assert!(plan(&screenshot(300, 200, (0, 0, 0, 0)), None).is_none());
-        assert!(plan(&screenshot(300, 200, (0, 0, 300, 200)), None).is_none());
-        assert!(plan(&screenshot(300, 200, (10, 10, 250, 170)), None).is_none());
+        assert!(
+            plan(
+                &screenshot(300, 200, (0, 0, 0, 0)),
+                None,
+                &ThreadPool::new(2)
+            )
+            .is_none()
+        );
+        assert!(
+            plan(
+                &screenshot(300, 200, (0, 0, 300, 200)),
+                None,
+                &ThreadPool::new(2)
+            )
+            .is_none()
+        );
+        assert!(
+            plan(
+                &screenshot(300, 200, (10, 10, 250, 170)),
+                None,
+                &ThreadPool::new(2)
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn alpha_joins_the_color_and_follows_the_crop() {
         let img = screenshot(300, 200, (70, 50, 120, 90));
         let alpha = AlphaPlane::U8(vec![255; 300 * 200]);
-        let regions = plan(&img, Some(&alpha)).expect("one region");
+        let regions = plan(&img, Some(&alpha), &ThreadPool::new(2)).expect("one region");
         let (_, base_alpha) = cut(&img, Some(&alpha), &regions);
         let (_, crop_alpha) = crop(&img, Some(&alpha), &regions[0]);
         assert_eq!(base_alpha.map(|a| a.len()), Some(300 * 200));
@@ -479,7 +522,10 @@ mod tests {
     #[test]
     fn region_frames_are_deterministic_across_workers() {
         let img = screenshot(200, 136, (60, 44, 72, 64));
-        assert_eq!(plan(&img, None).map(|r| r.len()), Some(1));
+        assert_eq!(
+            plan(&img, None, &ThreadPool::new(2)).map(|r| r.len()),
+            Some(1)
+        );
         let encode = |threads| {
             let mut w = crate::bit_writer::BitWriter::new();
             crate::lossless::encode_frame_lossless(

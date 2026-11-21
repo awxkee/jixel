@@ -40,7 +40,11 @@ pub(crate) struct Token {
 pub(crate) struct CompactToken(u32);
 
 impl CompactToken {
-    pub(crate) const VALUE_BITS: u32 = 22;
+    /// 12 context bits hold every leaf of a full learned tree (4095 leaves
+    /// plus the LZ77 distance context, `LZ77_MAX_CONTEXTS`); with 10, any
+    /// tree past 1023 leaves — every large photo — stored 8-byte tokens.
+    /// 20 value bits cover packed residuals of 16-bit samples.
+    pub(crate) const VALUE_BITS: u32 = 20;
     pub(crate) const MAX_VALUE: u32 = (1 << Self::VALUE_BITS) - 1;
     pub(crate) const MAX_CONTEXT: u32 = (1 << (32 - Self::VALUE_BITS)) - 1;
 

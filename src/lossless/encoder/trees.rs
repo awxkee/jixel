@@ -37,9 +37,8 @@
 //! - per-group palettes, for screens whose 256-px groups are low-color.
 //!
 //! First a ranking ([`SourcePlan::rank`]) compares the RGB and palette
-//! sources by one coarse learn each, ranks the WP presets per source and
-//! tries the color transform's runner-up: the corner-sampled WP proxy and the
-//! gradient RCT estimator both mis-rank on a third of images. Then each
+//! sources by one coarse learn each and ranks the WP presets per source: the
+//! corner-sampled WP proxy mis-ranks on a third of images. Then each
 //! surviving source is learned in full and written, cheapest first; a source
 //! whose estimate trails the best so far is not written.
 
@@ -49,8 +48,7 @@ use crate::coder_scratch::CoderScratch;
 use crate::lossless::GroupLayout;
 use crate::lossless::ma_encoding::write_learned_tree_frame;
 use crate::lossless::ma_learning::{
-    RANK_COARSE_PRUNE, RCT_RANK_MARGIN, finish_ma_learn, learn_best_layout, learn_ma_candidate,
-    rank_bits, rank_coarse, rank_presets,
+    finish_ma_learn, learn_best_layout, learn_ma_candidate, rank_coarse, rank_presets,
 };
 use crate::lossless::ma_source::{
     CoarseLearn, DENSE_FINAL_MIN_BITS_PER_VALUE, LearnedCandidate, MA_COARSE_TARGET_SAMPLES,
@@ -62,7 +60,6 @@ use crate::lossless::palette::{
     self, GlobalPalette, OrderRace, PALETTE_COARSE_MARGIN, PALETTE_FINAL_MARGIN,
     build_global_palettes,
 };
-use crate::lossless::rct::rct_planes;
 use crate::patches::ModularFrameKind;
 use crate::thread_pool::ThreadPool;
 use crate::weighted_predictor::WpParams;
@@ -376,8 +373,7 @@ impl SourcePlan {
     }
 
     /// Ranks the sources by one coarse learn each under the current preset,
-    /// then ranks the WP presets of each surviving source and tries the color
-    /// transform's runner-up.
+    /// then ranks the WP presets of each surviving source.
     fn rank(
         &mut self,
         frame: &CoreFrame<'_>,
@@ -462,7 +458,7 @@ impl SourcePlan {
         let rank_more = source_values_of(xsize, ysize, frame.coded_chans) >= RANK_MIN_VALUES;
         if self.rgb && rank_more {
             // The RGB source's WP presets.
-            let (best_bits, best_coarse, params, stage) = {
+            let (_, _, params, stage) = {
                 let rct_type = color.rct_type;
                 let planes = color.planes(pool, scratch);
                 let source = rgb_ma_source(
@@ -494,42 +490,14 @@ impl SourcePlan {
                     scratch,
                 )
             };
+            // The estimator's first transform stands. Scoring its runner-up
+            // with a ranking learn changed 12 of 74 photos, six each way
+            // (Kodak +0.11%, the rest -0.03%), for 5-7% of the encode: a
+            // 32-leaf tree favors transforms that decorrelate more and then
+            // gain less from depth, and no estimate margin told its wins
+            // from its losses.
             self.wp_params = params;
             rgb_stage = stage;
-
-            // The transform runner-up under the chosen preset, with the same
-            // coarse prune.
-            if let Some((runner_up, cost)) = color.runner_up()
-                && cost <= color.ranked[0].1 * RCT_RANK_MARGIN
-            {
-                // The runner-up samples the same number of rows. Keep the
-                // first stage when both sets fit the ranking sample budget
-                // and the final learn can reuse it if the runner-up loses.
-                rgb_stage = rgb_stage.filter(|stage| {
-                    let rows = stage.samples.len();
-                    self.final_sampling == self.rank_sampling
-                        && rows > MA_COARSE_TARGET_SAMPLES
-                        && rows <= self.rank_sampling.0 / 2
-                });
-                let planes = (runner_up != 6)
-                    .then(|| rct_planes(color.ycocg, xsize, ysize, runner_up, pool, scratch));
-                let source = rgb_ma_source(
-                    planes.as_ref().unwrap_or(color.ycocg),
-                    frame.alpha,
-                    xsize,
-                    runner_up,
-                    frame.alpha_constant,
-                    frame.num_color,
-                );
-                if let Some(stage) = coarse(&source, self.wp_params, scratch)
-                    && stage.candidate.est_real + header_bits(self.wp_params)
-                        <= best_coarse * RANK_COARSE_PRUNE
-                    && rank_bits(&stage) + header_bits(self.wp_params) < best_bits
-                {
-                    color.adopt(runner_up, planes);
-                    rgb_stage = keep_stages.then_some(stage);
-                }
-            }
         }
         if self.palette
             && rank_more

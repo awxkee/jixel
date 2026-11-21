@@ -50,7 +50,7 @@ use std::sync::Arc;
 /// The kAdd and kMul lattice arms of a frame whose luma repeats on an integer
 /// lattice; both race the tile/glyph plans on estimated bits.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn lattice_variants(
+pub(crate) fn lattice_variants(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
     distance: f32,
@@ -128,18 +128,18 @@ pub(super) fn lattice_variants(
 /// Spline selection of one frame variant.
 #[cfg(feature = "splines")]
 #[derive(Clone, Copy)]
-pub(super) struct SplineStage<'a> {
-    pub(super) candidates: &'a crate::splines::SplineCandidates,
-    pub(super) quant_field: &'a [f32],
+pub(crate) struct SplineStage<'a> {
+    pub(crate) candidates: &'a crate::splines::SplineCandidates,
+    pub(crate) quant_field: &'a [f32],
     /// Select before the Replace tiles are detected: splines may then cross
     /// tiles, which are cut from the spline-subtracted image.
-    pub(super) before_tiles: bool,
+    pub(crate) before_tiles: bool,
 }
 
 /// A frame's glyph patches and their coded atlas. Every variant of the
 /// patch race starts from the same glyphs, so they are found and coded once.
 #[derive(Clone)]
-pub(super) struct GlyphStage {
+pub(crate) struct GlyphStage {
     atlas: BitWriter,
     base: Image3F,
     references: Vec<crate::patches::PatchReference>,
@@ -147,7 +147,7 @@ pub(super) struct GlyphStage {
 }
 
 impl GlyphStage {
-    pub(super) fn find(
+    pub(crate) fn find(
         ctx: &EncodingContext,
         scratch: &mut CoderScratch,
         distance: f32,
@@ -231,12 +231,17 @@ impl GlyphStage {
         })
     }
 
-    pub(super) fn atlas_bits(&self) -> usize {
+    /// Glyph occurrences drawn from the atlas.
+    pub(crate) fn placements(&self) -> usize {
+        self.references.iter().map(|r| r.positions.len()).sum()
+    }
+
+    pub(crate) fn atlas_bits(&self) -> usize {
         self.atlas.bits_written()
     }
 
     /// The coded atlas frame, the image less the patches, and the dictionary.
-    pub(super) fn into_parts(self) -> (BitWriter, Image3F, Vec<crate::patches::PatchReference>) {
+    pub(crate) fn into_parts(self) -> (BitWriter, Image3F, Vec<crate::patches::PatchReference>) {
         (self.atlas, self.base, self.references)
     }
 }
@@ -244,7 +249,7 @@ impl GlyphStage {
 /// One patched or regular VarDCT frame, with or without Replace `tiles`.
 /// Atlas frames are small and encoded immediately; the full residual is deferred.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn prepare_vardct_variant(
+pub(crate) fn prepare_vardct_variant(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
     distance: f32,
@@ -718,7 +723,7 @@ pub(super) fn prepare_vardct_variant(
     })
 }
 
-pub(super) struct PreparedVarDct {
+pub(crate) struct PreparedVarDct {
     prefix: BitWriter,
     /// Selected splines/patches removed and inverse Gaborish already applied.
     base: Image3F,
@@ -730,13 +735,14 @@ pub(super) struct PreparedVarDct {
     #[cfg(feature = "splines")]
     splines: Option<crate::splines::SplineSet>,
     #[cfg_attr(not(feature = "splines"), allow(dead_code))]
-    pub(super) tiles_touched: bool,
-    pub(super) used_tiles: bool,
-    estimated_bits: Option<f64>,
+    pub(crate) tiles_touched: bool,
+    pub(crate) used_tiles: bool,
+    /// The estimate and its sampled residual part.
+    estimated_bits: Option<(f64, f64)>,
 }
 
 impl PreparedVarDct {
-    pub(super) fn regular(base: Image3F) -> Self {
+    pub(crate) fn regular(base: Image3F) -> Self {
         Self {
             prefix: BitWriter::new(),
             base,
@@ -753,7 +759,7 @@ impl PreparedVarDct {
     }
 
     /// Price a regular frame whose source has no spline or Gaborish changes.
-    pub(super) fn estimate_regular(
+    pub(crate) fn estimate_regular(
         ctx: &EncodingContext,
         scratch: &mut CoderScratch,
         distance: f32,
@@ -762,11 +768,64 @@ impl PreparedVarDct {
         coeff_shifts: &[u32],
     ) -> Result<f64, EncodeError> {
         Ok(noise_estimate_bits(ctx)
-            + estimate_residual_bits(ctx, scratch, distance, source, alpha, coeff_shifts)?)
+            + estimate_residual_bits(
+                ctx,
+                scratch,
+                distance,
+                source,
+                alpha,
+                coeff_shifts,
+                ESTIMATE_WINDOWS,
+            )?)
+    }
+
+    /// [`Self::estimate_regular`] on the dense sample.
+    pub(crate) fn estimate_regular_dense(
+        ctx: &EncodingContext,
+        scratch: &mut CoderScratch,
+        distance: f32,
+        source: &Image3F,
+        alpha: Option<&AlphaPlane>,
+        coeff_shifts: &[u32],
+    ) -> Result<f64, EncodeError> {
+        Ok(noise_estimate_bits(ctx)
+            + estimate_residual_bits(
+                ctx,
+                scratch,
+                distance,
+                source,
+                alpha,
+                coeff_shifts,
+                ESTIMATE_DENSE_WINDOWS,
+            )?)
+    }
+
+    /// The estimate with its residual priced on the dense sample; for picks
+    /// the regular sample leaves within its own noise.
+    pub(crate) fn estimate_dense(
+        &mut self,
+        ctx: &EncodingContext,
+        scratch: &mut CoderScratch,
+        distance: f32,
+        alpha: Option<&AlphaPlane>,
+        coeff_shifts: &[u32],
+    ) -> Result<f64, EncodeError> {
+        let bits = self.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
+        let residual = self.estimated_bits.map_or(0.0, |(_, residual)| residual);
+        Ok(bits - residual
+            + estimate_residual_bits(
+                ctx,
+                scratch,
+                distance,
+                &self.base,
+                alpha,
+                coeff_shifts,
+                ESTIMATE_DENSE_WINDOWS,
+            )?)
     }
 
     #[cfg(feature = "splines")]
-    pub(super) fn has_splines(&self) -> bool {
+    pub(crate) fn has_splines(&self) -> bool {
         self.splines.is_some()
     }
 
@@ -821,7 +880,7 @@ impl PreparedVarDct {
 
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(not(feature = "splines"), allow(unused_mut))]
-    pub(super) fn encode(
+    pub(crate) fn encode(
         mut self,
         ctx: &EncodingContext,
         scratch: &mut CoderScratch,
@@ -876,7 +935,7 @@ impl PreparedVarDct {
         Ok(())
     }
 
-    pub(super) fn estimate(
+    pub(crate) fn estimate(
         &mut self,
         ctx: &EncodingContext,
         scratch: &mut CoderScratch,
@@ -884,7 +943,7 @@ impl PreparedVarDct {
         alpha: Option<&AlphaPlane>,
         coeff_shifts: &[u32],
     ) -> Result<f64, EncodeError> {
-        if let Some(bits) = self.estimated_bits {
+        if let Some((bits, _)) = self.estimated_bits {
             return Ok(bits);
         }
         #[cfg(feature = "splines")]
@@ -906,11 +965,20 @@ impl PreparedVarDct {
         if let Some(set) = &self.splines {
             crate::splines::write_splines(set, scratch, &mut extras);
         }
+        let residual = estimate_residual_bits(
+            ctx,
+            scratch,
+            distance,
+            &self.base,
+            alpha,
+            coeff_shifts,
+            ESTIMATE_WINDOWS,
+        )?;
         let bits = self.prefix.bits_written() as f64
             + (dictionary.map_or(0, BitWriter::bits_written) + extras.bits_written()) as f64
             + noise_estimate_bits(ctx)
-            + estimate_residual_bits(ctx, scratch, distance, &self.base, alpha, coeff_shifts)?;
-        self.estimated_bits = Some(bits);
+            + residual;
+        self.estimated_bits = Some((bits, residual));
         Ok(bits)
     }
 }
@@ -935,9 +1003,10 @@ fn estimate_residual_bits(
     source: &Image3F,
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
+    max_windows: usize,
 ) -> Result<f64, EncodeError> {
     let (w, h) = (source.xsize(), source.ysize());
-    let (sample, sample_alpha) = sample_vardct_residual(source, alpha);
+    let (sample, sample_alpha) = sample_vardct_windows(source, alpha, max_windows);
     let (sw, sh) = (sample.xsize(), sample.ysize());
     let mut writer = BitWriter::new();
     let payload = encode_frame_core(
@@ -961,17 +1030,32 @@ fn estimate_residual_bits(
 
 /// Keep sample windows on the original pixel lattice and copy alpha through
 /// the same positions. At most sixteen 128x128 windows enter the rate model.
+#[cfg(test)]
 fn sample_vardct_residual(
     source: &Image3F,
     alpha: Option<&AlphaPlane>,
+) -> (Image3F, Option<AlphaPlane>) {
+    sample_vardct_windows(source, alpha, ESTIMATE_WINDOWS)
+}
+
+/// Windows of the regular rate sample.
+const ESTIMATE_WINDOWS: usize = 16;
+/// Windows of the dense sample that settles near-tie picks.
+const ESTIMATE_DENSE_WINDOWS: usize = 36;
+
+/// [`sample_vardct_residual`] with up to `max_windows` (a square) windows.
+fn sample_vardct_windows(
+    source: &Image3F,
+    alpha: Option<&AlphaPlane>,
+    max_windows: usize,
 ) -> (Image3F, Option<AlphaPlane>) {
     let (w, h) = (source.xsize(), source.ysize());
     let side = (w.min(h) / 2).clamp(8, 128).next_power_of_two().min(128);
     let (tw, th) = (side.min(w), side.min(h));
     let (nx, ny) = (w.div_ceil(tw), h.div_ceil(th));
     let cells = nx * ny;
-    let count = (cells / 4).clamp(1, 16);
-    let columns = count.min(4);
+    let count = (cells / 4).clamp(1, max_windows);
+    let columns = count.min(max_windows.isqrt());
     let rows = count.div_ceil(columns);
     let count = columns * rows;
     let (sw, sh) = (tw * columns, th * rows);
@@ -1018,7 +1102,7 @@ fn sample_vardct_residual(
 /// Effective AC quant (`scale * q`) per 8x8 block, measured on the image before
 /// any spline is removed; the spline RD gate prices blocks with it.
 #[cfg(feature = "splines")]
-pub(super) fn spline_quant_field(
+pub(crate) fn spline_quant_field(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
     xyb: &Image3F,
@@ -1056,9 +1140,15 @@ pub(super) fn spline_quant_field(
 /// only when together they cover this share of the frame, or when the plan
 /// with them wins the bit race: at any distance on a frame whose estimate
 /// is trusted, up to the race distance elsewhere.
-pub(super) const GLYPH_SINGLETON_FREE_MAX_DISTANCE: f32 = 1.0;
-pub(super) const GLYPH_SINGLETON_RACE_MAX_DISTANCE: f32 = 2.0;
+pub(crate) const GLYPH_SINGLETON_FREE_MAX_DISTANCE: f32 = 1.0;
+pub(crate) const GLYPH_SINGLETON_RACE_MAX_DISTANCE: f32 = 2.0;
 const GLYPH_SINGLETON_MIN_COVER: f64 = 0.5;
+/// Unrepeated glyphs count as stragglers of a glyph-coded page while they
+/// are at most this share of all placements.
+pub(crate) const GLYPH_STRAGGLER_MAX_SHARE: f64 = 0.1;
+/// The plan that also places the stragglers may be estimated this much
+/// larger than the repeated-only one and still win.
+pub(crate) const GLYPH_STRAGGLER_BITS_MARGIN: f64 = 1.1;
 /// A glyph must differ from its background by this many lattice rounding
 /// steps somewhere; fainter shapes are shading the base codes for less.
 const GLYPH_MIN_CONTRAST_STEPS: i32 = 2;
@@ -1069,12 +1159,16 @@ const GLYPH_MIN_REPEAT_PIXELS: usize = 48;
 const GLYPH_CHECK_MIN_DISTANCE: f32 = 6.0;
 const GLYPH_CHECK_ATLAS_SHARE: f64 = 0.35;
 /// Patched bits may exceed the frame's without tiles by this factor.
-pub(super) const GLYPH_BITS_MARGIN: f64 = 1.10;
+pub(crate) const GLYPH_BITS_MARGIN: f64 = 1.10;
 /// The frame without any patches stands as soon as its estimate is the
 /// smaller one.
-pub(super) const UNPATCHED_BITS_MARGIN: f64 = 1.0;
+pub(crate) const UNPATCHED_BITS_MARGIN: f64 = 1.0;
+/// Patched and unpatched estimates closer than this are settled on the
+/// dense sample (the sixteen-window estimate is off by a few percent where
+/// the patches sit between its windows).
+pub(crate) const UNPATCHED_DENSE_BAND: f64 = 0.02;
 /// A lattice arm must stay under this share of the best tile/glyph plan's bits.
-pub(super) const LATTICE_BITS_MARGIN: f64 = 0.5;
+pub(crate) const LATTICE_BITS_MARGIN: f64 = 0.5;
 /// Tile patches are used only when they cover this share of the frame.
 const PATCH_TILE_MIN_COVER: f64 = 0.03;
 const NEAR_TILES_MAX: f32 = 2.0;

@@ -229,14 +229,24 @@ impl MaSamples {
         }
     }
 
-    /// Apply a full permutation in place. The deep learner's stable grouping
-    /// supplies each source row exactly once; cycle rotation preserves that
-    /// exact order without allocating another full property array.
-    fn into_permuted(mut self, mut indices: Vec<u32>) -> Self {
-        assert_eq!(indices.len(), self.len());
-        with_ma_properties!(&mut self.props, |rows| {
-            permute_sample_rows(rows, &mut self.tok, &mut self.val, &mut indices)
-        });
+    /// Group the rows by `keys` (one per row; `counts[key]` rows each),
+    /// keys ascending and each key's rows in their original order, in place.
+    /// The property rows and the token/value rows are grouped side by side
+    /// on two threads.
+    fn into_grouped(mut self, keys: &[u16], counts: &[usize], pool: &ThreadPool) -> Self {
+        assert_eq!(keys.len(), self.len());
+        let Self { props, tok, val } = &mut self;
+        pool.join(
+            || {
+                with_ma_properties!(props, |rows| group_rows_in_place(rows, keys, counts));
+            },
+            || {
+                group_rows_in_place(tok, keys, counts);
+                if !val.is_empty() {
+                    group_rows_in_place(val, keys, counts);
+                }
+            },
+        );
         self
     }
 
@@ -290,39 +300,80 @@ impl MaSamples {
     }
 }
 
-fn permute_sample_rows<T: Copy>(
-    props: &mut [[T; NUM_MA_PROPS]],
-    tok: &mut [[u8; NUM_MA_PREDS]],
-    val: &mut [i32],
-    indices: &mut [u32],
-) {
-    for start in 0..indices.len() {
-        if indices[start] as usize == start {
-            continue;
-        }
-        let first_props = props[start];
-        let first_tok = tok[start];
-        let first_val = val.get(start).copied();
-        let mut dst = start;
-        loop {
-            let src = indices[dst] as usize;
-            indices[dst] = dst as u32;
-            if src == start {
-                props[dst] = first_props;
-                tok[dst] = first_tok;
-                if let Some(first_val) = first_val {
-                    val[dst] = first_val;
-                }
-                break;
-            }
-            props[dst] = props[src];
-            tok[dst] = tok[src];
-            if first_val.is_some() {
-                val[dst] = val[src];
-            }
-            dst = src;
+/// Rows of one block of [`group_rows_in_place`]: a block of property rows is
+/// 48-96 KiB, so the per-key buffers of a 32-leaf seed stay within a few
+/// megabytes and every copy is a sequential run.
+const GROUP_BLOCK_ROWS: usize = 1024;
+
+/// Stable grouping of `rows` by `keys` (`counts[key]` rows per key) without
+/// a second array. A cycle-following permutation moves every row in
+/// cache-missing order and was a fifth of a large photo's wall time; here
+/// every pass is sequential:
+///
+/// 1. Distribute: rows are read front to back into one block buffer per key;
+///    a full buffer is written to the next block slot at the front, which the
+///    read position has always passed.
+/// 2. Order the written blocks by (key, sequence) with block swaps.
+/// 3. From the last key down, shift each key's blocks right to its final
+///    offset and append its partly filled buffer.
+fn group_rows_in_place<T: Copy>(rows: &mut [T], keys: &[u16], counts: &[usize]) {
+    const B: usize = GROUP_BLOCK_ROWS;
+    debug_assert_eq!(rows.len(), keys.len());
+    let num_keys = counts.len();
+    let mut buffers: Vec<Vec<T>> = counts
+        .iter()
+        .map(|&count| Vec::with_capacity(count.min(B)))
+        .collect();
+    // Blocks written so far, per key, and each written slot's (key, sequence).
+    let mut blocks = vec![0usize; num_keys];
+    let mut slots: Vec<(u16, usize)> = Vec::with_capacity(rows.len() / B);
+    for (i, &key) in keys.iter().enumerate() {
+        let buffer = &mut buffers[key as usize];
+        buffer.push(rows[i]);
+        if buffer.len() == B {
+            // Slots written, this one included, hold at most the i + 1 rows
+            // read so far: the slot lies entirely behind the read position.
+            let slot = slots.len();
+            debug_assert!((slot + 1) * B <= i + 1);
+            rows[slot * B..(slot + 1) * B].copy_from_slice(buffer);
+            buffer.clear();
+            slots.push((key, blocks[key as usize]));
+            blocks[key as usize] += 1;
         }
     }
+
+    // First block slot of each key once the blocks are in (key, sequence) order.
+    let mut first_slot = vec![0usize; num_keys + 1];
+    for key in 0..num_keys {
+        first_slot[key + 1] = first_slot[key] + blocks[key];
+    }
+    let mut target: Vec<usize> = slots
+        .iter()
+        .map(|&(key, sequence)| first_slot[key as usize] + sequence)
+        .collect();
+    for slot in 0..target.len() {
+        while target[slot] != slot {
+            let other = target[slot];
+            let (low, high) = rows.split_at_mut(slot.max(other) * B);
+            low[slot.min(other) * B..][..B].swap_with_slice(&mut high[..B]);
+            target.swap(slot, other);
+        }
+    }
+
+    // A key's final offset is never left of its blocks (earlier keys only
+    // add their buffered rows in between), so placing the last key first
+    // overwrites nothing that is still to be moved.
+    let mut end = rows.len();
+    for key in (0..num_keys).rev() {
+        let start = end - counts[key];
+        let full = blocks[key] * B;
+        let source = first_slot[key] * B;
+        debug_assert!(source <= start);
+        rows.copy_within(source..source + full, start);
+        rows[start + full..end].copy_from_slice(&buffers[key]);
+        end = start;
+    }
+    debug_assert_eq!(end, 0);
 }
 
 #[derive(Clone, Copy)]
@@ -2001,35 +2052,49 @@ pub(crate) fn deepen_ma_tree(
         depths
     };
 
-    // Stable counting partition by coarse leaf. Each leaf becomes one
-    // contiguous range that can participate in the existing in-place growth.
-    let (counts, offsets, idx) = {
-        let mut leaf_for_sample = Vec::with_capacity(samples.len());
-        let mut counts = vec![0usize; seed.nodes.len()];
-        with_ma_properties!(&samples.props, |rows| {
-            for props in rows {
-                let (leaf, _) = seed.lookup(props);
-                leaf_for_sample.push(leaf);
-                counts[leaf as usize] += 1;
-            }
+    // Stable grouping by coarse leaf. Each leaf becomes one contiguous range
+    // that can participate in the existing in-place growth. Rows are routed
+    // in chunks on the pool's threads; the chunks come back in row order.
+    let (counts, offsets, keys) = {
+        const ROUTE_CHUNK_ROWS: usize = 1 << 15;
+        let num_rows = samples.len();
+        let num_nodes = seed.nodes.len();
+        assert!(num_nodes <= usize::from(u16::MAX) + 1);
+        let routed: Vec<(Vec<u16>, Vec<usize>)> = with_ma_properties!(&samples.props, |rows| {
+            let seed = &seed;
+            pool.steal_map(scratch, num_rows.div_ceil(ROUTE_CHUNK_ROWS), |chunk, _| {
+                let start = chunk * ROUTE_CHUNK_ROWS;
+                let part = &rows[start..(start + ROUTE_CHUNK_ROWS).min(num_rows)];
+                let mut counts = vec![0usize; num_nodes];
+                let leaves = part
+                    .iter()
+                    .map(|props| {
+                        let (leaf, _) = seed.lookup(props);
+                        counts[leaf as usize] += 1;
+                        leaf as u16
+                    })
+                    .collect();
+                (leaves, counts)
+            })
         });
-        let mut offsets = vec![0usize; seed.nodes.len() + 1];
+        let mut counts = vec![0usize; num_nodes];
+        let mut keys = Vec::with_capacity(num_rows);
+        for (leaves, part) in routed {
+            for (count, more) in counts.iter_mut().zip(part) {
+                *count += more;
+            }
+            keys.extend_from_slice(&leaves);
+        }
+        let mut offsets = vec![0usize; num_nodes + 1];
         let mut total = 0;
         for (offset, &count) in offsets.iter_mut().skip(1).zip(&counts) {
             total += count;
             *offset = total;
         }
-        let mut cursors = offsets[..seed.nodes.len()].to_vec();
-        let mut idx = vec![0u32; samples.len()];
-        for (sample, &leaf) in leaf_for_sample.iter().enumerate() {
-            let cursor = &mut cursors[leaf as usize];
-            idx[*cursor] = sample as u32;
-            *cursor += 1;
-        }
-
-        (counts, offsets, idx)
+        (counts, offsets, keys)
     };
-    let mut compact = samples.into_permuted(idx);
+    let mut compact = samples.into_grouped(&keys, &counts, pool);
+    drop(keys);
     let mut learner = new_learner(&mut compact, params, seed.nodes);
     let flat_bits = flat_cost(&learner, scratch);
     let mut heap = std::collections::BinaryHeap::new();
@@ -2197,39 +2262,47 @@ mod tests {
     }
 
     #[test]
-    fn sample_permutation_matches_gather() {
+    fn in_place_grouping_matches_a_stable_sort() {
         let mut state = 0x739feb12u32;
-        for len in [0, 1, 2, 3, 31, 64, 257, 4096] {
-            for kind in 0..4 {
-                let mut samples = MaSamples::new();
-                for i in 0..len {
-                    samples.push(
-                        core::array::from_fn(|p| (i * 101 + p) as i32),
-                        core::array::from_fn(|p| (i * 13 + p) as u8),
-                    );
-                }
-                let mut indices: Vec<u32> = (0..len as u32).collect();
-                match kind {
-                    1 => indices.reverse(),
-                    2 if len > 0 => indices.rotate_left(1),
-                    3 => {
-                        for i in (1..len).rev() {
-                            state ^= state << 13;
-                            state ^= state >> 17;
-                            state ^= state << 5;
-                            indices.swap(i, state as usize % (i + 1));
-                        }
+        let pool = ThreadPool::new(3);
+        for len in [0, 1, 2, 3, 31, 1023, 1024, 1025, 4096, 5000, 70_000] {
+            for num_keys in [1usize, 2, 5, 63] {
+                for kind in 0..4 {
+                    let mut samples = MaSamples::new();
+                    let mut keys = Vec::with_capacity(len);
+                    for i in 0..len {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        keys.push(match kind {
+                            // One key, runs, skewed and uniform keys.
+                            0 => (num_keys - 1) as u16,
+                            1 => ((i / 700) % num_keys) as u16,
+                            2 => ((state % 97) as usize * num_keys / 4000).min(num_keys - 1) as u16,
+                            _ => (state as usize % num_keys) as u16,
+                        });
+                        samples.push_val(
+                            core::array::from_fn(|p| ((i * 101 + p) % 30_000) as i32),
+                            core::array::from_fn(|p| (i * 13 + p) as u8),
+                            i as i32,
+                        );
                     }
-                    _ => {}
+                    let mut counts = vec![0usize; num_keys];
+                    for &key in &keys {
+                        counts[key as usize] += 1;
+                    }
+                    let mut indices: Vec<u32> = (0..len as u32).collect();
+                    indices.sort_by_key(|&i| keys[i as usize]);
+                    let expected = samples.select(&indices);
+                    let props_ptr = samples.props.as_ptr();
+                    let tok_ptr = samples.tok.as_ptr();
+                    let actual = samples.into_grouped(&keys, &counts, &pool);
+                    assert_eq!(actual.props, expected.props);
+                    assert_eq!(actual.tok, expected.tok);
+                    assert_eq!(actual.val, expected.val);
+                    assert_eq!(actual.props.as_ptr(), props_ptr);
+                    assert_eq!(actual.tok.as_ptr(), tok_ptr);
                 }
-                let expected = samples.select(&indices);
-                let props_ptr = samples.props.as_ptr();
-                let tok_ptr = samples.tok.as_ptr();
-                let actual = samples.into_permuted(indices);
-                assert_eq!(actual.props, expected.props);
-                assert_eq!(actual.tok, expected.tok);
-                assert_eq!(actual.props.as_ptr(), props_ptr);
-                assert_eq!(actual.tok.as_ptr(), tok_ptr);
             }
         }
     }

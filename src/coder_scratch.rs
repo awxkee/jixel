@@ -33,8 +33,8 @@ use crate::ac_strategy::{
 use crate::adaptive_quant::AqMapScratch;
 use crate::dc_group_data::AcStrategyImage;
 use crate::entropy::{
-    ALPHABET_SIZE, CLUSTERS_LIMIT, FixedClusterScratch, Histogram, HuffmanNode, HybridUintConfig,
-    PrefixCode, Token,
+    ALPHABET_SIZE, ANS_CLUSTERS_LIMIT, FixedClusterScratch, Histogram, HuffmanNode,
+    HybridUintConfig, PrefixCode, Token,
 };
 use crate::group::AcGroupScratch;
 use crate::lossless::{
@@ -73,7 +73,7 @@ pub(crate) struct LzEntropyScratch {
     pub(crate) histograms: Vec<Histogram>,
     pub(crate) prefix_codes: Vec<PrefixCode>,
     pub(crate) context_map: Box<[u8; LZ77_MAX_CONTEXTS]>,
-    pub(crate) configs: Box<[HybridUintConfig; CLUSTERS_LIMIT]>,
+    pub(crate) configs: Box<[HybridUintConfig; ANS_CLUSTERS_LIMIT]>,
     pub(crate) clustering: FixedClusterScratch<LZ77_MAX_CONTEXTS>,
     /// rANS tables for the pixel code (Slow lossless); empty on the prefix path.
     pub(crate) ans: Box<LzAnsScratch>,

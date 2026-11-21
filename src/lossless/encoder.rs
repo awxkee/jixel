@@ -532,9 +532,6 @@ struct ColorTransform<'a> {
     rct_type: u32,
     /// The color planes under a non-YCoCg `rct_type`, once built.
     planes: Option<Image3Si>,
-    /// Every transform with its estimated cost, cheapest first; empty
-    /// without the search.
-    ranked: Vec<(u32, f32)>,
 }
 
 impl<'a> ColorTransform<'a> {
@@ -569,21 +566,7 @@ impl<'a> ColorTransform<'a> {
             num_color: frame.num_color,
             rct_type: ranked.first().map_or(default_rct, |&(t, _)| t),
             planes: None,
-            ranked,
         }
-    }
-
-    /// The best-ranked transform that is not a cost twin of the winner: a
-    /// permutation that only flips a channel's sign scores the same bits and
-    /// would waste the runner-up race.
-    pub(super) fn runner_up(&self) -> Option<(u32, f32)> {
-        const TWIN_TOLERANCE: f32 = 1e-4;
-        let (_, best) = *self.ranked.first()?;
-        self.ranked
-            .iter()
-            .skip(1)
-            .copied()
-            .find(|&(_, cost)| cost > best * (1.0 + TWIN_TOLERANCE))
     }
 
     /// The color planes under `rct_type`, built on first use.
@@ -603,13 +586,6 @@ impl<'a> ColorTransform<'a> {
     /// YCoCg input.
     fn release_planes(&mut self) {
         self.planes = None;
-    }
-
-    /// Switches to `rct_type`, whose planes (`None` for YCoCg) were built by
-    /// the caller.
-    fn adopt(&mut self, rct_type: u32, planes: Option<Image3Si>) {
-        self.rct_type = rct_type;
-        self.planes = planes;
     }
 }
 
