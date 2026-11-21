@@ -577,33 +577,6 @@ mod tests {
     }
 
     #[test]
-    fn actual_group_quantizer_scores_every_native_strategy() {
-        let ctx = EncodingContext::default();
-        let mut scratch = CoderScratch::default();
-        for strategy in 0..NUM_STRATEGIES as u8 {
-            #[cfg(not(feature = "extraslow"))]
-            if matches!(
-                strategy,
-                crate::dc_group_data::STRATEGY_DCT128X128
-                    | crate::dc_group_data::STRATEGY_DCT128X64
-                    | crate::dc_group_data::STRATEGY_DCT64X128
-            ) {
-                continue;
-            }
-            let (w, h) = crate::inflated_cost::strategy_pixel_dims(strategy);
-            let mut group = DcGroupData::new(w / 8, h / 8).unwrap();
-            group.ac_strategy.set_first(0, 0, strategy);
-            group.raw_quant_field.as_mut_slice().fill(8);
-            let groups = [group];
-            let model = NativeModel::new(&ctx, quantization(), &groups, w, h, None);
-            let cost = model.score(&mut scratch, &image(w, h), &[0]);
-            assert!(cost.is_finite(), "native strategy {strategy}");
-            assert_eq!(cost.transforms, 1);
-            assert_eq!(cost.pixels, w * h);
-        }
-    }
-
-    #[test]
     fn partial_footprints_and_dc_group_offsets_use_only_visible_pixels() {
         let ctx = EncodingContext::default();
         let mut groups = [

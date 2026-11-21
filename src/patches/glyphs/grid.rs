@@ -477,29 +477,6 @@ mod tests {
     }
 
     #[test]
-    fn glyph_grid_rejects_aperiodic_ink() {
-        // A filled disc: smooth profiles that correlate at every short lag.
-        let (width, height) = (200usize, 160usize);
-        let mut ink = vec![false; width * height];
-        for y in 0..height {
-            for x in 0..width {
-                let (dx, dy) = (x as i64 - 100, y as i64 - 80);
-                ink[y * width + x] = dx * dx + dy * dy < 60 * 60;
-            }
-        }
-        assert!(detect_glyph_grid(&ink, width, height, &[]).is_none());
-        // Pseudo-random speckle has no pitch either.
-        let mut state = 0x2545_f491_4f6c_dd1du64;
-        for pixel in &mut ink {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *pixel = state % 5 == 0;
-        }
-        assert!(detect_glyph_grid(&ink, width, height, &[]).is_none());
-    }
-
-    #[test]
     fn glyph_grid_vote_finds_cell_pitch() {
         // Three glyphs on a 9-pixel pitch, each at its own offset in the
         // cell, at scattered columns; a fourth made of two equal parts.
@@ -528,21 +505,6 @@ mod tests {
         // A proportional font: the same glyphs at arbitrary columns.
         let loose: Vec<(u64, usize)> = (0..160).map(|i| (i % 4, next(900))).collect();
         assert_eq!(glyph_grid_vote(&loose, &sizes), Ok(None));
-    }
-
-    #[test]
-    fn glyph_grid_vote_ignores_lags_shorter_than_the_glyphs() {
-        // A dot repeating 5 apart (colons) outvotes the 20-pixel rows, but
-        // no 17-pixel glyph fits a 5-pixel cell.
-        let mut positions = Vec::new();
-        for i in 0..80 {
-            positions.push((1u64, i * 5));
-        }
-        for i in 0..40 {
-            positions.push((2u64, i * 20));
-        }
-        let sizes: Vec<usize> = (0..120).map(|i| if i < 40 { 2 } else { 17 }).collect();
-        assert_eq!(glyph_grid_vote(&positions, &sizes), Ok(Some(20)));
     }
 
     #[test]

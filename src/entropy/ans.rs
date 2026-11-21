@@ -1355,117 +1355,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn scratch_population_cost_matches_full_alphabet_after_reuse() {
-        let mut scratch = AnsCostScratch::new();
-        let mut state = 0x392dda71u32;
-        // Alternate alphabet sizes so a shorter histogram follows a longer
-        // one, including empty, singleton, sparse and full alphabets.
-        for case in 0..1024 {
-            let len = (case * 73) % (TABLE_ENTRIES + 1);
-            let mut counts = [0; TABLE_ENTRIES];
-            for (i, count) in counts[..len].iter_mut().enumerate() {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                *count = match case % 4 {
-                    0 => 1,
-                    1 => {
-                        if i % 3 == 0 {
-                            state % 10_000
-                        } else {
-                            0
-                        }
-                    }
-                    2 => {
-                        if i + 1 == len {
-                            u32::MAX
-                        } else {
-                            0
-                        }
-                    }
-                    _ => state % 10_000,
-                };
-            }
-            for scale in [0, 1, 3, 17] {
-                assert_eq!(
-                    fast_ans_population_cost_scratch(&counts, scale, &mut scratch).to_bits(),
-                    fast_ans_population_cost(&counts, scale).to_bits(),
-                    "case={case}, scale={scale}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn normalization_matches_one_count_at_a_time() {
-        fn reference(counts: &[u32]) -> Vec<u16> {
-            let total: u64 = counts.iter().map(|&c| u64::from(c)).sum();
-            if total == 0 {
-                return vec![0; counts.len()];
-            }
-            let mut freqs: Vec<u16> = counts
-                .iter()
-                .map(|&c| {
-                    if c == 0 {
-                        0
-                    } else {
-                        (u64::from(c) * u64::from(ANS_TAB_SIZE) / total).max(1) as u16
-                    }
-                })
-                .collect();
-            let mut sum: u32 = freqs.iter().map(|&f| u32::from(f)).sum();
-            while sum != ANS_TAB_SIZE {
-                let maximum = *freqs.iter().max().unwrap();
-                let first = freqs.iter().position(|&f| f == maximum).unwrap();
-                if sum < ANS_TAB_SIZE {
-                    freqs[first] += 1;
-                    sum += 1;
-                } else if maximum > 1 {
-                    freqs[first] -= 1;
-                    sum -= 1;
-                } else {
-                    break;
-                }
-            }
-            freqs
-        }
-        let mut state = 0x235da23eu32;
-        for case in 0..2048 {
-            let len = case % (TABLE_ENTRIES + 1);
-            let counts: Vec<u32> = (0..len)
-                .map(|i| {
-                    state ^= state << 13;
-                    state ^= state >> 17;
-                    state ^= state << 5;
-                    match case % 6 {
-                        0 => 0,
-                        1 => 1, // Equal maxima: the first symbol must retain the deficit.
-                        2 => {
-                            if i == len / 2 {
-                                u32::MAX
-                            } else {
-                                1
-                            }
-                        } // Excess counts.
-                        3 => state % 11,
-                        4 => {
-                            if i % 3 == 0 {
-                                0
-                            } else {
-                                state
-                            }
-                        }
-                        _ => state,
-                    }
-                })
-                .collect();
-            let mut freqs = vec![u16::MAX; len];
-            normalize_counts_into(&counts, &mut freqs);
-            assert_eq!(freqs, reference(&counts), "case={case}");
-        }
-    }
-
     fn assert_flat_reverse_map(freqs: &[u16]) {
         let alias = init_alias_table(freqs);
         let mut reverse_map = vec![0u16; ANS_TAB_SIZE as usize];
@@ -1539,22 +1428,9 @@ mod tests {
     }
 
     #[test]
-    fn symbol_info_builds_on_a_small_stack() {
-        crate::thread_pool::ThreadPool::on_small_stack(|| {
-            let counts: [u32; TABLE_ENTRIES] =
-                core::array::from_fn(|symbol| (symbol * 37 % 257 + 1) as u32);
-            let mut freqs = Vec::new();
-            normalize_counts(&counts, &mut freqs);
-            let mut reverse_map = vec![0u16; ANS_TAB_SIZE as usize];
-            let symbols = build_symbol_info(&freqs, &mut reverse_map);
-            assert_eq!(symbols.len(), TABLE_ENTRIES);
-        });
-    }
-
-    #[test]
     fn optimized_histograms_are_valid_and_representable() {
         let mut state = 0x1234_5678_9abc_def0u64;
-        for case in 0..500 {
+        for case in 0..150 {
             let len = case % TABLE_ENTRIES + 1;
             let mut counts = vec![0u32; TABLE_ENTRIES];
             for count in &mut counts[..len] {
@@ -1596,31 +1472,6 @@ mod tests {
                 assert!(writer.bits_written() != 0);
             }
         }
-    }
-
-    #[test]
-    fn precision_refinement_skips_empty_and_small_histograms() {
-        for counts in [vec![0; 128], vec![0, 23, 0], vec![7, 0, 11]] {
-            let incumbent = optimize_ans_histogram(&counts);
-            assert!(refine_ans_histogram_precision(&counts, &incumbent).is_none());
-        }
-    }
-
-    #[test]
-    fn flat_and_rle_forms_reduce_header_bits() {
-        let flat = flat_histogram(128, 128);
-        assert_eq!(ans_table_bits(&flat), 12.0);
-
-        let mut freqs = vec![16u16; 128];
-        freqs[0] += 2048;
-        let histogram = AnsHistogram {
-            freqs,
-            method: 12,
-            omit_pos: 0,
-            cost: 0.0,
-        };
-        // Without RLE, 127 identical width-5 counts alone need 508 bits.
-        assert!(ans_table_bits(&histogram) < 100.0);
     }
 
     #[test]

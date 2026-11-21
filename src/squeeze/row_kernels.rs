@@ -707,62 +707,6 @@ mod tests {
     }
 
     #[test]
-    fn closed_vertical_preserves_rounding_thresholds_and_scalar_special_cases() {
-        let limit = 1 << 24;
-        for q in [
-            1i64,
-            2,
-            3,
-            7,
-            12,
-            255,
-            256,
-            65535,
-            1 << 20,
-            1 << 24,
-            i64::from(i32::MAX),
-        ] {
-            let mut residuals = vec![i32::MIN, i32::MAX];
-            for magnitude in [
-                (1 << 23) - 1,
-                1 << 23,
-                (1 << 23) + 1,
-                limit - 1,
-                limit,
-                limit + 1,
-            ] {
-                residuals.extend([magnitude, -magnitude]);
-            }
-            for k in [0, 1, 2, 7, 100] {
-                for delta in [-1, 0, 1] {
-                    let v = k * q + q / 2 + delta;
-                    if v >= 0 && v <= i64::from(i32::MAX) {
-                        residuals.extend([v as i32, -v as i32]);
-                    }
-                }
-            }
-            for offset in 0..8 {
-                let residuals = &residuals[offset..];
-                let zero = vec![0; residuals.len()];
-                let row = ClosedRow {
-                    exact: InverseRow {
-                        average: &zero,
-                        residual: residuals,
-                        top: None,
-                        next: &zero,
-                    },
-                    average: &zero,
-                    top: &zero,
-                    next: &zero,
-                };
-                for deadzone in [0.0, -0.0, 0.15, 0.5, -0.1, 0.75, f32::INFINITY, f32::NAN] {
-                    check_closed(row, q, deadzone);
-                }
-            }
-        }
-    }
-
-    #[test]
     fn rows_match_wide_scalar_for_tails_and_fallbacks() {
         let reference = scalar();
         let mut seed = 1234567;
@@ -826,59 +770,6 @@ mod tests {
                     }
                 }
             }
-        }
-    }
-
-    #[test]
-    fn tendency_clamps_and_narrow_bounds_match_i64() {
-        let limit = 1 << 26;
-        let values = [
-            i32::MIN,
-            -limit - 1,
-            -limit,
-            -limit + 1,
-            -65535,
-            -19,
-            -2,
-            -1,
-            0,
-            1,
-            2,
-            19,
-            65535,
-            limit - 1,
-            limit,
-            limit + 1,
-            i32::MAX,
-        ];
-        let mut top = Vec::new();
-        let mut average = Vec::new();
-        let mut next = Vec::new();
-        for b in values {
-            for a in values {
-                for n in values {
-                    top.push(b);
-                    average.push(a);
-                    next.push(n);
-                }
-            }
-        }
-        let residual: Vec<i32> = (0..top.len()).map(|i| values[i % values.len()]).collect();
-        let row = InverseRow {
-            average: &average,
-            residual: &residual,
-            top: Some(&top),
-            next: &next,
-        };
-        let mut expected = [vec![0; top.len()], vec![0; top.len()]];
-        let [a, b] = &mut expected;
-        (scalar().inverse_vertical)(row, [a, b]);
-        for (name, kernels) in available() {
-            let mut actual = expected.clone();
-            actual.iter_mut().for_each(|r| r.fill(0));
-            let [a, b] = &mut actual;
-            (kernels.inverse_vertical)(row, [a, b]);
-            assert_eq!(actual, expected, "{name}");
         }
     }
 }

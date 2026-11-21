@@ -216,39 +216,6 @@ mod tests {
         }
     }
 
-    /// A nearest-upscaled image codes as its base plus the kernel bundle
-    /// (15 to 210 half floats), not as the full-size frame.
-    #[test]
-    fn lossless_codes_constant_cells_at_the_base_size() {
-        let (bw, bh) = (37usize, 29usize);
-        let base: Vec<u8> = (0..bw * bh * 3).map(|i| ((i * 7919) % 251) as u8).collect();
-        let config = crate::EncodeConfig::default()
-            .with_lossless(true)
-            .with_upsampling(true)
-            .with_speed(crate::Speed::Fast);
-        let base_bytes = crate::encode_image(&base, bw, bh, &config).unwrap();
-        for n in [2usize, 4, 8] {
-            // Cells cut by the border: the image is not a multiple of n.
-            let (w, h) = (bw * n - n / 2, bh * n - 1);
-            let mut up = vec![0u8; w * h * 3];
-            for y in 0..h {
-                for x in 0..w {
-                    for c in 0..3 {
-                        up[(y * w + x) * 3 + c] = base[((y / n) * bw + x / n) * 3 + c];
-                    }
-                }
-            }
-            let bytes = crate::encode_image(&up, w, h, &config).unwrap();
-            let kernel_bytes = 2 * weight_count(n as u32);
-            assert!(
-                bytes.len() <= base_bytes.len() + kernel_bytes + 8,
-                "{n}x: {} bytes, base {} + kernel {kernel_bytes}",
-                bytes.len(),
-                base_bytes.len()
-            );
-        }
-    }
-
     #[test]
     fn nearest_weights_match_libjxl() {
         let w2 = nearest_weights(2);

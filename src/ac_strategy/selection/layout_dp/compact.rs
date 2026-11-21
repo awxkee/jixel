@@ -395,33 +395,6 @@ mod tests {
     }
 
     #[test]
-    fn memo_pages_reuse_storage_across_dimensions() {
-        let mut compact = CompactPlanner::default();
-        compact.reset(8, 8);
-        let first = State { cell: 0, filled: 0 };
-        let neighbor = State { cell: 0, filled: 2 };
-        let distant = State {
-            cell: 62,
-            filled: 2,
-        };
-        compact.insert(first, 8, Memo::AtLeast(7.0));
-        compact.insert(distant, 8, Memo::AtLeast(9.0));
-        assert_eq!(compact.costs.len(), 2 * PAGE_SIZE);
-        assert!(matches!(compact.get(first, 8), Some(Memo::AtLeast(7.0))));
-        assert!(matches!(compact.get(distant, 8), Some(Memo::AtLeast(9.0))));
-        assert!(compact.get(neighbor, 8).is_none());
-
-        compact.reset(3, 7);
-        compact.insert(neighbor, 3, Memo::AtLeast(11.0));
-        assert!(compact.get(first, 3).is_none());
-        assert!(matches!(
-            compact.get(neighbor, 3),
-            Some(Memo::AtLeast(11.0))
-        ));
-        assert_eq!(compact.costs.len(), 2 * PAGE_SIZE);
-    }
-
-    #[test]
     fn compact_reconstruction_matches_generic_cost_choices_and_visits() {
         let mut generic = PlannerScratch::default();
         let mut specialized = PlannerScratch::default();

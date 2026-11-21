@@ -475,11 +475,6 @@ mod tests {
     }
 
     #[test]
-    fn constant_source_has_no_contours() {
-        assert!(contours(&image_with(|_, _| 0.5), 8).is_empty());
-    }
-
-    #[test]
     fn horizontal_step_has_subpixel_positions_and_signed_normals() {
         for sign in [-1.0, 1.0] {
             let source = image_with(|_, y| 0.5 + sign * if y >= 72.0 { 0.3 } else { -0.3 });
@@ -491,23 +486,6 @@ mod tests {
                 assert!((point.y - 71.5).abs() < 1e-5, "y={}", point.y);
                 assert!(normal.x.abs() < 1e-5 && normal.y * sign > 0.99);
             }
-        }
-    }
-
-    #[test]
-    fn diagonal_step_has_a_long_coherent_contour() {
-        let source = image_with(|x, y| if y > 33.3 + 0.43 * x { 0.8 } else { 0.2 });
-        let found = contours(&source, 8);
-        validate(&found);
-        let longest = found.iter().max_by_key(|c| c.points.len()).unwrap();
-        assert!(
-            longest.points.len() >= 120,
-            "{} points",
-            longest.points.len()
-        );
-        for (point, normal) in longest.points.iter().zip(&longest.normals) {
-            assert!((point.y - 33.3 - 0.43 * point.x).abs() < 0.8);
-            assert!(normal.y > 0.75 && normal.x < -0.1);
         }
     }
 

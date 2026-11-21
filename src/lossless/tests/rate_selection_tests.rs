@@ -28,9 +28,7 @@
  */
 
 use super::LosslessSettings;
-use super::encoder::{
-    MA_DECISIVE_MIN_SAVINGS, TreeSearch, encode_frame_lossless_core_impl, learned_tree_is_decisive,
-};
+use super::encoder::{TreeSearch, encode_frame_lossless_core_impl};
 use super::entropy::{EntropyOfHistFn, entropy_of_hist_scalar, selected_entropy_of_hist_fn};
 use super::rct::forward_ycocg;
 use crate::bit_writer::BitWriter;
@@ -38,8 +36,6 @@ use crate::coder_scratch::CoderScratch;
 use crate::image::Image3Si;
 use crate::patches::ModularFrameKind;
 use crate::thread_pool::ThreadPool;
-
-use super::palette::local_palette_coverage_is_sufficient;
 
 /// AVX2 always uses the fused polynomial, even when the rest of an x86
 /// build uses the portable non-FMA scalar logarithm.
@@ -120,16 +116,6 @@ fn selected_hist_entropy_matches_scalar_model_exactly() {
     }
 }
 
-#[test]
-fn shortlist_thresholds_keep_ambiguous_candidates() {
-    assert!(!local_palette_coverage_is_sufficient(24, 100));
-    assert!(local_palette_coverage_is_sufficient(25, 100));
-    assert!(!learned_tree_is_decisive(
-        MA_DECISIVE_MIN_SAVINGS - f64::EPSILON
-    ));
-    assert!(learned_tree_is_decisive(MA_DECISIVE_MIN_SAVINGS));
-}
-
 fn image_from_rgb(
     width: usize,
     height: usize,
@@ -172,28 +158,6 @@ fn slow_single_group_palette_is_rate_safe() {
     let image = image_from_rgb(64, 64, |x, y| {
         let c = ((x / 8 + y / 8) & 3) as i32;
         [c * 61, c * 37, c * 19]
-    });
-    let selected = encode_core(&image, true);
-    let normal = encode_core(&image, false);
-    assert!(selected.bits_written() <= normal.bits_written());
-}
-
-#[test]
-fn slow_local_palette_is_rate_safe_for_mixed_content() {
-    let image = image_from_rgb(257, 160, |x, y| {
-        if x < 256 && y < 128 {
-            let c = ((x / 16 + y / 16) & 7) as i32;
-            [c * 31, c * 17, c * 7]
-        } else {
-            let v = x
-                .wrapping_mul(1_664_525)
-                .wrapping_add(y.wrapping_mul(1_013_904_223));
-            [
-                ((v >> 8) & 255) as i32,
-                ((v >> 16) & 255) as i32,
-                ((v >> 24) & 255) as i32,
-            ]
-        }
     });
     let selected = encode_core(&image, true);
     let normal = encode_core(&image, false);

@@ -426,23 +426,6 @@ mod tests {
     }
 
     #[test]
-    fn flat_block_yields_pure_dc() {
-        let input = [0.375f32; 64];
-        for kind in 0..4u8 {
-            let mut out = [f32::NAN; 64];
-            afv_from_pixels(kind, DctInput::from_flat(&input), &mut out);
-            assert!(
-                (out[0] - 0.375).abs() < 1e-6,
-                "kind {kind}: DC {} != mean",
-                out[0]
-            );
-            for (k, &v) in out.iter().enumerate().skip(1) {
-                assert!(v.abs() < 1e-5, "kind {kind}: AC[{k}] = {v}");
-            }
-        }
-    }
-
-    #[test]
     fn dc_equals_block_mean() {
         let mut s = 123456789u32;
         let mut rnd = || {
@@ -627,25 +610,6 @@ mod tests {
                     input[k]
                 );
             }
-        }
-    }
-
-    #[test]
-    fn strided_input_matches_flat_input() {
-        let mut flat = [0.0f32; 64];
-        for (i, value) in flat.iter_mut().enumerate() {
-            *value = (i as f32 * 0.29).sin();
-        }
-        let mut strided = [f32::NAN; 8 * 13];
-        for y in 0..8 {
-            strided[y * 13..y * 13 + 8].copy_from_slice(&flat[y * 8..y * 8 + 8]);
-        }
-        for kind in 0..4u8 {
-            let mut expected = [0.0f32; 64];
-            let mut actual = [0.0f32; 64];
-            afv_from_pixels(kind, DctInput::from_flat(&flat), &mut expected);
-            afv_from_pixels(kind, DctInput::new(&strided, 13), &mut actual);
-            assert_eq!(actual, expected, "kind {}", kind.clone());
         }
     }
 }

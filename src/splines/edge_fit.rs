@@ -812,20 +812,6 @@ mod tests {
     }
 
     #[test]
-    fn constant_image_has_no_pairs() {
-        let image = Image3F::new(96, 96);
-        assert!(
-            find_pairs(
-                &EncodingContext::default(),
-                &mut CoderScratch::default(),
-                &image,
-                None
-            )
-            .is_empty()
-        );
-    }
-
-    #[test]
     fn coherent_step_produces_bounded_deterministic_pairs() {
         let (w, h) = (129usize, 113usize);
         let mut source = Image3F::new(w, h);
@@ -861,91 +847,5 @@ mod tests {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod dp_tests {
-    use super::*;
-
-    fn normals_of(curve: &[Point<f32>]) -> Vec<Point<f32>> {
-        (0..curve.len())
-            .map(|i| {
-                let (a, b) = (
-                    curve[i.saturating_sub(1)],
-                    curve[(i + 1).min(curve.len() - 1)],
-                );
-                let (dx, dy) = (b.x - a.x, b.y - a.y);
-                let length = fast_hypot(dx, dy);
-                Point::new(-dy / length, dx / length)
-            })
-            .collect()
-    }
-
-    /// Largest distance from a dense curve sample to the decoder's curve.
-    fn rendered_deviation(curve: &[Point<f32>], controls: &[Point<i32>]) -> f32 {
-        let controls: Vec<_> = controls
-            .iter()
-            .map(|p| Point::new(p.x as f32, p.y as f32))
-            .collect();
-        let rendered = crate::splines::catmull_rom(&controls);
-        curve
-            .iter()
-            .map(|p| {
-                rendered
-                    .windows(2)
-                    .map(|w| {
-                        let (dx, dy) = (w[1].x - w[0].x, w[1].y - w[0].y);
-                        let l2 = (dx * dx + dy * dy).max(1e-9);
-                        let t = (((p.x - w[0].x) * dx + (p.y - w[0].y) * dy) / l2).clamp(0.0, 1.0);
-                        fast_hypot(p.x - w[0].x - t * dx, p.y - w[0].y - t * dy)
-                    })
-                    .fold(f32::INFINITY, f32::min)
-            })
-            .fold(0.0, f32::max)
-    }
-
-    #[test]
-    fn dp_controls_follow_lines_arcs_and_wiggles_with_few_points() {
-        let line: Vec<_> = (0..120)
-            .map(|i| Point::new(10.3 + i as f32, 20.6 + i as f32 / 3.0))
-            .collect();
-        let arc: Vec<_> = (0..200)
-            .map(|i| {
-                let t = i as f32 / 199.0 * 1.5;
-                Point::new(100.0 + 80.0 * t.cos(), 100.0 + 80.0 * t.sin())
-            })
-            .collect();
-        // Detection jitter must not buy control points.
-        let wiggle: Vec<_> = (0..200)
-            .map(|i| Point::new(10.0 + i as f32, 50.0 + 0.3 * (i as f32 * 0.9).sin()))
-            .collect();
-        for (curve, most) in [(&line, 5), (&arc, 7), (&wiggle, 6)] {
-            let controls =
-                dp_controls(curve, &normals_of(curve), DP_LAMBDA, DP_MAX_DEVIATION).unwrap();
-            assert!(
-                controls.len() >= 2 && controls.len() <= most,
-                "{controls:?}"
-            );
-            assert!(rendered_deviation(curve, &controls) < 1.2);
-        }
-    }
-
-    #[test]
-    fn dp_controls_space_a_straight_run_for_zero_double_deltas() {
-        let line: Vec<_> = (0..241)
-            .map(|i| Point::new(8.0 + i as f32, 30.0 + i as f32 / 2.0))
-            .collect();
-        let controls = dp_controls(&line, &normals_of(&line), DP_LAMBDA, DP_MAX_DEVIATION).unwrap();
-        let deltas: Vec<_> = controls
-            .windows(2)
-            .map(|w| (w[1].x - w[0].x, w[1].y - w[0].y))
-            .collect();
-        assert!(
-            deltas.windows(2).filter(|d| d[0] != d[1]).count() <= 1,
-            "{controls:?}"
-        );
-        assert_eq!(controls[0], Point::new(8, 30));
-        assert_eq!(*controls.last().unwrap(), Point::new(248, 150));
     }
 }

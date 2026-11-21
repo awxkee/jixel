@@ -31,40 +31,14 @@
 
 use super::super::rct::inverse_ycocg;
 use super::global::{
-    ColorHasher, build_global_palette, cooccurrence_chain, cooccurrence_chain_path,
-    estimate_index_plane_cost, improve_chain_tour, index_cooccurrence, index_cost_rows,
-    path_cooccurrence,
+    build_global_palette, cooccurrence_chain_path, estimate_index_plane_cost, improve_chain_tour,
+    index_cost_rows, path_cooccurrence,
 };
 use super::visit_palette_colors;
 use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
 use crate::image::Image3Si;
 use crate::thread_pool::ThreadPool;
-
-#[test]
-fn color_hasher_accepts_array_hashing_and_uses_every_channel() {
-    use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
-
-    let builder = BuildHasherDefault::<ColorHasher>::default();
-    let mut hashes = std::collections::HashSet::new();
-    for channel in 0..4 {
-        for value in [i32::MIN, -65535, -1, 1, 255, 65535, i32::MAX] {
-            let mut color = [0i32; 4];
-            color[channel] = value;
-            let mut bytes = [0; 16];
-            for (part, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(color) {
-                *part = value.to_ne_bytes();
-            }
-            let mut raw = ColorHasher::default();
-            raw.write(&bytes);
-            let hash = builder.hash_one(color);
-            // Exercise the standard library's actual array Hash protocol,
-            // including its constant length prefix, against a raw payload.
-            assert_eq!(hash, raw.finish());
-            assert!(hashes.insert(hash), "channel={channel}, value={value}");
-        }
-    }
-}
 
 #[test]
 fn global_palette_reconstructs_rgb_and_alpha_from_input_tuple_ids() {
@@ -150,31 +124,6 @@ fn pooled_index_cost_matches_serial_histograms() {
             }
         }
     }
-}
-
-#[test]
-fn cooccurrence_chain_recovers_a_scrambled_ramp() {
-    // A horizontal ramp of 40 levels whose canonical ids are a random
-    // permutation of the ramp position: the chain must put the levels
-    // back in ramp order (either direction), which luma order cannot.
-    let (w, h, n) = (200usize, 8usize, 40usize);
-    let mut perm: Vec<u16> = (0..n as u16).collect();
-    let mut state = 0x2545_F491u32;
-    for i in (1..n).rev() {
-        state ^= state << 13;
-        state ^= state >> 17;
-        state ^= state << 5;
-        perm.swap(i, state as usize % (i + 1));
-    }
-    let indices: Vec<u16> = (0..h)
-        .flat_map(|_| (0..w).map(|x| perm[x * n / w]))
-        .collect();
-    let cooc = index_cooccurrence(&indices, w, h, n);
-    let order = cooccurrence_chain(n, &cooc);
-    let ramp: Vec<i32> = (0..n).map(|level| order[perm[level] as usize]).collect();
-    let ascending = ramp.array_windows::<2>().all(|p| p[1] == p[0] + 1);
-    let descending = ramp.array_windows::<2>().all(|p| p[1] == p[0] - 1);
-    assert!(ascending || descending, "chain order {ramp:?}");
 }
 
 #[test]

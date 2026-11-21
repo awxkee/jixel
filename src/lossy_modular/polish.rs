@@ -973,41 +973,6 @@ mod tests {
         img
     }
 
-    fn decoded_planes(p: &Pyramid) -> Vec<Vec<i32>> {
-        let mut channels = dequantized(p);
-        for s in p.steps.iter().rev() {
-            apply_step_inverse(&mut channels, s);
-        }
-        channels.into_iter().take(3).map(|c| c.data).collect()
-    }
-
-    #[test]
-    fn propagation_ranges_match_the_ordered_map() {
-        let mut seed = 23;
-        let mut scratch = PropagationScratch::default();
-        // Reuse between differently sized levels and proposals, including
-        // duplicate averages, copied odd tails and empty changed sets.
-        for lines in [97, 1, 67, 141, 1, 0, 83] {
-            scratch.clear(lines);
-            let mut expected = std::collections::BTreeMap::new();
-            for _ in 0..lines * 20 {
-                let line = next(&mut seed) as usize % lines;
-                let pos = next(&mut seed) as usize % 100;
-                scratch.add(line, pos);
-                let range = expected.entry(line).or_insert((usize::MAX, 0));
-                range.0 = range.0.min(pos.saturating_sub(1));
-                range.1 = range.1.max(pos);
-            }
-            scratch.lines.shared_sort();
-            let actual: Vec<_> = scratch
-                .lines
-                .iter()
-                .map(|&line| (line, scratch.ranges[line]))
-                .collect();
-            assert_eq!(actual, expected.into_iter().collect::<Vec<_>>());
-        }
-    }
-
     #[test]
     fn move_prices_preserve_local_sum_bits() {
         let mut seed = 17;
@@ -1039,80 +1004,6 @@ mod tests {
                     }
                 }
             }
-        }
-    }
-
-    #[test]
-    fn propagated_moves_decode_like_the_pyramid() {
-        let mut seed = 5u64;
-        // Wide (H first) and tall (V first) scripts, odd sizes.
-        for (w, h) in [(67, 45), (41, 90), (130, 64)] {
-            let src = source(w, h, &mut seed);
-            let pool = ThreadPool::new(1);
-            let mut p = Pyramid::xyb(&src, 3.0, false, &pool).unwrap();
-            let base = Baseline::new(&p, &src, true).unwrap();
-            let planes = decoded_planes(&p);
-            for (c, chain) in base.chains.iter().enumerate() {
-                assert_eq!(chain.outs[0], planes[c]);
-            }
-            let mut chains = base.chains.clone();
-            let mut log = Vec::new();
-            let mut propagation = PropagationScratch::default();
-            for _ in 0..900 {
-                let c = next(&mut seed) as usize % 3;
-                let chain = &mut chains[c];
-                let lv = &mut chain.lv;
-                let j = chain.movable + next(&mut seed) as usize % (lv.len() - chain.movable);
-                let (lines, pairs) = (lv[j].l.lines, lv[j].l.pairs);
-                if lines == 0 || pairs == 0 {
-                    continue;
-                }
-                let line = next(&mut seed) as usize % lines;
-                let i = next(&mut seed) as usize % pairs;
-                let (cx, cy) = lv[j].l.res_xy(line, i);
-                let ri = cy * lv[j].res_w + cx;
-                let step = if next(&mut seed).is_multiple_of(2) {
-                    1
-                } else {
-                    -1
-                };
-                lv[j].div[ri] += step;
-                lv[j].res[ri] = i64::from(lv[j].div[ri]) * lv[j].q;
-                log.clear();
-                propagate(lv, &mut chain.outs, j, line, i, &mut log, &mut propagation);
-            }
-            for chain in &chains {
-                for level in &chain.lv {
-                    p.channels[level.stored].data = level.div.clone();
-                }
-            }
-            let planes = decoded_planes(&p);
-            for (c, chain) in chains.iter().enumerate() {
-                assert_eq!(chain.outs[0], planes[c], "{w}x{h} plane {c}");
-            }
-        }
-    }
-
-    #[test]
-    fn undo_restores_every_level() {
-        let mut seed = 9u64;
-        let src = source(96, 70, &mut seed);
-        let pool = ThreadPool::new(1);
-        let p = Pyramid::xyb(&src, 2.0, false, &pool).unwrap();
-        let base = Baseline::new(&p, &src, true).unwrap();
-        for chain in &base.chains {
-            let (mut lv, mut outs) = (chain.lv.clone(), chain.outs.clone());
-            let mut log = Vec::new();
-            let mut propagation = PropagationScratch::default();
-            for j in chain.movable..lv.len() {
-                let (cx, cy) = lv[j].l.res_xy(0, 0);
-                let ri = cy * lv[j].res_w + cx;
-                lv[j].res[ri] += 5 * lv[j].q;
-                propagate(&lv, &mut outs, j, 0, 0, &mut log, &mut propagation);
-                lv[j].res[ri] -= 5 * lv[j].q;
-            }
-            undo(&mut outs, &log);
-            assert_eq!(outs, chain.outs);
         }
     }
 

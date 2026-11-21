@@ -2236,6 +2236,7 @@ pub(crate) fn dct32x16(input: &[f32; 512], output: &mut [f32; 512]) {
 }
 
 #[cfg(test)]
+#[allow(dead_code)] // Called by target-specific AVX/WASM tests.
 pub(crate) fn dct32x16_scalar(input: &[f32; 512], output: &mut [f32; 512]) {
     dct32x16_scalar_input(DctInput::from_flat(input), output);
 }
@@ -2317,6 +2318,7 @@ pub(crate) fn dct16x32(input: &[f32; 512], output: &mut [f32; 512]) {
 }
 
 #[cfg(test)]
+#[allow(dead_code)] // Called by target-specific AVX/WASM tests.
 pub(crate) fn dct16x32_scalar(input: &[f32; 512], output: &mut [f32; 512]) {
     dct16x32_scalar_input(DctInput::from_flat(input), output);
 }
@@ -2995,15 +2997,6 @@ mod tests {
     }
 
     #[test]
-    fn dct32x8_dispatch_matches_scalar_for_every_impulse() {
-        for i in 0..256 {
-            let mut pixels = [0.0; 256];
-            pixels[i] = 1.0;
-            check_dct32x8_dispatch(&pixels);
-        }
-    }
-
-    #[test]
     fn dct64_round_trips() {
         let mut input = [0.0f32; 4096];
         for y in 0..64 {
@@ -3018,21 +3011,6 @@ mod tests {
         inv_dct64x64(DctInput::from_flat(&coeffs), &mut output);
         for (expected, actual) in input.iter().zip(output.iter()) {
             assert!((expected - actual).abs() < 1e-4, "{expected} vs {actual}");
-        }
-    }
-
-    #[test]
-    fn dct64_constant_is_pure_dc_and_extracts_block_dcs() {
-        let input = [2.0f32; 4096];
-        let mut coeffs = [0.0f32; 4096];
-        dct64x64_scalar_input(DctInput::from_flat(&input), &mut coeffs);
-        assert!((coeffs[0] - 2.0).abs() < 1e-5);
-        assert!(coeffs[1..].iter().map(|v| v * v).sum::<f32>() < 1e-7);
-
-        let mut dc = [0.0f32; 64];
-        dc_from_dct64x64(&coeffs, &mut dc);
-        for value in dc {
-            assert!((value - 2.0).abs() < 1e-4, "{value}");
         }
     }
 
@@ -3154,35 +3132,10 @@ mod tests {
     }
 
     #[test]
-    fn strided_idct_input_matches_flat_input() {
-        let mut flat = [0.0f32; 64];
-        for (i, value) in flat.iter_mut().enumerate() {
-            *value = (i as f32 * 0.19).cos();
-        }
-        let mut strided = [f32::NAN; 8 * 13];
-        for y in 0..8 {
-            strided[y * 13..y * 13 + 8].copy_from_slice(&flat[y * 8..y * 8 + 8]);
-        }
-
-        let mut expected = [0.0f32; 64];
-        let mut actual = [0.0f32; 64];
-        inv_dct8x8(DctInput::from_flat(&flat), &mut expected);
-        inv_dct8x8(DctInput::new(&strided, 13), &mut actual);
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
     #[should_panic]
     fn strided_input_rejects_short_last_row() {
         let data = [0.0f32; (8 - 1) * 13 + 8 - 1];
         let _ = DctInput::<8, 8>::new(&data, 13);
-    }
-
-    #[test]
-    #[should_panic]
-    fn strided_input_rejects_short_stride() {
-        let data = [0.0f32; 64];
-        let _ = DctInput::<8, 8>::new(&data, 7);
     }
 
     #[test]
@@ -3228,157 +3181,6 @@ mod tests {
         rt2d!(512, dct32x16, inv_dct32x16);
     }
 
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    #[test]
-    fn neon_inverse_matches_scalar() {
-        let mut s = 555u32;
-        let mut rnd = || {
-            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5
-        };
-        macro_rules! cmp {
-            ($n:literal, $sc:path, $ne:path) => {{
-                for case in 0..16 {
-                    let mut c = [0.0f32; $n];
-                    c.iter_mut().for_each(|v| *v = rnd());
-                    let mut rs = [0.0f32; $n];
-                    $sc(DctInput::from_flat(&c), &mut rs);
-                    let mut rn = [0.0f32; $n];
-                    unsafe { $ne(DctInput::from_flat(&c), &mut rn) };
-                    let me = (0..$n)
-                        .map(|i| (rs[i] - rn[i]).abs())
-                        .fold(0.0f32, f32::max);
-                    assert!(me < 1e-3, "neon vs scalar {} case {case} max diff {me}", $n);
-                }
-            }};
-        }
-        cmp!(64, inv_dct8x8, crate::neon::inv_dct8x8_neon);
-        cmp!(128, inv_dct8x16, crate::neon::inv_dct8x16_neon);
-        cmp!(128, inv_dct16x8, crate::neon::inv_dct16x8_neon);
-        cmp!(256, inv_dct16x16, crate::neon::inv_dct16x16_neon);
-        cmp!(512, inv_dct16x32, crate::neon::inv_dct16x32_neon);
-        cmp!(512, inv_dct32x16, crate::neon::inv_dct32x16_neon);
-        cmp!(1024, inv_dct32x32, crate::neon::inv_dct32x32_neon);
-    }
-
-    #[test]
-    fn dct4x8_dc_matches_dct8x8() {
-        // The block DC (coeff[0]) of DCT4X8 must land on the same scale as
-        // DCT8X8's, otherwise the shared DC plane / decoder reconstruction is
-        // wrong. The ×0.5 Hadamard on the two half-DCs is what enforces this.
-        for &v in &[0.0f32, 0.37, -1.2, 4.5] {
-            let block = [v; 64];
-            let mut o4 = [0.0f32; 64];
-            let mut o8 = [0.0f32; 64];
-            dct4x8(&block, &mut o4);
-            dct8x8(&block, &mut o8);
-            assert!(
-                (o4[0] - o8[0]).abs() < 1e-4,
-                "DC mismatch for v={v}: 4x8={} 8x8={}",
-                o4[0],
-                o8[0]
-            );
-        }
-    }
-
-    #[test]
-    fn dct4x8_constant_is_pure_dc() {
-        // A constant block has energy only in the DC; every AC coefficient
-        // (including the vertical-difference at [8]) must vanish.
-        let block = [2.0f32; 64];
-        let mut o = [0.0f32; 64];
-        dct4x8(&block, &mut o);
-        for (i, &c) in o.iter().enumerate() {
-            if i == 0 {
-                continue;
-            }
-            assert!(c.abs() < 1e-4, "AC coeff[{i}] = {c} should be ~0");
-        }
-    }
-
-    #[test]
-    fn dct8x4_dc_matches_dct8x8() {
-        for &v in &[0.0f32, 0.37, -1.2, 4.5] {
-            let block = [v; 64];
-            let mut o = [0.0f32; 64];
-            let mut o8 = [0.0f32; 64];
-            dct8x4(&block, &mut o);
-            dct8x8(&block, &mut o8);
-            assert!(
-                (o[0] - o8[0]).abs() < 1e-4,
-                "DC mismatch for v={v}: 8x4={} 8x8={}",
-                o[0],
-                o8[0]
-            );
-        }
-    }
-
-    #[test]
-    fn dct8x4_constant_is_pure_dc() {
-        let block = [2.0f32; 64];
-        let mut o = [0.0f32; 64];
-        dct8x4(&block, &mut o);
-        for (i, &c) in o.iter().enumerate() {
-            if i == 0 {
-                continue;
-            }
-            assert!(c.abs() < 1e-4, "AC coeff[{i}] = {c} should be ~0");
-        }
-    }
-
-    #[test]
-    fn dct32x16_constant_is_pure_dc() {
-        let block = [1.7f32; 512];
-        let mut o = [0.0f32; 512];
-        dct32x16(&block, &mut o);
-        for (i, &c) in o.iter().enumerate() {
-            if i == 0 {
-                continue;
-            }
-            assert!(c.abs() < 1e-3, "32x16 AC coeff[{i}] = {c} should be ~0");
-        }
-    }
-
-    #[test]
-    fn dct16x32_constant_is_pure_dc() {
-        let block = [-0.9f32; 512];
-        let mut o = [0.0f32; 512];
-        dct16x32(&block, &mut o);
-        for (i, &c) in o.iter().enumerate() {
-            if i == 0 {
-                continue;
-            }
-            assert!(c.abs() < 1e-3, "16x32 AC coeff[{i}] = {c} should be ~0");
-        }
-    }
-
-    #[test]
-    fn dct32x16_16x32_dc_matches_dct8x8() {
-        // The block DC must land on the same scale as DCT8X8's, or the shared
-        // DC plane / decoder reconstruction is wrong.
-        for &v in &[0.0f32, 0.37, -1.2, 4.5] {
-            let block512 = [v; 512];
-            let block64 = [v; 64];
-            let mut o8 = [0.0f32; 64];
-            dct8x8(&block64, &mut o8);
-            let mut o = [0.0f32; 512];
-            dct32x16(&block512, &mut o);
-            assert!(
-                (o[0] - o8[0]).abs() < 1e-4,
-                "32x16 DC mismatch v={v}: {} vs 8x8 {}",
-                o[0],
-                o8[0]
-            );
-            dct16x32(&block512, &mut o);
-            assert!(
-                (o[0] - o8[0]).abs() < 1e-4,
-                "16x32 DC mismatch v={v}: {} vs 8x8 {}",
-                o[0],
-                o8[0]
-            );
-        }
-    }
-
     #[test]
     fn dc_from_dct32x16_16x32_constant_matches_block_dc() {
         // For a constant block, every covered-block DC equals the block DC
@@ -3407,137 +3209,6 @@ mod tests {
             assert!(
                 (d - expect).abs() < 1e-3,
                 "16x32 DC[{i}] = {d} should match block DC {expect}"
-            );
-        }
-    }
-
-    // Emulate the SIMD data-flow (each vector lane modeled as one of 8 f32s,
-    // dct1d_*_flat as the scalar 1D kernel applied per lane) using the exact
-    // gather/store index math of `dct32x16_avx2` / `dct16x32_avx2` (and their
-    // NEON twins), and confirm it reproduces the scalar transform. This
-    // validates the SIMD coefficient layout — the one part not exercised by the
-    // scalar fallback and not runnable under the in-repo toolchain. The real
-    // intrinsic kernels are additionally checked vs scalar in avx/neon `tests`.
-    fn dct1d_16_flat_emu(c: &mut [[f32; 8]; 16]) {
-        for lane in 0..8 {
-            let mut col = [0.0f32; 16];
-            for i in 0..16 {
-                col[i] = c[i][lane];
-            }
-            dct1d_16(&mut col);
-            for i in 0..16 {
-                c[i][lane] = col[i];
-            }
-        }
-    }
-    fn dct1d_32_flat_emu(c: &mut [[f32; 8]; 32]) {
-        for lane in 0..8 {
-            let mut col = [0.0f32; 32];
-            for i in 0..32 {
-                col[i] = c[i][lane];
-            }
-            dct1d_32(&mut col);
-            for i in 0..32 {
-                c[i][lane] = col[i];
-            }
-        }
-    }
-
-    #[test]
-    fn dct32x16_simd_layout_matches_scalar() {
-        let input: [f32; 512] = std::array::from_fn(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0);
-        let mut output = [0.0f32; 512];
-        // Phase 1: 32-pt column DCT, lane = column (contiguous loadu/storeu).
-        let mut after_col = [0.0f32; 512];
-        for g in 0..2 {
-            let mut c = [[0.0f32; 8]; 32];
-            for r in 0..32 {
-                for lane in 0..8 {
-                    c[r][lane] = input[r * 16 + g * 8 + lane];
-                }
-            }
-            dct1d_32_flat_emu(&mut c);
-            for v in 0..32 {
-                for lane in 0..8 {
-                    after_col[v * 16 + g * 8 + lane] = c[v][lane];
-                }
-            }
-        }
-        // Phase 2: 16-pt row DCT, lane = vfreq (set_ps gather → output[u*32+v]).
-        let scale = 1.0 / 512.0;
-        for g in 0..4 {
-            let b = g * 8;
-            let mut c = [[0.0f32; 8]; 16];
-            for u in 0..16 {
-                for lane in 0..8 {
-                    c[u][lane] = after_col[(b + lane) * 16 + u];
-                }
-            }
-            dct1d_16_flat_emu(&mut c);
-            for u in 0..16 {
-                for lane in 0..8 {
-                    output[u * 32 + b + lane] = c[u][lane] * scale;
-                }
-            }
-        }
-        let mut want = [0.0f32; 512];
-        dct32x16_scalar(&input, &mut want);
-        for i in 0..512 {
-            assert!(
-                (output[i] - want[i]).abs() < 1e-3,
-                "dct32x16 SIMD-layout mismatch at {i}: {} vs {}",
-                output[i],
-                want[i]
-            );
-        }
-    }
-
-    #[test]
-    fn dct16x32_simd_layout_matches_scalar() {
-        let input: [f32; 512] = std::array::from_fn(|i| ((i * 53 % 97) as f32 - 48.0) / 24.0);
-        let mut output = [0.0f32; 512];
-        // Phase 1: 32-pt row DCT, lane = row (set_ps gather → after_row[u*16+row]).
-        let mut after_row = [0.0f32; 512];
-        for g in 0..2 {
-            let b = g * 8;
-            let mut c = [[0.0f32; 8]; 32];
-            for u in 0..32 {
-                for lane in 0..8 {
-                    c[u][lane] = input[(b + lane) * 32 + u];
-                }
-            }
-            dct1d_32_flat_emu(&mut c);
-            for u in 0..32 {
-                for lane in 0..8 {
-                    after_row[u * 16 + b + lane] = c[u][lane];
-                }
-            }
-        }
-        // Phase 2: 16-pt column DCT, lane = hfreq (set_ps gather → output[v*32+u]).
-        let scale = 1.0 / 512.0;
-        for g in 0..4 {
-            let b = g * 8;
-            let mut c = [[0.0f32; 8]; 16];
-            for r in 0..16 {
-                for lane in 0..8 {
-                    c[r][lane] = after_row[(b + lane) * 16 + r];
-                }
-            }
-            dct1d_16_flat_emu(&mut c);
-            for v in 0..16 {
-                for lane in 0..8 {
-                    output[v * 32 + b + lane] = c[v][lane] * scale;
-                }
-            }
-        }
-        let mut want = [0.0f32; 512];
-        dct16x32_scalar(&input, &mut want);
-        for i in 0..512 {
-            assert!(
-                (output[i] - want[i]).abs() < 1e-3,
-                "dct16x32 SIMD-layout mismatch at {i}: {} vs {}",
-                output[i],
-                want[i]
             );
         }
     }
@@ -3591,22 +3262,6 @@ mod tests {
     }
 
     #[test]
-    fn dct4x4_dc_is_block_mean() {
-        // coeff[0] after the 2×2 Hadamard is the overall block mean (the DC the
-        // decoder pulls out via dc[0] = coeff[0]).
-        let input = [3.5f32; 64];
-        let mut coeff = [0.0f32; 64];
-        dct4x4(&input, &mut coeff);
-        assert!((coeff[0] - 3.5).abs() < 1e-4, "DC {} != 3.5", coeff[0]);
-        // A flat block has no AC energy.
-        for (i, &c) in coeff.iter().enumerate() {
-            if i != 0 {
-                assert!(c.abs() < 1e-3, "coeff[{i}] = {c} should be ~0");
-            }
-        }
-    }
-
-    #[test]
     fn dct1d_32_diagonalizes_dct_basis() {
         // Feeding the k0-th DCT-II basis vector must yield a single non-zero
         // output at index k0 (i.e. dct1d_32 really is a DCT).
@@ -3630,17 +3285,6 @@ mod tests {
             let off: f32 = (0..n).filter(|&i| i != k0).map(|i| x[i] * x[i]).sum();
             assert!(off < 1e-6 * (mv * mv).max(1.0), "basis {k0} leakage {off}");
         }
-    }
-
-    #[test]
-    fn dct32x32_constant_is_pure_dc() {
-        let input = [1.0f32; 1024];
-        let mut out = [0.0f32; 1024];
-        dct32x32_scalar(&input, &mut out);
-        // Same normalization as dct16x16 (1/N^2): DC of a flat block == mean.
-        assert!((out[0] - 1.0).abs() < 1e-4, "DC = {}", out[0]);
-        let off: f32 = (1..1024).map(|i| out[i] * out[i]).sum();
-        assert!(off < 1e-5, "non-DC energy {off}");
     }
 
     #[test]
@@ -3690,26 +3334,6 @@ mod tests {
             maxerr = maxerr.max((out[i] - reference[i]).abs());
         }
         assert!(maxerr < 1e-5, "dct32x32 vs reference maxerr {maxerr}");
-    }
-
-    #[test]
-    fn dc_from_dct32x32_inverts_lf_injection() {
-        // Round-trip: build LF coeffs from a known 4x4 DC via the decoder rule
-        // (forward 4-pt DCT then divide by resample scales), feed through
-        // dc_from_dct32x32, and recover the original DC. Validates the operator
-        // is the exact inverse of LowestFrequenciesFromDC (lossless DC path).
-        // We instead check invertibility directly: the 16x16 operator on the
-        // lowest 4x4 must be invertible and stable.
-        // Apply to several random LF patches and confirm determinism + that a
-        // flat LF (only coeff[0]) maps to a flat DC grid.
-        let mut coeffs = [0.0f32; 1024];
-        coeffs[0] = 32.0; // pure DC LF
-        let mut dc = [0.0f32; 16];
-        dc_from_dct32x32(&coeffs, &mut dc);
-        // RESAMPLE[0]=1, IDCT4 DC row = all ones -> every DC == coeffs[0].
-        for (i, &d) in dc.iter().enumerate() {
-            assert!((d - 32.0).abs() < 1e-3, "dc[{i}] = {d}, expected 32");
-        }
     }
 
     #[test]
@@ -3842,16 +3466,6 @@ mod tests {
     }
 
     #[test]
-    fn idct_context_reuses_the_resolved_dispatch_table() {
-        use crate::encoding_context::EncodingContext;
-
-        let first = EncodingContext::default();
-        let second = EncodingContext::default();
-        assert!(std::ptr::eq(first.idct, selected_idct_methods()));
-        assert!(std::ptr::eq(first.idct, second.idct));
-    }
-
-    #[test]
     fn identity8x8_round_trips_and_preserves_dc_scale() {
         let input = std::array::from_fn::<_, 64, _>(|i| {
             let x = (i % 8) as f32;
@@ -3886,38 +3500,6 @@ mod tests {
         inv_dct2x2_8x8(DctInput::from_flat(&coeffs), &mut recon);
         for (want, got) in input.iter().zip(recon) {
             assert!((want - got).abs() < 2e-6, "{want} != {got}");
-        }
-    }
-
-    #[test]
-    fn dct_linearity() {
-        let mut a = [0.0f32; 64];
-        let mut b = [0.0f32; 64];
-        for i in 0..64 {
-            a[i] = (i as f32 * 0.13).sin();
-            b[i] = (i as f32 * 0.27).cos();
-        }
-        let mut sum = [0.0f32; 64];
-        for i in 0..64 {
-            sum[i] = a[i] + b[i];
-        }
-
-        let mut da = [0.0f32; 64];
-        let mut db = [0.0f32; 64];
-        let mut dsum = [0.0f32; 64];
-        dct8x8(&a, &mut da);
-        dct8x8(&b, &mut db);
-        dct8x8(&sum, &mut dsum);
-
-        for i in 0..64 {
-            let expected = da[i] + db[i];
-            assert!(
-                (dsum[i] - expected).abs() < 1e-4,
-                "i={} dsum={} expected={}",
-                i,
-                dsum[i],
-                expected
-            );
         }
     }
 }

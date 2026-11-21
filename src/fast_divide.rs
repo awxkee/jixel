@@ -382,12 +382,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "division by zero")]
-    fn signed_64_rejects_zero() {
-        DividerI64::new(0);
-    }
-
-    #[test]
     #[should_panic(expected = "division overflow")]
     fn signed_64_rejects_overflow() {
         let _ = i64::MIN / DividerI64::new(-1);

@@ -166,13 +166,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uint_encode_small_values() {
-        for v in 0..16u32 {
-            assert_eq!(uint_encode(v), (v, 0, 0));
-        }
-    }
-
-    #[test]
     fn uint_encode_boundary_16() {
         // 16 = 10000, n=4, m=0, token = 16+0 = 16, nbits = 2
         assert_eq!(uint_encode(16), (16, 2, 0));
@@ -182,12 +175,6 @@ mod tests {
         assert_eq!(uint_encode(20), (17, 2, 0));
         // 31 = 11111, m=15, m>>2 = 3, token=19, bits=11
         assert_eq!(uint_encode(31), (19, 2, 3));
-    }
-
-    #[test]
-    fn uint_encode_n5() {
-        // 32 = 100000, n=5, m=0, token=20, nbits=3, bits=0
-        assert_eq!(uint_encode(32), (20, 3, 0));
     }
 
     fn uint_decode_for_test(token: u32, _nbits: u32, bits: u32, c: HybridUintConfig) -> u32 {

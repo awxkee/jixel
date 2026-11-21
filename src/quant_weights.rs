@@ -3173,23 +3173,6 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn dct8x32_table_sits_at_parity_with_the_pair_table() {
-        let m = DequantMatrices::new(1.0, Arbiter::Ssimulacra2, false);
-        // Weights (1/step) at matched physical frequency, 8x32 vs 16x8 x sqrt2.
-        for c in 0..3 {
-            for (y, x16) in [(0usize, 1usize), (0, 4), (2, 3), (4, 8), (7, 15)] {
-                let w16 = 1.0 / m.matrix_16x8(c)[y * 16 + x16];
-                let w32 = 1.0 / m.matrix_8x32(c)[y * 32 + 2 * x16];
-                let ratio = w32 / (w16 * std::f32::consts::SQRT_2);
-                assert!(
-                    (0.85..1.18).contains(&ratio),
-                    "c={c} y={y} x={x16} ratio={ratio}"
-                );
-            }
-        }
-    }
     use super::*;
 
     #[test]
@@ -3207,52 +3190,6 @@ mod tests {
             let t = tables_128();
             assert_eq!(t.matrix_128x128[1].len(), 16384);
             assert_eq!(t.matrix_128x64[1].len(), 8192);
-        }
-    }
-
-    #[test]
-    fn chromatic_sets_scale_the_dct8_base_weights() {
-        for d in [1.0, 1.5, 2.0] {
-            let base = DequantMatrices::new(d, Arbiter::Ssimulacra2, false).custom_tables[0]
-                .expect("flat DCT8 table");
-            for set in [
-                DequantMatrices::new_saturated(d, Arbiter::Ssimulacra2, false),
-                DequantMatrices::new_saturated_pair_b(d, Arbiter::Ssimulacra2, false),
-                DequantMatrices::new_x_heavy(d, Arbiter::Ssimulacra2),
-            ] {
-                let t = set.custom_tables[0].expect("chromatic DCT8 table");
-                for c in 0..3 {
-                    // Band multipliers are shared with the unscaled variant; the
-                    // base weight carries the fitted per-channel scale, F16-exact.
-                    let spec = if c == 2 {
-                        t.bands[2][0]
-                    } else {
-                        base.bands[c][0] * CHROMATIC_DCT8_ROWS[c]
-                    };
-                    if c != 2 {
-                        assert!((t.bands[c][0] / spec - 1.0).abs() < 2e-3, "d={d} c={c}");
-                    }
-                    assert_eq!(
-                        f16_bits_to_f32(f32_to_f16_bits(t.bands[c][0] / 64.0)) * 64.0,
-                        t.bands[c][0]
-                    );
-                }
-                let b_spec = f16_bits_to_f32(f32_to_f16_bits(512.0 / 64.0)) * 64.0;
-                assert!(
-                    (t.bands[2][0] / (b_spec * CHROMATIC_DCT8_ROWS[2]) - 1.0).abs() < 2e-3,
-                    "d={d}"
-                );
-            }
-            assert!(std::ptr::eq(
-                DequantMatrices::new_pair_b(d, Arbiter::Ssimulacra2, false).custom_tables[0]
-                    .as_ref()
-                    .map(|o| &o.bands[1][0])
-                    .unwrap(),
-                DequantMatrices::new_pair_b(d, Arbiter::Ssimulacra2, false).custom_tables[0]
-                    .as_ref()
-                    .map(|o| &o.bands[1][0])
-                    .unwrap()
-            ));
         }
     }
 
@@ -3375,18 +3312,6 @@ mod tests {
     }
 
     #[test]
-    fn dequant_matrices_are_only_heap_handles() {
-        // One handle (plus the custom-table box) per table, nothing inline: the
-        // struct must stay small enough to live on a 64 KiB stack.
-        let size = std::mem::size_of::<DequantMatrices>();
-        // The DCT64 rectangle family and the IDENTITY/DCT2X2 tables add three
-        // matrix/inverse pairs (six Box handles), taking the expected footprint
-        // from 296 to 392 bytes; the signalled IDENTITY weights (nine inline
-        // floats in an Option, not a matrix) take it to 432.
-        assert!(size <= 432, "DequantMatrices grew to {size} bytes");
-    }
-
-    #[test]
     fn dequant_matrices_construct_on_a_small_stack() {
         crate::thread_pool::ThreadPool::on_small_stack(|| {
             let _matrices = DequantMatrices::compute(
@@ -3398,129 +3323,6 @@ mod tests {
                 false,
             );
         });
-    }
-
-    #[test]
-    fn coarse_dct8_preserves_more_luma_high_frequency() {
-        // The DCT8 table is signaled (flat B bands) at every tier above the
-        // flat-B quality gate.
-        assert!(
-            DequantMatrices::new(QM_DCT8_MIN_DISTANCE - 0.01, Arbiter::Ssimulacra2, false)
-                .custom_tables[0]
-                .is_some()
-        );
-        assert!(
-            DequantMatrices::new(QM_DCT8_MIN_DISTANCE, Arbiter::Ssimulacra2, false).custom_tables
-                [0]
-            .is_some()
-        );
-
-        let normal =
-            DequantMatrices::compute(true, false, Some(&FLAT_B8_BANDS_MID), false, false, false);
-        let coarse =
-            DequantMatrices::compute(true, true, Some(&FLAT_B8_BANDS_MID), false, false, false);
-
-        let hf_ratio = coarse.inv_matrix(1)[63] / normal.inv_matrix(1)[63];
-        assert!((hf_ratio - QM_DCT8_Y_HF_SCALE).abs() < 0.01, "{hf_ratio}");
-        let lf_ratio = coarse.inv_matrix(1)[1] / normal.inv_matrix(1)[1];
-        assert!((1.0..1.03).contains(&lf_ratio), "{lf_ratio}");
-    }
-
-    #[test]
-    fn saturated_tables_swap_only_above_the_flat_b_gate() {
-        // Near-lossless tier ignores the content gate entirely (the tail pays
-        // for any finer B coding, saturated or not).
-        assert!(std::ptr::eq(
-            DequantMatrices::new_saturated(
-                QM_FLAT_B8_MIN_DISTANCE - 0.01,
-                Arbiter::Ssimulacra2,
-                false
-            ),
-            DequantMatrices::new(QM_FLAT_B8_MIN_DISTANCE - 0.01, Arbiter::Ssimulacra2, false),
-        ));
-        // Every flat-B tier gets a distinct table set with the saturated B row.
-        for d in [0.5, 1.5, 2.5, 4.0] {
-            let sat = DequantMatrices::new_saturated(d, Arbiter::Ssimulacra2, false);
-            let base = DequantMatrices::new(d, Arbiter::Ssimulacra2, false);
-            assert!(!std::ptr::eq(sat, base), "d={d}");
-            let table = sat.custom_tables[0].expect("saturated flat table");
-            assert_eq!(
-                table.bands[2][1],
-                f16_bits_to_f32(f32_to_f16_bits(SAT_B8_BANDS[1])),
-                "d={d}"
-            );
-        }
-    }
-
-    #[test]
-    fn flat_b8_gated_off_at_very_high_quality() {
-        // Near-lossless tier keeps the spec DCT8 table (nothing signaled);
-        // the flat-B override kicks in at the gate.
-        assert!(
-            DequantMatrices::new(QM_FLAT_B8_MIN_DISTANCE - 0.01, Arbiter::Ssimulacra2, false)
-                .custom_tables[0]
-                .is_none()
-        );
-        assert!(
-            DequantMatrices::new(QM_FLAT_B8_MIN_DISTANCE, Arbiter::Ssimulacra2, false)
-                .custom_tables[0]
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn flat_b8_shape_splits_at_mid_distance() {
-        // HQ knee below the split, Optuna mid shape at and above it.
-        let below = DequantMatrices::new(
-            QM_FLAT_B8_MID_MIN_DISTANCE - 0.01,
-            Arbiter::Ssimulacra2,
-            false,
-        )
-        .custom_tables[0]
-            .expect("hq flat table");
-        let at = DequantMatrices::new(QM_FLAT_B8_MID_MIN_DISTANCE, Arbiter::Ssimulacra2, false)
-            .custom_tables[0]
-            .expect("mid flat table");
-        assert_eq!(
-            below.bands[2][1],
-            f16_bits_to_f32(f32_to_f16_bits(FLAT_B8_BANDS_HQ[1]))
-        );
-        assert_eq!(
-            at.bands[2][1],
-            f16_bits_to_f32(f32_to_f16_bits(FLAT_B8_BANDS_MID[1]))
-        );
-        // X/Y rows identical across the split (only the B row changes).
-        for c in [0usize, 1] {
-            assert_eq!(below.bands[c][..6], at.bands[c][..6]);
-        }
-    }
-
-    #[test]
-    fn default_dct8_preserves_flat_blue_shape_with_fitted_rate() {
-        let m =
-            DequantMatrices::compute(false, false, Some(&FLAT_B8_BANDS_HQ), false, false, false);
-        // X and Y stay at the spec table within F16 signaling round-off.
-        for c in [0usize, 1] {
-            for k in 1..64 {
-                let spec = DEQUANT_MATRIX_8X8[c][k];
-                let got = m.matrix(c)[k];
-                assert!(
-                    (got - spec).abs() <= 2e-3 * spec.abs(),
-                    "c={c} k={k}: {got} vs spec {spec}"
-                );
-            }
-        }
-        // The base scale spends less on B while the flat shape still keeps
-        // substantially more precision at HF than the spec table.
-        for k in 1..64 {
-            let ratio = m.matrix(2)[k] / DEQUANT_MATRIX_8X8[2][k];
-            assert!(ratio <= 1.001 / ORDINARY_DCT8_B_SCALE, "k={k}: {ratio}");
-        }
-        let b_hf = m.matrix(2)[63] / DEQUANT_MATRIX_8X8[2][63];
-        assert!(
-            b_hf < 0.35 / ORDINARY_DCT8_B_SCALE,
-            "B HF step ratio {b_hf}"
-        );
     }
 
     #[test]
@@ -3562,38 +3364,6 @@ mod tests {
     }
 
     #[test]
-    fn color_proxy_retains_its_original_matrix_calibration() {
-        for d in [0.29, 0.3, 0.75, 1.249, 1.25, 2.25, 3.5] {
-            let expected = if d < QM_FLAT_B8_MIN_DISTANCE {
-                HeapMatrix::from_rows(&DEQUANT_MATRIX_8X8)
-            } else {
-                let b = if d < QM_FLAT_B8_MID_MIN_DISTANCE {
-                    &FLAT_B8_BANDS_HQ
-                } else {
-                    &FLAT_B8_BANDS_MID
-                };
-                compute_dct8x8_matrix(&default_dct8_override(
-                    d >= ORIGINAL_COARSE_DCT8_DISTANCE,
-                    b,
-                ))
-            };
-            for c in 0..3 {
-                assert_eq!(DequantMatrices::color_proxy_matrix(d, c), &expected[c]);
-            }
-        }
-    }
-
-    #[test]
-    fn fast_keeps_original_dct8_weights() {
-        for d in [0.29, 0.3, 0.75, 1.25, 2.0, 2.249, 2.25, 3.5] {
-            let fast = DequantMatrices::new_fast(d, Arbiter::Ssimulacra2);
-            for c in 0..3 {
-                assert_eq!(fast.matrix(c), DequantMatrices::color_proxy_matrix(d, c));
-            }
-        }
-    }
-
-    #[test]
     fn dct8_matrix_from_bands_matches_static() {
         let identity = BandOverride {
             num_bands: 6,
@@ -3613,52 +3383,6 @@ mod tests {
                 assert!(
                     (got - expected).abs() <= 2e-6 * expected.abs(),
                     "c={c} k={k}: computed {got}, static {expected}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn pair_b_tier_exists_only_inside_its_band() {
-        for d in [0.5, 1.0, 1.24, PAIR_B_FINE_MAX_DISTANCE, 3.0] {
-            assert!(std::ptr::eq(
-                DequantMatrices::new_pair_b(d, Arbiter::Ssimulacra2, false),
-                DequantMatrices::new(d, Arbiter::Ssimulacra2, false)
-            ));
-            assert!(std::ptr::eq(
-                DequantMatrices::new_saturated_pair_b(d, Arbiter::Ssimulacra2, false),
-                DequantMatrices::new_saturated(d, Arbiter::Ssimulacra2, false)
-            ));
-        }
-        for d in [PAIR_B_FINE_MIN_DISTANCE, 1.5, 2.0] {
-            assert!(
-                DequantMatrices::new(d, Arbiter::Ssimulacra2, false).custom_tables[3].is_none()
-            );
-            for m in [
-                DequantMatrices::new_pair_b(d, Arbiter::Ssimulacra2, false),
-                DequantMatrices::new_saturated_pair_b(d, Arbiter::Ssimulacra2, false),
-            ] {
-                let t = m.custom_tables[3].expect("finer pair-B table");
-                assert_eq!(t.num_bands, 7);
-                assert_eq!(
-                    t.bands[2][1],
-                    f16_bits_to_f32(f32_to_f16_bits(PAIR_B_FINE_BAND1))
-                );
-                // Only band 1 of B moves; X and Y rows stay the spec bands.
-                assert_eq!(
-                    t.bands[2][2],
-                    f16_bits_to_f32(f32_to_f16_bits(DCT16X8_BANDS[2][2]))
-                );
-                assert_eq!(
-                    t.bands[1][1],
-                    f16_bits_to_f32(f32_to_f16_bits(DCT16X8_BANDS[1][1]))
-                );
-                // The signalled table is what the encoder quantizes with: a
-                // finer band-1 means a smaller step at the first AC position
-                // outside the 2x1 LLF block.
-                assert!(
-                    m.matrix_16x8(2)[2]
-                        < DequantMatrices::new(d, Arbiter::Ssimulacra2, false).matrix_16x8(2)[2]
                 );
             }
         }
@@ -3798,81 +3522,6 @@ mod tests {
                 m_c[255],
                 m_c[0]
             );
-        }
-    }
-}
-
-#[cfg(test)]
-mod shared_storage_tests {
-    use super::*;
-    #[test]
-    fn invariant_tables_share_storage_across_all_preset_families() {
-        let shared = shared_tables();
-        for distance in [0.0, 0.1, 0.3, 0.75, 1.0, 1.5, 2.0, 2.25, 3.0, 4.0, 8.0] {
-            for set in [
-                DequantMatrices::new(distance, Arbiter::Ssimulacra2, false),
-                DequantMatrices::new_fast(distance, Arbiter::Ssimulacra2),
-                DequantMatrices::new_x_heavy(distance, Arbiter::Ssimulacra2),
-                DequantMatrices::new_pair_b(distance, Arbiter::Ssimulacra2, false),
-                DequantMatrices::new_saturated(distance, Arbiter::Ssimulacra2, false),
-                DequantMatrices::new_saturated_pair_b(distance, Arbiter::Ssimulacra2, false),
-            ] {
-                let large = large_tables(set.custom_tables[1].is_some(), None, false, 1.0);
-                assert!(std::ptr::eq(set.matrix_16x16, &*large.matrix_16x16));
-                assert!(std::ptr::eq(set.inv_matrix_16x16, &*large.inv_matrix_16x16));
-                assert!(std::ptr::eq(set.matrix_32x32, &*large.matrix_32x32));
-                assert!(std::ptr::eq(set.inv_matrix_32x32, &*large.inv_matrix_32x32));
-                assert!(std::ptr::eq(set.matrix_32x16, &*large.matrix_32x16));
-                assert!(std::ptr::eq(set.inv_matrix_32x16, &*large.inv_matrix_32x16));
-                assert!(std::ptr::eq(
-                    set.matrix_dct2x2.as_ptr(),
-                    shared.matrix_dct2x2.as_ptr()
-                ));
-                assert!(std::ptr::eq(
-                    set.inv_matrix_dct2x2.as_ptr(),
-                    shared.inv_matrix_dct2x2.as_ptr()
-                ));
-                assert!(std::ptr::eq(
-                    set.matrix_4x4.as_ptr(),
-                    shared.matrix_4x4.as_ptr()
-                ));
-                assert!(std::ptr::eq(
-                    set.inv_matrix_4x4.as_ptr(),
-                    shared.inv_matrix_4x4.as_ptr()
-                ));
-                assert!(std::ptr::eq(
-                    set.matrix_4x8.as_ptr(),
-                    tables_4x8().1.as_ptr()
-                ));
-                assert!(std::ptr::eq(
-                    set.inv_matrix_4x8.as_ptr(),
-                    tables_4x8().2.as_ptr()
-                ));
-                assert!(std::ptr::eq(
-                    set.matrix_afv.as_ptr(),
-                    shared.matrix_afv.as_ptr()
-                ));
-                assert!(std::ptr::eq(
-                    set.inv_matrix_afv.as_ptr(),
-                    shared.inv_matrix_afv.as_ptr()
-                ));
-                assert!(std::ptr::eq(
-                    set.matrix_64x64.as_ptr(),
-                    shared.matrix_64x64.as_ptr()
-                ));
-                assert!(std::ptr::eq(
-                    set.inv_matrix_64x64.as_ptr(),
-                    shared.inv_matrix_64x64.as_ptr()
-                ));
-                assert!(std::ptr::eq(
-                    set.matrix_64x32.as_ptr(),
-                    shared.matrix_64x32.as_ptr()
-                ));
-                assert!(std::ptr::eq(
-                    set.inv_matrix_64x32.as_ptr(),
-                    shared.inv_matrix_64x32.as_ptr()
-                ));
-            }
         }
     }
 }

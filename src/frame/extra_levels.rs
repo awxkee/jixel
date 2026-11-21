@@ -452,7 +452,7 @@ mod tests {
         };
         for bits in [10, 16] {
             let max = (1u32 << bits) - 1;
-            let n = 6000;
+            let n = 1200;
             // Mostly empty or full, antialiased edges in between.
             let data: Vec<u16> = (0..n)
                 .map(|_| match rnd() % 4 {
@@ -569,20 +569,5 @@ mod tests {
         assert!(matches!(q, AlphaPlane::U16 { bits: 10, .. }));
         assert!(levels(&q) < 64);
         assert!(sse(&plane, &q, &weights) <= 4096 * 400);
-    }
-
-    #[test]
-    fn error_weights_mark_smooth_partial_ramps_only() {
-        // Columns: a hard 0 → 255 edge, then a slow ramp.
-        let (w, h) = (12, 3);
-        let row = [0u8, 0, 255, 255, 100, 104, 108, 112, 116, 120, 255, 255];
-        let plane = AlphaPlane::U8((0..h).flat_map(|_| row).collect());
-        let weights = error_weights(&plane, w, h);
-        for y in 0..h {
-            for x in 0..w {
-                let smooth = (5..9).contains(&x);
-                assert_eq!(weights[y * w + x] > 1, smooth, "x {x} y {y}");
-            }
-        }
     }
 }

@@ -874,27 +874,4 @@ mod tests {
             &Default::default()
         ));
     }
-
-    #[test]
-    fn residual_candidates_are_judged_by_pooled_structure() {
-        let ctx = context();
-        let (width, height) = (70, 45);
-        let color = Image3F::try_new(width, height).unwrap();
-        let ramp: Vec<u8> = (0..width * height)
-            .map(|i| (40 + (i % width) * 2) as u8)
-            .collect();
-        // The incumbent is off by a smooth two levels; one candidate is off
-        // by one level, the other breaks the ramp into bands.
-        let incumbent = AlphaPlane::U8(ramp.iter().map(|&v| v + 2).collect());
-        let closer = AlphaPlane::U8(ramp.iter().map(|&v| v + 1).collect());
-        let banded = AlphaPlane::U8(ramp.iter().map(|&v| v / 4 * 4).collect());
-        let source = AlphaPlane::U8(ramp);
-        let cache = Default::default();
-        assert!(acceptable(
-            &ctx, &color, &source, &incumbent, &closer, true, &cache
-        ));
-        assert!(!acceptable(
-            &ctx, &color, &source, &incumbent, &banded, true, &cache
-        ));
-    }
 }

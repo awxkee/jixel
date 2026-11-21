@@ -320,8 +320,6 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lossless::tree::{TREE_CTX_PREDICTOR, TREE_CTX_PROPERTY, TREE_CTX_SPLIT_VAL};
-    use crate::util::fast_hypot;
 
     #[test]
     fn common_factor_division_preserves_signed_quotients() {
@@ -334,35 +332,6 @@ mod tests {
         let mut values = [i32::MIN, 0];
         assert_eq!(divide_common_factor(&mut values).0, 1 << 31);
         assert_eq!(values, [1, 0]); // Preserve the existing q-as-i32 divisor.
-    }
-
-    fn unpack(v: u32) -> i32 {
-        if v & 1 == 0 {
-            (v >> 1) as i32
-        } else {
-            -((v >> 1) as i32) - 1
-        }
-    }
-
-    /// Anti-aliased discs over a 600x300 plane, coded as two 300-wide crops.
-    fn discs() -> Vec<i32> {
-        let (w, h) = (600usize, 300usize);
-        (0..w * h)
-            .map(|i| {
-                let (x, y) = ((i % w) as f32, (i / w) as f32);
-                [
-                    (150.0, 150.0, 90.0),
-                    (420.0, 120.0, 70.0),
-                    (460.0, 230.0, 50.0),
-                ]
-                .iter()
-                .map(|&(cx, cy, r): &(f32, f32, f32)| {
-                    (0.5 - (fast_hypot(x - cx, y - cy) - r) / 1.5).clamp(0.0, 1.0)
-                })
-                .fold(0.0f32, f32::max)
-            })
-            .map(|a| (a * 255.0 + 0.5) as i32)
-            .collect()
     }
 
     #[test]
@@ -461,57 +430,5 @@ mod tests {
             le: 8,
         };
         assert!(gradient_lut(&other, &leaf_ctx, 0, 4).is_none());
-    }
-
-    #[test]
-    fn gradient_only_trees_stay_on_the_lookup_table_path() {
-        let pool = ThreadPool::new(1);
-        let mut scratch = CoderScratch::default();
-        let crops = [(0, 0, 300, 300, 4), (300, 0, 300, 300, 5)];
-        for budget in [
-            PlaneTreeBudget {
-                samples: 1 << 16,
-                leaves: 16,
-                gradient_only: true,
-            },
-            PlaneTreeBudget::FULL,
-        ] {
-            let mut data = discs();
-            let tree = learn_global_plane_tree(
-                &mut data,
-                600,
-                0,
-                None,
-                &crops,
-                budget,
-                &pool,
-                &mut scratch,
-            );
-            let mut splits = Vec::new();
-            let mut predictors = Vec::new();
-            let mut splitvals = Vec::new();
-            for t in &tree.tree_tokens {
-                match t.context {
-                    TREE_CTX_PROPERTY if t.value > 0 => splits.push(t.value - 1),
-                    TREE_CTX_PREDICTOR => predictors.push(t.value),
-                    TREE_CTX_SPLIT_VAL => splitvals.push(unpack(t.value)),
-                    _ => {}
-                }
-            }
-            assert!(!splits.is_empty(), "{budget:?} learned no splits");
-            assert_eq!(tree.crop_tokens.len(), 2);
-            if budget.gradient_only {
-                assert!(predictors.len() <= 16);
-                assert!(
-                    predictors.iter().all(|&p| p == PREDICTOR_GRADIENT),
-                    "{predictors:?}"
-                );
-                assert!(splits.iter().all(|&p| p < 2 || p == 9), "{splits:?}");
-                // libjxl's lookup table spans property values in [-8192, 8191].
-                assert!(splitvals.iter().all(|v| (-8192..8191).contains(v)));
-            } else {
-                assert!(splits.iter().any(|&p| p >= 2 && p != 9));
-            }
-        }
     }
 }

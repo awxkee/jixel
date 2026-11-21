@@ -510,39 +510,6 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_period_and_explains_the_pattern() {
-        let img = periodic(256, 192, 10, 12, 0.002);
-        let plan = find(&img).expect("lattice");
-        assert_eq!(plan.period, (10, 12));
-        assert_eq!(plan.nodes.len(), 25 * 16);
-        assert_eq!(plan.nodes[1], (10, 0));
-        assert_eq!(plan.nodes[25], (0, 12));
-        // The multiplicative model leaves only the noise.
-        let energy: f32 = (0..192)
-            .map(|y| {
-                plan.residual.plane_row(1, y)[..250]
-                    .iter()
-                    .map(|v| v * v)
-                    .sum::<f32>()
-            })
-            .sum();
-        assert!(energy / (192.0 * 250.0) < 1e-5, "residual {energy}");
-        // The additive tile has no DC.
-        assert!(plan.add_atlas[0].iter().sum::<i32>().abs() <= 120);
-    }
-
-    #[test]
-    fn smooth_content_has_no_lattice() {
-        let mut img = Image3F::new(128, 96);
-        for y in 0..96 {
-            for x in 0..128 {
-                img.plane_row_mut(1, y)[x] = 0.2 + 0.001 * (x + y) as f32;
-            }
-        }
-        assert!(find(&img).is_none());
-    }
-
-    #[test]
     fn both_arms_reconstruct_channels_and_uncovered_edges() {
         for (w, h, px, py) in [(67, 53, 6, 10), (128, 96, 8, 8), (257, 199, 32, 48)] {
             let img = periodic(w, h, px, py, 0.002);

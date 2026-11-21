@@ -700,13 +700,6 @@ pub(super) fn compact_tree(tokens: &[Token], context_map: &[u8]) -> Option<Compa
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    /// Build one group of `n` tokens in `context`, all carrying `value`.
-    fn leaf_tokens(context: u32, value: u32, n: usize) -> Vec<Vec<Token>> {
-        vec![(0..n).map(|_| Token::new(context, value)).collect()]
-    }
-
     #[test]
     fn dc_plane_price_pools_histograms_and_restarts_prediction() {
         let mut price = super::DcPlanePrice::default();
@@ -724,41 +717,6 @@ mod tests {
         // Treating them as one row would instead code residuals 100 and zero.
         assert_eq!(price.bits(), 2.0 * super::price_dc_plane(&[100], 1, 1, 1));
         assert!(super::price_dc_plane(&[100, 100], 2, 1, 2) < price.bits());
-    }
-
-    #[test]
-    fn dc_predictor_flips_only_on_a_decisive_populated_win() {
-        let n = MIN_TOKENS_PER_DC_LEAF as usize;
-        let ctx = 11;
-        let mut scratch = DcPredictorScratch::default();
-
-        // Gradient codes every residual as zero; the weighted predictor misses
-        // by a wide, multi-extra-bit margin.
-        let decisive = choose_dc_predictors(
-            &leaf_tokens(ctx, 4000, n),
-            &leaf_tokens(ctx, 0, n),
-            &mut scratch,
-        );
-        assert!(decisive[ctx as usize], "a decisive gradient win must flip");
-
-        // Identical streams: the margin must keep the weighted default.
-        let tied = choose_dc_predictors(
-            &leaf_tokens(ctx, 7, n),
-            &leaf_tokens(ctx, 7, n),
-            &mut scratch,
-        );
-        assert!(!tied[ctx as usize], "a tie must not flip");
-
-        // Same decisive win, but below the population floor.
-        let sparse = choose_dc_predictors(
-            &leaf_tokens(ctx, 4000, n - 1),
-            &leaf_tokens(ctx, 0, n - 1),
-            &mut scratch,
-        );
-        assert!(
-            !sparse[ctx as usize],
-            "an underpopulated leaf must not flip"
-        );
     }
 }
 

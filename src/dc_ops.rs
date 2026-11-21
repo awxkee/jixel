@@ -462,61 +462,6 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    #[ignore = "DC row benchmark; run in release mode with --ignored --nocapture"]
-    fn benchmark_dc_rows() {
-        use std::hint::black_box;
-        use std::time::Instant;
-
-        let n = 512;
-        let source_b: Vec<_> = (0..n).map(|i| (i as f32 - 256.0) / 17.0).collect();
-        let source_y: Vec<_> = (0..n).map(|i| (i as f32 - 256.0) / 971.0).collect();
-        let quant: [Vec<i16>; 3] =
-            std::array::from_fn(|c| (0..n).map(|i| (i * (c + 1)) as i16 - 256).collect());
-        let p = BdcCompensation {
-            scale_b: 317.0,
-            y_step_b: 0.53,
-        };
-        for (name, kernels, _) in kernels() {
-            let mut output = vec![0i16; n];
-            let mut targets = source_b.clone();
-            let mut recon: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0.0; n]);
-            for operation in ["compensate", "adjust", "reconstruct"] {
-                let mut times = Vec::new();
-                for _ in 0..5 {
-                    let start = Instant::now();
-                    for _ in 0..10_000 {
-                        match operation {
-                            "compensate" => black_box(kernels.compensate_b)(
-                                black_box(&source_b),
-                                black_box(&source_y),
-                                black_box(&quant[1]),
-                                black_box(p),
-                                black_box(0.37),
-                                black_box(&mut output),
-                            ),
-                            "adjust" => black_box(kernels.adjust_b)(
-                                black_box(&mut targets),
-                                black_box(&source_y),
-                                black_box(&quant[1]),
-                                black_box(p),
-                            ),
-                            _ => black_box(kernels.reconstruct)(
-                                black_box(quant.each_ref().map(Vec::as_slice)),
-                                black_box([-0.23, 0.37]),
-                                black_box([0.01, 0.02, 0.03]),
-                                black_box(recon.each_mut().map(Vec::as_mut_slice)),
-                            ),
-                        }
-                    }
-                    times.push(start.elapsed().as_nanos() as f64 / 10_000.0);
-                }
-                times.sort_by(f64::total_cmp);
-                eprintln!("{name} {operation}, {n} DCs: {:.1} ns/row", times[2]);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

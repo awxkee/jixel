@@ -70,8 +70,6 @@ mod tests;
 pub(super) use global::{
     GlobalPalette, OrderRace, PALETTE_COARSE_MARGIN, PALETTE_FINAL_MARGIN, build_global_palettes,
 };
-#[cfg(test)]
-pub(super) use local::local_palette_coverage_is_sufficient;
 pub(super) use local::{
     LOCAL_PALETTE_MAX_COLORS, LocalPaletteGroup, build_local_palette_group_limited,
     ordered_local_palette, try_encode_local_palette_multi_group,

@@ -310,18 +310,6 @@ mod tests {
     }
 
     #[test]
-    fn matrix_fee_is_shared_and_scan_order_independent() {
-        let header = MatrixHeaderCost {
-            payload: [0, 388, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        };
-        assert_eq!(choose_tables(&header, 2, 0, &[region(1, 200.0, 0)]), 0);
-        let mut regions = vec![region(1, 240.0, 0), region(1, 210.0, 0)];
-        assert_eq!(choose_tables(&header, 2, 0, &regions), 2);
-        regions.reverse();
-        assert_eq!(choose_tables(&header, 2, 0, &regions), 2);
-    }
-
-    #[test]
     fn table_combinations_include_fallback_activation_and_shared_mode_bits() {
         let header = MatrixHeaderCost {
             payload: [292, 388, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],

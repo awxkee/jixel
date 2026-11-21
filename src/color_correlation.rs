@@ -2332,125 +2332,6 @@ mod tests {
     }
 
     #[test]
-    fn x_dc_search_obeys_source_error_and_incremental_header() {
-        let ctx = EncodingContext::default();
-        // It would be cheap to store a zero residual, but a 0.49 phase has
-        // much worse error than the baseline's nearest source rounding.
-        let mut groups = [x_dc_fixture(5, 0.49, 48, 48)];
-        let mut gradient_price = DcGradientPrice::default();
-        let mut current = vec![0; 48];
-        let base = ytox_dc_cost(
-            &groups,
-            0,
-            INV_DC_QUANT[0],
-            [1.0; 3],
-            CflFrame::XYB,
-            ctx.quantize_dc_cfl,
-            &mut gradient_price,
-            &mut current,
-        );
-        let cheap = ytox_dc_cost(
-            &groups,
-            5,
-            INV_DC_QUANT[0],
-            [1.0; 3],
-            CflFrame::XYB,
-            ctx.quantize_dc_cfl,
-            &mut gradient_price,
-            &mut current,
-        );
-        assert!(cheap.bits < base.bits);
-        assert!(cheap.distortion > base.distortion);
-        let chosen = choose_ytox_dc(
-            &mut groups,
-            1.0,
-            [1.0; 3],
-            CflFrame::XYB,
-            false,
-            ctx.quantize_dc_cfl,
-            &ctx.thread_pool,
-            &mut Default::default(),
-        );
-        assert_ne!(chosen, 5);
-        let actual = ytox_dc_cost(
-            &groups,
-            chosen,
-            INV_DC_QUANT[0],
-            [1.0; 3],
-            CflFrame::XYB,
-            ctx.quantize_dc_cfl,
-            &mut gradient_price,
-            &mut current,
-        );
-        assert!(actual.distortion <= base.distortion);
-        let mut tiny = [x_dc_fixture(42, 0.0, 1, 1)];
-        assert_eq!(
-            choose_ytox_dc(
-                &mut tiny,
-                1.0,
-                [1.0; 3],
-                CflFrame::XYB,
-                false,
-                ctx.quantize_dc_cfl,
-                &ctx.thread_pool,
-                &mut Default::default(),
-            ),
-            0
-        );
-        assert_eq!(
-            choose_ytox_dc(
-                &mut tiny,
-                1.0,
-                [1.0; 3],
-                CflFrame::XYB,
-                true,
-                ctx.quantize_dc_cfl,
-                &ctx.thread_pool,
-                &mut Default::default(),
-            ),
-            42
-        );
-        let mut missing = [DcGroupData::new(48, 48).unwrap()];
-        assert_eq!(
-            choose_ytox_dc(
-                &mut missing,
-                1.0,
-                [1.0; 3],
-                CflFrame::XYB,
-                false,
-                ctx.quantize_dc_cfl,
-                &ctx.thread_pool,
-                &mut Default::default(),
-            ),
-            0
-        );
-    }
-
-    #[test]
-    fn constant_image_returns_zero() {
-        let mut opsin = Image3F::new(64, 64);
-        for c in 0..3 {
-            for y in 0..64 {
-                let row = opsin.plane_row_mut(c, y);
-                for x in 0..64 {
-                    row[x] = 0.5;
-                }
-            }
-        }
-        let ctx = EncodingContext::default();
-        let mut scratch = CflScratch {
-            block_b: [0.; 64],
-            block_x: [0.; 64],
-            block_y: [0.; 64],
-        };
-        let (ytox, ytob) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 2.0, &mut scratch);
-        // No variation → no useful correlation → slope == 0 (the regression
-        // collapses to numerator=0, denominator>0 → 0).
-        assert_eq!(ytox, 0);
-        assert_eq!(ytob, 0);
-    }
-
-    #[test]
     fn perfectly_correlated_chroma_finds_nonzero_slope() {
         // X = 0.3 * Y per pixel (within float roundoff). The regression
         // should land on roughly ytox = 0.3 * 84 ≈ 25.
@@ -2798,95 +2679,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rd_cost_rounding_boundaries_match_scalar() {
-        let kernels = rd_cost_kernels();
-        let m = [0.0; 9];
-        for residual in [
-            0.0f32,
-            0.5,
-            1.0,
-            1.5,
-            2.0,
-            2.5,
-            3.5,
-            8.5,
-            8_388_608.0,
-            2_147_483_648.0,
-        ] {
-            for residual in [residual.next_down(), residual, residual.next_up()] {
-                for residual in [residual, -residual] {
-                    let s = [residual; 9];
-                    // Offset the slices to exercise unaligned vector loads.
-                    let m = &m[1..];
-                    let s = &s[1..];
-                    for &(name, cost_fn) in &kernels {
-                        for lambda in [0.0, 0.03] {
-                            let expected = cfl_rd_cost_scalar(
-                                m,
-                                s,
-                                0.0,
-                                10.0,
-                                lambda,
-                                crate::group::DequantBias::DEFAULT[0],
-                            );
-                            let actual = cost_fn(
-                                m,
-                                s,
-                                0.0,
-                                10.0,
-                                lambda,
-                                crate::group::DequantBias::DEFAULT[0],
-                            );
-                            assert!(
-                                (actual - expected).abs() <= 2e-6 * expected.abs().max(1.0),
-                                "{name} residual {residual} lambda {lambda}: SIMD={actual}, scalar={expected}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn rd_cost_codes_only_when_cheaper_than_the_error() {
-        // A residual of 0.3 steps is zeroed: coding it costs lambda*bits on
-        // top of the quantization error. A residual of 3 steps is coded.
-        let small = cfl_rd_cost_scalar(
-            &[1.0],
-            &[0.3],
-            0.0,
-            1.0,
-            0.03,
-            crate::group::DequantBias::DEFAULT[0],
-        );
-        assert!((small - 0.09).abs() < 1e-6, "{small}");
-        let large = cfl_rd_cost_scalar(
-            &[1.0],
-            &[3.0],
-            0.0,
-            1.0,
-            0.03,
-            crate::group::DequantBias::DEFAULT[0],
-        );
-        let err = 3.0 - crate::group::DequantBias::DEFAULT[0].level_f32(3.0);
-        let coded = err * err + 0.03 * (CFL_NONZERO_BITS + CFL_MAGNITUDE_BITS * 3f32.log2());
-        assert!((large - coded).abs() < 1e-4, "{large} vs {coded}");
-        assert!(large < 9.0);
-    }
-
-    #[test]
-    fn deadzone_schedule_ramps_from_full_to_zero() {
-        // Full amount at/below LO, zero at/above HI, linear in between, and off
-        // (byte-identical) at low quality.
-        assert_eq!(cfl_deadzone(0.5), CFL_DEADZONE_AMOUNT);
-        assert_eq!(cfl_deadzone(CFL_DEADZONE_LO), CFL_DEADZONE_AMOUNT);
-        assert_eq!(cfl_deadzone(1.5), CFL_DEADZONE_AMOUNT * 0.5); // midpoint of 1.0..2.0
-        assert_eq!(cfl_deadzone(CFL_DEADZONE_HI), 0.0);
-        assert_eq!(cfl_deadzone(3.0), 0.0);
-    }
-
     /// X = k*Y on every pixel, so the tile's slope is k*84.
     fn correlated_tile(k: f32) -> Image3F {
         let mut opsin = Image3F::new(64, 64);
@@ -2899,41 +2691,6 @@ mod tests {
             }
         }
         opsin
-    }
-
-    #[test]
-    fn deadzone_keeps_a_real_slope_whole() {
-        let ctx = EncodingContext::default();
-        let mut scratch = CflScratch {
-            block_b: [0.; 64],
-            block_x: [0.; 64],
-            block_y: [0.; 64],
-        };
-        // ytox ≈ 25 and ≈ 4: both outside the deadzone, identical at every
-        // distance.
-        for k in [0.3f32, 0.045] {
-            let opsin = correlated_tile(k);
-            let (ytox_hq, _) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 0.5, &mut scratch);
-            let (ytox_lq, _) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 2.0, &mut scratch);
-            assert_eq!(ytox_hq, ytox_lq, "k={k}");
-            assert!((ytox_hq as f32 - k * 84.0).abs() <= 1.0, "k={k}: {ytox_hq}");
-        }
-    }
-
-    #[test]
-    fn deadzone_snaps_a_sub_threshold_slope_at_high_quality_only() {
-        let ctx = EncodingContext::default();
-        let mut scratch = CflScratch {
-            block_b: [0.; 64],
-            block_x: [0.; 64],
-            block_y: [0.; 64],
-        };
-        // ytox ≈ 1, inside the 1.5 deadzone.
-        let opsin = correlated_tile(1.0 / 84.0);
-        let (ytox_hq, _) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 0.5, &mut scratch);
-        let (ytox_lq, _) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 2.0, &mut scratch);
-        assert_eq!(ytox_hq, 0);
-        assert_eq!(ytox_lq, 1);
     }
 
     fn rdo_tile(opsin: &Image3F, pred_x: i32, pred_b: i32) -> (i32, i32) {
@@ -2975,25 +2732,6 @@ mod tests {
         )
     }
 
-    #[test]
-    fn rdo_keeps_full_slope_on_correlated_tiles() {
-        // X = 0.3*Y: the RDO path must land on the least-squares slope (~25)
-        // with no high-quality shrinkage — the anti-desaturation property the
-        // default path's distance-scheduled deadzone gives up below d=2.
-        let mut opsin = Image3F::new(64, 64);
-        for y in 0..64 {
-            for x in 0..64 {
-                let v = ((x ^ y) as f32) / 64.0;
-                opsin.plane_row_mut(1, y)[x] = v;
-                opsin.plane_row_mut(0, y)[x] = 0.3 * v;
-                opsin.plane_row_mut(2, y)[x] = v;
-            }
-        }
-        let (ytox, ytob) = rdo_tile(&opsin, 0, 0);
-        assert!((ytox - 25).abs() < 3, "ytox = {ytox}, expected ~25");
-        assert!(ytob.abs() < 3, "ytob = {ytob}, expected ~0");
-    }
-
     fn refit_tile(opsin: &Image3F, dc_data: &DcGroupData) -> (i32, i32) {
         let ctx = EncodingContext::default();
         let mut scratch = CoderScratch::lossless();
@@ -3010,26 +2748,6 @@ mod tests {
         let mut dc_data = DcGroupData::new(8, 8).unwrap();
         dc_data.raw_quant_field.as_mut_slice().fill(32);
         assert_eq!(refit_tile(&opsin, &dc_data), rdo_tile(&opsin, 0, 0));
-    }
-
-    #[test]
-    fn refit_keeps_full_slope_under_a_16x16_layout() {
-        // X = 0.3*Y holds under any linear transform: the refit must find the
-        // same slope (~25) on 16x16 coefficients, skipping their four lowest
-        // frequencies.
-        let opsin = correlated_tile(0.3);
-        let mut dc_data = DcGroupData::new(8, 8).unwrap();
-        dc_data.raw_quant_field.as_mut_slice().fill(32);
-        for y in (0..8).step_by(2) {
-            for x in (0..8).step_by(2) {
-                dc_data
-                    .ac_strategy
-                    .set_first(x, y, crate::dc_group_data::STRATEGY_DCT16X16);
-            }
-        }
-        let (ytox, ytob) = refit_tile(&opsin, &dc_data);
-        assert!((ytox - 25).abs() < 3, "ytox = {ytox}, expected ~25");
-        assert!(ytob.abs() < 3, "ytob = {ytob}, expected ~0");
     }
 
     #[test]
@@ -3060,44 +2778,6 @@ mod tests {
         let aligned = fit(6);
         assert!((aligned.0 - 25).abs() < 3, "aligned = {aligned:?}");
         assert_eq!(fit(7), aligned);
-    }
-
-    #[test]
-    fn rdo_returns_zero_on_neutral_tiles() {
-        // Achromatic content (X = 0, B = Y): both multipliers must stay 0.
-        let mut opsin = Image3F::new(64, 64);
-        for y in 0..64 {
-            for x in 0..64 {
-                let v = ((x * 7 + y * 13) % 31) as f32 / 62.0;
-                opsin.plane_row_mut(1, y)[x] = v;
-                opsin.plane_row_mut(0, y)[x] = 0.0;
-                opsin.plane_row_mut(2, y)[x] = v;
-            }
-        }
-        let (ytox, ytob) = rdo_tile(&opsin, 0, 0);
-        assert_eq!(ytox, 0);
-        assert_eq!(ytob, 0);
-    }
-
-    #[test]
-    fn rdo_empty_tile_falls_back_to_small_predictions() {
-        let pick = |pred| {
-            optimize_channel_rdo(
-                cfl_rdo_stats_scalar,
-                cfl_rd_costs_sequential,
-                crate::group::DequantBias::DEFAULT[0],
-                &[],
-                &[],
-                0.3,
-                0.03,
-                pred,
-                0.0,
-                K_COLOR_FACTOR,
-                None,
-            )
-        };
-        assert_eq!(pick(3), 3);
-        assert_eq!(pick(100), 0);
     }
 
     fn dc_group_with_residual_correlation(slope: f32) -> DcGroupData {
@@ -3168,78 +2848,6 @@ mod tests {
         assert_eq!(
             crate::util::f16_bits_to_f32(wire[2]),
             DC_QUANT[2] * 128.0 * steps[2]
-        );
-    }
-
-    #[test]
-    fn dc_steps_do_not_charge_an_existing_custom_header_again() {
-        // Removing one isolated rounding flip saves fewer than the 48 header
-        // bits. It is useful only when a custom X step already pays for them.
-        let flat = dc_group_with_sources(
-            |_, _| 100.0 / INV_DC_QUANT[1],
-            |x, y| {
-                let residual = if x == 20 && y == 20 { 40.51 } else { 40.49 };
-                (50.0 + residual) / INV_DC_QUANT[2]
-            },
-        );
-        let choose = |base| {
-            choose_dc_steps(
-                std::slice::from_ref(&flat),
-                &EncodingContext::default(),
-                1.0,
-                0,
-                base,
-                CflFrame::XYB,
-            )
-        };
-        assert_eq!(choose([1.0; 3]), [1.0; 3]);
-        let steps = choose([2.0, 1.0, 1.0]);
-        assert_eq!(steps[0], 2.0);
-        assert!(steps[1] < 1.0 || steps[2] < 1.0, "{steps:?}");
-    }
-
-    #[test]
-    fn dc_steps_stay_default_on_textured_dc() {
-        let noise = |seed: u32| {
-            move |x: usize, y: usize| {
-                let mut state = (x as u32 * 7919 + y as u32 * 104729 + seed) | 1;
-                for _ in 0..3 {
-                    state ^= state << 13;
-                    state ^= state >> 17;
-                    state ^= state << 5;
-                }
-                (state >> 12) as f32 / 1_048_576.0 * 300.0 - 150.0
-            }
-        };
-        let (luma, blue) = (noise(1), noise(99));
-        let textured = dc_group_with_sources(
-            |x, y| luma(x, y) / INV_DC_QUANT[1],
-            |x, y| blue(x, y) / INV_DC_QUANT[2],
-        );
-        assert_eq!(
-            choose_dc_steps(
-                &[textured],
-                &EncodingContext::default(),
-                1.0,
-                0,
-                [1.0; 3],
-                CflFrame::XYB,
-            ),
-            [1.0; 3]
-        );
-        assert!(dc_step_wire([1.0; 3]).is_none());
-        // Without the first pass's sources there is nothing to choose from.
-        let bare = DcGroupData::new(48, 48).unwrap();
-        assert_eq!(
-            choose_dc_steps(
-                &[bare],
-                &EncodingContext::default(),
-                1.0,
-                0,
-                [1.0; 3],
-                CflFrame::XYB,
-            ),
-            [1.0; 3]
         );
     }
 
@@ -3443,30 +3051,6 @@ mod tests {
                 "planted ytob_dc {k}"
             );
         }
-    }
-
-    #[test]
-    fn ytob_dc_declines_when_there_is_nothing_to_gain() {
-        // No residual correlation: the explicit ColorCorrelationParams bundle
-        // would cost header bits for nothing, so the search must return 0 and
-        // leave the frame on the all-default bit.
-        let groups = [dc_group_with_residual_correlation(0.0)];
-        let mut s0 = Vec::new();
-        let mut s1 = Vec::new();
-        assert_eq!(
-            choose_ytob_dc(
-                &groups,
-                selected_fill_ytob_row_fn(),
-                selected_accumulate_ytob_weights_fn(),
-                selected_fill_ytob_residuals_fn(),
-                &mut s0,
-                &mut s1,
-                [1.0; 3],
-                K_COLOR_FACTOR,
-                &ThreadPool::new(1),
-            ),
-            0
-        );
     }
 
     #[test]

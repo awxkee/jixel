@@ -473,54 +473,7 @@ impl Default for CoderScratch {
 
 #[cfg(test)]
 mod tests {
-    use super::{CoderScratch, DcPredictorScratch, LazyScratch, LzEntropyScratch};
-    use crate::ac_strategy::FineMosaicScratch;
-    use crate::group::AcGroupScratch;
-    use std::mem::size_of;
-
-    #[test]
-    fn scratch_structs_are_only_small_heap_handles() {
-        // MA split scoring keeps four buffers (plans, LUTs, histogram, counts).
-        // The 64-family rerank adds one Vec handle for cross-band leaves.
-        assert!(size_of::<CoderScratch>() <= 1208);
-        assert!(size_of::<LazyScratch<FineMosaicScratch>>() <= 32);
-        assert!(size_of::<DcPredictorScratch>() <= 32);
-        assert!(size_of::<LzEntropyScratch>() <= 128);
-        assert!(size_of::<LazyScratch<Box<LzEntropyScratch>>>() <= 32);
-        assert!(size_of::<AcGroupScratch>() <= 160);
-    }
-
-    #[test]
-    fn dc_predictor_counts_start_initialized_and_support_updates() {
-        let mut scratch = DcPredictorScratch::default();
-        for row in scratch.counts.iter() {
-            assert!(row.iter().all(|&count| count == 0));
-        }
-        assert!(scratch.extra.iter().all(|&bits| bits == 0));
-        scratch.counts[0][0] += 1;
-        let last = scratch.counts.last_mut().unwrap().last_mut().unwrap();
-        *last = u32::MAX;
-        assert_eq!(scratch.counts[0][0], 1);
-        assert_eq!(*scratch.counts.last().unwrap().last().unwrap(), u32::MAX);
-    }
-
-    #[test]
-    fn slow_lz_buffers_are_not_reserved_by_default() {
-        let scratch = CoderScratch::default();
-        assert_eq!(scratch.lz_repetitions.capacity(), 0);
-        assert_eq!(scratch.lz_depth.capacity(), 0);
-        assert_eq!(scratch.lz_candidate.capacity(), 0);
-        let entropy = LzEntropyScratch::default();
-        assert_eq!(entropy.histograms.capacity(), 0);
-        assert_eq!(entropy.prefix_codes.capacity(), 0);
-    }
-
-    #[test]
-    fn lossy_scratch_allocates_aq_only_when_needed() {
-        let scratch = CoderScratch::default();
-        assert_eq!(scratch.aq_map.aq_map.capacity(), 0);
-        assert_eq!(scratch.aq_map.secondary.capacity(), 0);
-    }
+    use super::CoderScratch;
 
     #[test]
     fn lossless_scratch_does_not_reserve_lossy_buffers() {

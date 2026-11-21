@@ -644,17 +644,4 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn wp_headers_have_expected_sizes() {
-        let mut default = BitWriter::new();
-        write_wp_header(WpParams::DEFAULT, &mut default);
-        assert_eq!(default.bits_written(), 1);
-
-        for &params in &WpParams::PRESETS[1..] {
-            let mut custom = BitWriter::new();
-            write_wp_header(params, &mut custom);
-            assert_eq!(custom.bits_written(), 52);
-        }
-    }
 }

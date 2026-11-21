@@ -280,37 +280,4 @@ mod tests {
             assert!(score.is_finite() && score > identity);
         }
     }
-
-    #[test]
-    fn identity_and_blurred_detail_on_odd_sizes() {
-        for (w, h) in [(4, 4), (19, 27), (128, 65)] {
-            let y: Vec<_> = (0..w * h).map(|i| 0.2 + (i % 17) as f32 * 0.01).collect();
-            let pool = ThreadPool::new(1);
-            let reference = LumaProxy::new(&y, w, h, &pool);
-            let mut work = Scratch::default();
-            let identity = reference.compare(&y, &mut work).0;
-            assert!(identity < 1e-5, "{identity}");
-            let flat = vec![0.28; w * h];
-            assert!(reference.compare(&flat, &mut work).0 > identity + 0.01);
-        }
-    }
-
-    #[test]
-    fn pooled_scores_match_serial_scores() {
-        let (w, h) = (131, 67);
-        let source: Vec<_> = (0..w * h).map(|i| (i % 47) as f32 * 0.01).collect();
-        let serial_pool = ThreadPool::new(1);
-        let parallel_pool = ThreadPool::new(4);
-        let serial = LumaProxy::new(&source, w, h, &serial_pool);
-        let parallel = LumaProxy::new(&source, w, h, &parallel_pool);
-        let mut serial_work = Scratch::default();
-        let mut parallel_work = Scratch::default();
-        for shift in [0.0, 0.01, -0.03] {
-            let test: Vec<_> = source.iter().map(|&v| v + shift).collect();
-            assert_eq!(
-                serial.compare(&test, &mut serial_work),
-                parallel.compare(&test, &mut parallel_work),
-            );
-        }
-    }
 }

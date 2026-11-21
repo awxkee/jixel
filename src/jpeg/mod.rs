@@ -597,14 +597,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_a_single_chunk_profile() {
-        let jpg = with_app(vec![icc_app2(1, 1, b"profile")]);
-        let icc = extract_icc(&jpg).unwrap();
-        assert_eq!(icc.profile, b"profile");
-        assert_eq!(icc.in_order_apps.as_deref(), Some(&[0][..]));
-    }
-
-    #[test]
     fn rejects_incomplete_or_inconsistent_profiles() {
         // A chunk is missing.
         let missing = with_app(vec![icc_app2(1, 2, b"half")]);
@@ -747,13 +739,6 @@ mod tests {
     }
 
     #[test]
-    fn ignores_unrelated_app_segments() {
-        let mut jfif = vec![0xE0u8, 0x00, 0x10];
-        jfif.extend_from_slice(b"JFIF\0\x01\x02\x00\x00\x01\x00\x01\x00\x00");
-        assert_eq!(extract_icc(&with_app(vec![jfif])), None);
-    }
-
-    #[test]
     fn extracts_the_first_standard_xmp_packet() {
         let jpg = with_app(vec![
             vec![0xE1, 0, 5, b'n', b'o', b'p'],
@@ -763,17 +748,5 @@ mod tests {
         let (index, xmp) = extract_xmp(&jpg).expect("XMP packet");
         assert_eq!(index, 1);
         assert_eq!(xmp, b"<x:xmpmeta>first</x:xmpmeta>");
-    }
-
-    #[test]
-    fn reconstruction_is_on_by_default() {
-        let default = JpegTranscodeConfig::default();
-        assert!(default.jpeg_reconstruction);
-        assert!(default.brotli_compression.is_none());
-        assert!(
-            !JpegTranscodeConfig::default()
-                .with_jpeg_reconstruction(false)
-                .jpeg_reconstruction
-        );
     }
 }

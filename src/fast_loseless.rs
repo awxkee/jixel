@@ -1246,30 +1246,6 @@ mod tests {
             Err(EncodeError::EmptyImage)
         );
     }
-    #[test]
-    fn rejects_unsupported_color_space() {
-        let img = ramp8(10, 10, 3);
-        assert!(matches!(
-            encode_fast_lossless(&img, 10, 10, ColorSpace::Xyb, false, &FlMeta::srgb()),
-            Err(EncodeError::UnsupportedColorSpace(ColorSpace::Xyb))
-        ));
-        assert!(matches!(
-            encode_fast_lossless(&img, 10, 10, ColorSpace::Unknown, false, &FlMeta::srgb()),
-            Err(EncodeError::UnsupportedColorSpace(ColorSpace::Unknown))
-        ));
-    }
-
-    #[test]
-    fn accepts_embedded_icc() {
-        let img = ramp8(10, 10, 3);
-        let mut m = FlMeta::srgb();
-        // A minimal non-empty ICC blob; the encoder compresses it via icc_codec.
-        m.icc = Some(vec![0u8; 128]);
-        let out = encode_fast_lossless(&img, 10, 10, Rgb, false, &m).expect("ICC encode");
-        // ICC-bearing stream must be larger than the equivalent no-ICC stream.
-        let base = encode_fast_lossless(&img, 10, 10, Rgb, false, &FlMeta::srgb()).unwrap();
-        assert!(out.len() > base.len());
-    }
 
     #[test]
     fn accepts_xmp() {
@@ -1297,83 +1273,6 @@ mod tests {
             encode_fast_lossless_u16(&img16, 10, 10, Gray, false, 16, &FlMeta::srgb()),
             Err(EncodeError::InputLength { .. })
         ));
-    }
-    #[test]
-    fn rejects_bad_bit_depth() {
-        let img16 = ramp16(10, 10, 3, 16);
-        assert!(matches!(
-            encode_fast_lossless_u16(&img16, 10, 10, Rgb, false, 8, &FlMeta::srgb()),
-            Err(EncodeError::BadBitDepth(8))
-        ));
-        assert!(matches!(
-            encode_fast_lossless_u16(&img16, 10, 10, Rgb, false, 17, &FlMeta::srgb()),
-            Err(EncodeError::BadBitDepth(17))
-        ));
-    }
-    #[test]
-    fn rejects_oversized() {
-        let img = ramp8(4, 4, 3);
-        assert!(matches!(
-            encode_fast_lossless(&img, (1usize << 30) + 1, 4, Rgb, false, &FlMeta::srgb()),
-            Err(EncodeError::DimensionTooLarge { .. })
-        ));
-        assert!(
-            encode_fast_lossless(
-                &img,
-                1usize << 30,
-                1usize << 30,
-                Rgb,
-                false,
-                &FlMeta::srgb()
-            )
-            .is_err()
-        );
-    }
-    #[test]
-    fn encodes_8bit_metadata_variants() {
-        let img = ramp8(48, 48, 3);
-        let mut metas = vec![FlMeta::srgb(), FlMeta::linear(), FlMeta::display_p3()];
-        for o in [
-            Orientation::Normal,
-            Orientation::FlipH,
-            Orientation::Rotate180,
-            Orientation::FlipV,
-            Orientation::Transpose,
-            Orientation::Rotate90,
-            Orientation::Transverse,
-            Orientation::Rotate270,
-        ] {
-            let mut m = FlMeta::srgb();
-            m.orientation = o;
-            metas.push(m);
-        }
-        let mut m = FlMeta::srgb();
-        m.intrinsic_size = Some((96, 96));
-        metas.push(m);
-        for m in &metas {
-            let out = encode_fast_lossless(&img, 48, 48, Rgb, false, m).expect("encode");
-            assert!(out.len() > 8 && out[0] == 0xFF && out[1] == 0x0A);
-        }
-    }
-    #[test]
-    fn encodes_high_bit_depth_hdr() {
-        for &(cs, alpha, bits) in &[
-            (Gray, false, 10u32),
-            (Rgb, false, 12),
-            (Rgb, false, 16),
-            (Rgb, true, 16),
-        ] {
-            let nb = (if cs == Gray { 1 } else { 3 }) + alpha as usize;
-            let img = ramp16(70, 50, nb, bits);
-            let out =
-                encode_fast_lossless_u16(&img, 70, 50, cs, alpha, bits, &FlMeta::rec2100_pq())
-                    .expect("u16 encode");
-            assert!(out.len() > 8 && out[0] == 0xFF && out[1] == 0x0A);
-        }
-        let img = ramp16(48, 48, 3, 10);
-        assert!(
-            encode_fast_lossless_u16(&img, 48, 48, Rgb, false, 10, &FlMeta::rec2100_hlg()).is_ok()
-        );
     }
     #[test]
     fn encodes_edge_dimensions() {

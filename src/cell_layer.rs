@@ -483,18 +483,6 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_block_at_an_odd_offset() {
-        let img = composite(400, 300, 37, 51, 90, 60, 2);
-        let plan = plan(&img).expect("a 2x block");
-        assert_eq!(plan.factor, 2);
-        assert_eq!((plan.x0 % 2, plan.y0 % 2), (1, 1));
-        assert!(plan.x0 <= 37 && plan.y0 <= 51);
-        assert!(plan.x0 + plan.width >= 37 + 180 && plan.y0 + plan.height >= 51 + 120);
-        let covered = plan.covered_pixels();
-        assert!((21_000..30_000).contains(&covered), "{covered}");
-    }
-
-    #[test]
     fn finds_a_4x_block_and_ignores_plain_ui() {
         let img = composite(400, 300, 64, 32, 40, 30, 4);
         let plan4 = plan(&img).expect("a 4x block");

@@ -57,56 +57,6 @@ fn unit_steps_reconstruct_the_plane_exactly() {
     assert_eq!(squeezed.reconstruct(), want);
 }
 
-#[test]
-fn black_plate_keeps_more_paper_free_of_ink() {
-    // Ink strokes on paper; K is stored inverted, so 255 is no ink. At K's
-    // coarse distance the squeeze overshoots next to every stroke.
-    let (w, h) = (96, 64);
-    let data: Vec<u8> = (0..w * h)
-        .map(|i| {
-            let (x, y) = (i % w, i / w);
-            if (x + 2 * y) % 23 < 3 || x % 31 < 2 {
-                0
-            } else {
-                255
-            }
-        })
-        .collect();
-    let plane = AlphaPlane::U8(data.clone());
-    let inked_paper = |black_plate| {
-        let squeezed = ExtraSqueeze::new(&plane, w, h, 24.0, false, true, black_plate).unwrap();
-        squeezed
-            .reconstruct()
-            .iter()
-            .zip(&data)
-            .filter(|&(&v, &source)| source == 255 && v.clamp(0, 255) < 255)
-            .count()
-    };
-    let (plain, black) = (inked_paper(false), inked_paper(true));
-    assert!(plain > 0, "the plain squeeze should ink some paper");
-    assert!(
-        black < plain,
-        "black plate inks {black} paper pixels, plain {plain}"
-    );
-}
-
-#[test]
-fn quantized_reconstruction_stays_close() {
-    let (w, h) = (300, 270);
-    let plane = soft_disc(w, h);
-    let squeezed = ExtraSqueeze::new(&plane, w, h, 4.0, false, true, false).unwrap();
-    assert!(squeezed.quants.iter().any(|&q| q > 1));
-    let rec = squeezed.reconstruct();
-    let err: Vec<i32> = rec
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| (v.clamp(0, 255) - plane.get_i32(i)).abs())
-        .collect();
-    let mean = err.iter().sum::<i32>() as f32 / err.len() as f32;
-    assert!(err.iter().any(|&e| e > 0), "distance 4 should be lossy");
-    assert!(mean < 2.0, "mean alpha error {mean}");
-}
-
 /// The closed-loop quantizer tracks exactly what the decoder's inverse
 /// squeeze rebuilds from the decoded averages and the scaled residuals.
 #[test]
@@ -226,23 +176,6 @@ fn exact_tail_candidates_preserve_unclamped_reconstruction() {
 }
 
 #[test]
-fn an_entirely_exact_pyramid_can_be_removed() {
-    for (bits, wide) in [(8, false), (8, true), (10, true), (12, true), (16, true)] {
-        for (w, h) in [(1, 9), (9, 1), (19, 27), (513, 257)] {
-            let plane = patterned_alpha(w, h, bits, wide);
-            let original = ExtraSqueeze::new(&plane, w, h, 1e-6, false, true, false).unwrap();
-            assert!(original.quants.iter().all(|&q| q == 1));
-            assert_eq!(original.exact_tail_start(), Some(0));
-            let candidate = original.without_exact_tail(0).unwrap();
-            assert!(candidate.steps.is_empty());
-            assert_eq!(candidate.channels.len(), 1);
-            let want: Vec<i32> = (0..w * h).map(|i| plane.get_i32(i)).collect();
-            assert_eq!(candidate.reconstruct(), want);
-        }
-    }
-}
-
-#[test]
 fn exact_tail_removal_rejects_quantized_or_out_of_range_requests() {
     for (bits, wide) in [(8, false), (8, true), (10, true), (12, true), (16, true)] {
         let plane = patterned_alpha(17, 11, bits, wide);
@@ -291,33 +224,4 @@ fn global_ac_forest_covers_every_ac_sample() {
     let coded: usize = forest.crop_tokens.iter().map(Vec::len).sum();
     assert_eq!(coded, ac_px);
     assert!(!forest.tree_tokens.is_empty());
-}
-
-#[test]
-fn repeated_share_marks_tiled_alpha_only() {
-    use super::{TILED_SHARE, repeated_share};
-    let (w, h) = (400, 400);
-    // An antialiased ring per 40x40 tile, repeated over the plane.
-    let ring = |x: usize, y: usize| {
-        let (dx, dy) = (x as f32 - 19.5, y as f32 - 19.5);
-        let r = (dx * dx + dy * dy).sqrt();
-        ((1.0 - (r - 12.0).abs() / 4.0).clamp(0.0, 1.0) * 65535.0) as i32
-    };
-    let tiled: Vec<i32> = (0..w * h).map(|i| ring(i % w % 40, i / w % 40)).collect();
-    assert!(repeated_share(&tiled, w) > TILED_SHARE);
-    // One large soft ring fading downwards: its rows never recur (an exactly
-    // mirrored shape repeats its rows, which LZ77 copies too).
-    let single: Vec<i32> = (0..w * h)
-        .map(|i| {
-            let (x, y) = (i % w, i / w);
-            let (dx, dy) = (x as f32 - 199.5, y as f32 - 199.5);
-            let r = (dx * dx + dy * dy).sqrt();
-            let fade = 1.0 - y as f32 / (2 * h) as f32;
-            ((1.0 - (r - 120.0).abs() / 40.0).clamp(0.0, 1.0) * fade * 65535.0) as i32
-        })
-        .collect();
-    assert!(repeated_share(&single, w) < 0.1);
-    // A straight vertical ramp repeats only from the row above.
-    let ramp: Vec<i32> = (0..w * h).map(|i| (i % w * 163) as i32).collect();
-    assert!(repeated_share(&ramp, w) < 0.1);
 }

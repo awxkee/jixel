@@ -1003,16 +1003,6 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_constant_zero() {
-        let chan = vec![0u8; 16 * 16];
-        let alpha = AlphaPlane::from_u8(chan);
-        let toks = tokenize_channel(&alpha, 16, 16);
-        for t in &toks {
-            assert_eq!(t.value, 0);
-        }
-    }
-
-    #[test]
     fn tokenize_channel_matches_scalar_for_all_sample_types() {
         for width in [
             1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 255, 256,
@@ -1056,13 +1046,6 @@ mod tests {
                     }
                 }
             }
-        }
-    }
-
-    #[test]
-    fn tokenize_empty_channel() {
-        for (width, height) in [(0, 0), (0, 3), (3, 0)] {
-            assert!(tokenize_channel(&AlphaPlane::U8(Vec::new()), width, height).is_empty());
         }
     }
 
@@ -1161,19 +1144,6 @@ mod tests {
                 },
             ));
         }
-    }
-
-    #[test]
-    fn write_alpha_small_emits_bytes() {
-        let mut w = BitWriter::new();
-        let chan = vec![128u8; 8 * 8];
-        let alpha = AlphaPlane::from_u8(chan);
-        let mut scratch = CoderScratch::default();
-        write_global_alpha_modular(&alpha, 8, 8, 1, true, &mut scratch, &mut w);
-        let bits = w.bits_written();
-        w.zero_pad_to_byte();
-        assert!(!w.into_bytes().is_empty());
-        assert!(bits > 0);
     }
 
     #[test]

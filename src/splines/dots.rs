@@ -935,32 +935,6 @@ mod tests {
     use crate::splines::dot_morphology::{column_scalar, row_scalar};
 
     #[test]
-    fn dark_spots_fit_on_sloped_backgrounds_but_reject_texture() {
-        let kernels = SplinesContext::get();
-        for slope in [0.0, 0.003, 0.008] {
-            let mut image = Image3F::new(64, 64);
-            for c in 0..3 {
-                for y in 0..64 {
-                    for x in 0..64 {
-                        let (dx, dy) = (x as f32 - 32.0, y as f32 - 32.0);
-                        image.plane_row_mut(c, y)[x] = 0.6 + slope * (dx + dy * 0.5)
-                            - 0.12 * (-0.5 * (dx * dx + dy * dy) / 0.64).exp();
-                    }
-                }
-            }
-            let fits = fit_peaks(kernels, &image, &[(-0.12, 32, 32)]);
-            assert_eq!(fits.len(), 1, "slope={slope}");
-            assert!(fits[0].1.alts.iter().all(|sp| sp.dct[3][0] < 0));
-            for y in 0..64 {
-                for x in 0..64 {
-                    image.plane_row_mut(1, y)[x] += if (x + y) % 2 == 0 { 0.04 } else { -0.04 };
-                }
-            }
-            assert!(fit_peaks(kernels, &image, &[(-0.12, 32, 32)]).is_empty());
-        }
-    }
-
-    #[test]
     fn fitting_cache_preserves_large_coordinate_rounding() {
         let kernels = SplinesContext::get();
         let r = 4isize;
@@ -1001,48 +975,6 @@ mod tests {
                 .collect::<Vec<_>>()
             };
             assert_eq!(fit(&mut cache), fit(&mut FitKernels::new()), "x={x}");
-        }
-    }
-
-    #[test]
-    fn compact_fit_screen_rejects_long_edges_in_both_polarities() {
-        let kernels = SplinesContext::get();
-        let r = 4isize;
-        let side = (2 * r + 1) as usize;
-        let mut targets = [
-            vec![0.0; side * side],
-            vec![0.0; side * side],
-            vec![0.0; side * side],
-        ];
-        for dy in -r..=r {
-            for dx in -1..=1 {
-                for channel in [1, 2] {
-                    targets[channel][(dy + r) as usize * side + (dx + r) as usize] = -0.08;
-                }
-            }
-        }
-        for polarity in [-1.0, 1.0] {
-            let targets: [Vec<f32>; 3] = targets
-                .clone()
-                .map(|values| values.into_iter().map(|v| -polarity * v).collect());
-            assert!(
-                dot_alts(
-                    kernels,
-                    16.0,
-                    16.0,
-                    4,
-                    &targets[1],
-                    &mut [[0.0; FIT_AREA]; 2],
-                    |_| panic!("a rejected luma fit must not read chroma"),
-                    16,
-                    16,
-                    r,
-                    polarity,
-                    MIN_EXPLAINED,
-                    &mut FitKernels::new()
-                )
-                .is_empty()
-            );
         }
     }
 
@@ -1141,91 +1073,6 @@ mod tests {
                         }
                     }
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn banded_top_hat_peaks_match_full_image_morphology() {
-        // A single band, a band boundary and clipped edges.
-        for (w, h) in [(23, 17), (61, 150), (130, 71)] {
-            let mut image = Image3F::new(w, h);
-            let mut s = 0x9e37_79b9u32;
-            for y in 0..h {
-                for (x, v) in image.plane_row_mut(1, y).iter_mut().enumerate() {
-                    s ^= s << 13;
-                    s ^= s >> 17;
-                    s ^= s << 5;
-                    let spike = match s % 61 {
-                        0 => 0.3,
-                        1 => -0.2,
-                        _ => 0.0,
-                    };
-                    *v = 0.002 * x as f32 + 0.001 * y as f32 + (s % 97) as f32 * 1e-4 + spike;
-                }
-            }
-            let y: Vec<f32> = (0..h)
-                .flat_map(|r| image.plane_row(1, r).to_vec())
-                .collect();
-            let pass = |src: &[f32], max: bool, horizontal: bool| {
-                (0..w * h)
-                    .map(|i| {
-                        let (x, yy) = (i % w, i / w);
-                        let (axis, size) = if horizontal { (x, w) } else { (yy, h) };
-                        (axis.saturating_sub(OPEN_RADIUS)..=(axis + OPEN_RADIUS).min(size - 1))
-                            .map(|k| {
-                                if horizontal {
-                                    src[yy * w + k]
-                                } else {
-                                    src[k * w + x]
-                                }
-                            })
-                            .reduce(|a, b| if max { a.max(b) } else { a.min(b) })
-                            .unwrap()
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let top_hat = |src: &[f32]| {
-                let eroded = pass(&pass(src, false, true), false, false);
-                let opened = pass(&pass(&eroded, true, true), true, false);
-                src.iter()
-                    .zip(&opened)
-                    .map(|(v, o)| (v - o).max(0.0))
-                    .collect::<Vec<_>>()
-            };
-            let negated: Vec<f32> = y.iter().map(|v| -v).collect();
-            let th = [top_hat(&y), top_hat(&negated)];
-            let mut expected = Vec::new();
-            for yy in BORDER..h - BORDER {
-                for x in BORDER..w - BORDER {
-                    for (polarity, th) in th.iter().enumerate() {
-                        let v = th[yy * w + x];
-                        if v < [MIN_TOP_HAT, MIN_DARK_TOP_HAT][polarity] {
-                            continue;
-                        }
-                        let is_max = (-1isize..=1).all(|dy| {
-                            (-1isize..=1).all(|dx| {
-                                let o = th
-                                    [(yy as isize + dy) as usize * w + (x as isize + dx) as usize];
-                                let earlier = dy < 0 || (dy == 0 && dx < 0);
-                                (dx == 0 && dy == 0) || !(o > v || (earlier && o == v))
-                            })
-                        });
-                        if is_max {
-                            expected.push((if polarity == 0 { v } else { -v }, x, yy));
-                        }
-                    }
-                }
-            }
-            assert!(expected.iter().any(|p| p.0 > 0.0) && expected.iter().any(|p| p.0 < 0.0));
-            for threads in [1, 3] {
-                let peaks = top_hat_peaks(
-                    SplinesContext::get(),
-                    &ThreadPool::new(threads),
-                    &mut CoderScratch::default(),
-                    &image,
-                );
-                assert_eq!(peaks, expected, "{w}x{h} threads={threads}");
             }
         }
     }

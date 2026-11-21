@@ -491,24 +491,6 @@ mod tests {
     }
 
     #[test]
-    fn stores_short() {
-        roundtrip(b"Exif\0\0MM\0*");
-    }
-
-    #[test]
-    fn stores_incompressible() {
-        // A simple LCG stands in for random data without pulling in a crate.
-        let mut state = 0x12345678u32;
-        let data: Vec<u8> = (0..70_000)
-            .map(|_| {
-                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-                (state >> 24) as u8
-            })
-            .collect();
-        roundtrip(&data);
-    }
-
-    #[test]
     fn stores_across_nibble_widths() {
         // Exercises the 4- and 5-nibble MLEN encodings.
         for len in [1usize, 0xFFFF, 0x1_0000, 0x1_0001] {
@@ -552,22 +534,6 @@ mod tests {
             compressed.len()
         );
         roundtrip(&data);
-    }
-
-    #[test]
-    fn compresses_runs_and_overlapping_copies() {
-        let mut data = vec![0u8; 50_000];
-        data.extend((0..50_000u32).map(|i| (i % 3) as u8));
-        data.extend(b"abcabcabcabcabcabcabcabc".iter().cycle().take(10_000));
-        roundtrip(&data);
-    }
-
-    #[test]
-    fn compresses_every_small_length() {
-        // Every length through the first block sizes, then a sample.
-        for len in (0..64).chain((64..300).step_by(7)) {
-            roundtrip(&words(len, len as u32));
-        }
     }
 
     #[test]

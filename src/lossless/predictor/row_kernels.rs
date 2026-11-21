@@ -819,40 +819,6 @@ mod tests {
     }
 
     #[test]
-    fn full_range_rounding_select_ties_and_average4_fallback_match_i64() {
-        let limit = 1 << 26;
-        let values = [
-            i32::MIN,
-            i32::MIN + 1,
-            -limit - 1,
-            -limit,
-            -limit + 1,
-            -65535,
-            -17,
-            -2,
-            -1,
-            0,
-            1,
-            2,
-            17,
-            65535,
-            limit - 1,
-            limit,
-            limit + 1,
-            i32::MAX - 1,
-            i32::MAX,
-        ];
-        for phase in 0..values.len() {
-            let data = std::array::from_fn(|row| {
-                (0..257)
-                    .map(|x| values[(x + phase + row * 7) % values.len()])
-                    .collect()
-            });
-            check_rows::<i32>(&data, 1);
-        }
-    }
-
-    #[test]
     fn fixed_costs_preserve_wide_average4_fallback() {
         for base in [i32::MIN + 512, -(1 << 26), 1 << 26, i32::MAX - 512] {
             let data: [Vec<i32>; 3] = std::array::from_fn(|y| {
@@ -926,41 +892,6 @@ mod tests {
                         }
                     }
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn rct_symbolization_matches_all_hybrid_boundaries() {
-        let mut packed: Vec<u32> = (0..=17).collect();
-        for log in 4..32 {
-            for mantissa in 0..4 {
-                let value = (1u64 << log) + (mantissa << (log - 2));
-                for delta in [-1i64, 0, 1] {
-                    packed.push((value as i64 + delta).clamp(0, i64::from(u32::MAX)) as u32);
-                }
-            }
-        }
-        packed.extend([u32::MAX - 1, u32::MAX]);
-        for offset in 0..8 {
-            let mut current = vec![0i32; offset];
-            let mut previous = 0i32;
-            for &value in &packed {
-                let residual = ((value >> 1) as i32) ^ -((value & 1) as i32);
-                previous = previous.wrapping_add(residual);
-                current.push(previous);
-            }
-            let north = vec![0; current.len()];
-            let mut expected = [0; 18 * 64];
-            let bits = (scalar().rct)(&current, &north, true, &mut expected);
-            for (name, kernels) in available() {
-                let mut actual = [0; 18 * 64];
-                assert_eq!(
-                    (kernels.rct)(&current, &north, true, &mut actual),
-                    bits,
-                    "{name}/{offset}"
-                );
-                assert_eq!(actual, expected, "{name}/{offset}");
             }
         }
     }

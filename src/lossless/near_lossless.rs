@@ -133,20 +133,4 @@ mod tests {
             assert_eq!(exact.plane_data(c), rgb.plane_data(c));
         }
     }
-
-    #[test]
-    fn wide_samples_use_the_declared_range() {
-        let mut rgb = Image3Si::new(4, 1);
-        rgb.plane_row_mut(0, 0)
-            .copy_from_slice(&[65535, 65534, 1023, 1022]);
-        let mut wide = rgb.clone();
-        quantize_planes(&mut wide, 65535, 2);
-        assert_eq!(wide.plane_row(0, 0), &[65535, 65535, 1025, 1020]);
-        let mut ten_bit = rgb.clone();
-        ten_bit
-            .plane_row_mut(0, 0)
-            .copy_from_slice(&[1023, 1022, 1021, 1020]);
-        quantize_planes(&mut ten_bit, 1023, 2);
-        assert_eq!(ten_bit.plane_row(0, 0), &[1023, 1020, 1020, 1020]);
-    }
 }

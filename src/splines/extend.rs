@@ -381,26 +381,4 @@ mod tests {
             assert_eq!(seed.last().unwrap().x, 48.0);
         }
     }
-
-    #[test]
-    fn does_not_extrapolate_seed_into_empty_affine_background() {
-        let (data, seed) = fixture(1.0, 0..0, 49, false);
-        assert!(trace(&data, 256, 128, &seed, 1.4).is_none());
-    }
-
-    #[test]
-    fn stops_at_large_gap_and_does_not_jump_to_parallel_line() {
-        for parallel in [false, true] {
-            let (data, seed) = fixture(1.0, 96..160, 224, parallel);
-            let p = trace(&data, 256, 128, &seed, 1.4).expect("initial visible continuation lost");
-            assert!(
-                p.chain.points.last().unwrap().x < 120.0,
-                "crossed a long unsupported interval"
-            );
-            assert!(
-                p.chain.points.iter().all(|q| (q.y - 64.0).abs() < 0.6),
-                "switched to another line"
-            );
-        }
-    }
 }

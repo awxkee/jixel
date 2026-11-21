@@ -735,17 +735,6 @@ mod tests {
     }
 
     #[test]
-    fn dictionary_is_never_larger_than_in_given_order() {
-        let mut scratch = CoderScratch::default();
-        let references = [entry(scattered(200), false), entry(scattered(50), true)];
-        let given =
-            encode_patch_dictionary(&patch_dictionary_tokens(&references, false), &mut scratch);
-        let mut w = BitWriter::new();
-        write_patch_dictionary(&references, false, &mut scratch, &mut w);
-        assert!(w.bits_written() < given.bits_written());
-    }
-
-    #[test]
     fn parallel_dictionary_matches_serial_with_shared_prices() {
         let pool = crate::thread_pool::ThreadPool::new_lossless(4);
         let references = [

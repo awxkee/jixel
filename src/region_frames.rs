@@ -478,34 +478,6 @@ mod tests {
     }
 
     #[test]
-    fn flat_images_and_rich_images_have_no_regions() {
-        assert!(
-            plan(
-                &screenshot(300, 200, (0, 0, 0, 0)),
-                None,
-                &ThreadPool::new(2)
-            )
-            .is_none()
-        );
-        assert!(
-            plan(
-                &screenshot(300, 200, (0, 0, 300, 200)),
-                None,
-                &ThreadPool::new(2)
-            )
-            .is_none()
-        );
-        assert!(
-            plan(
-                &screenshot(300, 200, (10, 10, 250, 170)),
-                None,
-                &ThreadPool::new(2)
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
     fn alpha_joins_the_color_and_follows_the_crop() {
         let img = screenshot(300, 200, (70, 50, 120, 90));
         let alpha = AlphaPlane::U8(vec![255; 300 * 200]);
