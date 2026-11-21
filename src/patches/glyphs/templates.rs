@@ -32,6 +32,7 @@ use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
 use crate::patches::{MODULAR_PATCH_REF_ID, PatchReference};
 use crate::shared_sort::SharedSort;
+use crate::util::FastRound;
 use std::collections::HashMap;
 
 /// Glyph templates: one atlas tile per glyph holds its color and its
@@ -121,7 +122,7 @@ fn template_of(
         }
     }
     for t in alpha {
-        *t = (*t * TEMPLATE_ALPHA_LEVELS).round() / TEMPLATE_ALPHA_LEVELS;
+        *t = (*t * TEMPLATE_ALPHA_LEVELS).fast_round() / TEMPLATE_ALPHA_LEVELS;
     }
     fg
 }
@@ -410,7 +411,7 @@ fn build_glyph_templates(
             atlas[1][start..][..w].fill(color[1]);
             atlas[2][start..][..w].fill(color[2] - color[0]);
             for (a, sample) in row.iter_mut().zip(&mut atlas_alpha[start..][..w]) {
-                *sample = (*a * 255.0).round().clamp(0.0, 255.0) as u8;
+                *sample = (*a * 255.0).fast_round().clamp(0.0, 255.0) as u8;
                 *a = f32::from(*sample) / 255.0;
             }
         }

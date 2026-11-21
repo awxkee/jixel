@@ -54,6 +54,8 @@ const INV_SIGMA_NUM: f32 = -1.171_572_9;
 const MIN_SIGMA: f32 = -3.905_243;
 const SAD_MUL: f32 = 1.65;
 const SHARPNESS_IDS: i32 = 8;
+/// Each band recomputes 2 * (2 + 1) stage-0 and 2 stage-1 rows at its edges.
+const MIN_BAND_ROWS: usize = 32;
 
 /// Loop-filter fields as the decoder reads them.
 #[derive(Clone, Copy, Debug)]
@@ -270,6 +272,10 @@ pub(crate) struct Epf<'a> {
     inv_sigma: Vec<f32>,
     work: Vec<stream::Scratch>,
     kernels: kernels::Kernels,
+    /// Column strip width. Full rows of a wide frame spill the fused rings
+    /// out of L2 (an 8K row: 2.8 MB); much narrower strips turn the frame
+    /// reads into short strided segments the prefetcher handles poorly.
+    strip: usize,
 }
 
 impl<'a> Epf<'a> {
@@ -279,10 +285,16 @@ impl<'a> Epf<'a> {
             blocks,
             output: None,
             inv_sigma: Vec::new(),
-            work: (0..pool.num_threads().min(image.ysize()).max(1))
+            // Bands of at least MIN_BAND_ROWS keep the recomputed halos of
+            // the fused stages small.
+            work: (0..pool
+                .num_threads()
+                .min(image.ysize().div_ceil(MIN_BAND_ROWS))
+                .max(1))
                 .map(|_| stream::Scratch::default())
                 .collect(),
             kernels: kernels::selected(),
+            strip: 1024,
         }
     }
 
@@ -322,27 +334,23 @@ impl<'a> Epf<'a> {
             ],
         };
         let output = self.output.get_or_insert_with(|| Image3F::new(w, h));
-        for (i, &(stage, sm)) in stages.iter().enumerate() {
-            stream::render(
-                pool,
-                scratch,
-                if i == 0 { Some(self.image) } else { None },
-                output,
-                stage,
-                lf,
-                &self.inv_sigma,
-                self.blocks.xsize,
-                sm,
-                self.kernels,
-                &mut self.work,
-            );
-        }
+        let chain = stream::Chain {
+            stages,
+            source: self.image,
+            lf,
+            sigma: &self.inv_sigma,
+            blocks_w: self.blocks.xsize,
+            kernels: self.kernels,
+            strip: self.strip,
+        };
+        stream::render(pool, scratch, &chain, output, &mut self.work);
         output
     }
 }
 
-/// Per raw strategy: `dc = M · llf` inverted, row-major over the lowest
-/// frequencies (`v * cx + u`) by DC index (`iy * cov_x + ix`).
+/// Per raw strategy: `dc = M · llf` inverted, stored column-major: entry
+/// `k * n + j` maps DC index `k` (`iy * cov_x + ix`) to lowest frequency `j`
+/// (`v * cx + u`), so the projection kernel loads lanes of `j` contiguously.
 fn llf_from_dc(ctx: &EncodingContext, raw: u8) -> &'static [f32] {
     static TABLES: [OnceLock<Vec<f32>>; crate::dc_group_data::NUM_STRATEGIES] =
         [const { OnceLock::new() }; crate::dc_group_data::NUM_STRATEGIES];
@@ -366,7 +374,14 @@ fn llf_from_dc(ctx: &EncodingContext, raw: u8) -> &'static [f32] {
                 m[k * n + j] = dc[k];
             }
         }
-        invert(&mut m, n)
+        let inv = invert(&mut m, n);
+        let mut columns = vec![0.0f32; n * n];
+        for j in 0..n {
+            for k in 0..n {
+                columns[k * n + j] = inv[j * n + k];
+            }
+        }
+        columns
     })
 }
 

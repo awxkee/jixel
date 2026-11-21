@@ -57,6 +57,7 @@ use crate::adaptive_quant::{dirty_log2f, dirty_log2p1f};
 use crate::coeff_order::{CoeffOrders, OrderStats, derive_orders, order_slot_of};
 use crate::dc_group_data::{NUM_STRATEGIES, STRATEGY_CODE_LUT};
 use crate::entropy::{pack_signed, uint_encode};
+use crate::util::FastRound;
 use std::cell::RefCell;
 use std::sync::{Arc, OnceLock};
 
@@ -503,7 +504,7 @@ impl RatePrices {
         let table = self.tables[strategy as usize].as_ref()?;
         let (width, height) = (cx * 8, cy * 8);
         let size = width * height;
-        let qf_hi = (class_qac * self.inv_scale).round() as u32 > self.qf_threshold;
+        let qf_hi = (class_qac * self.inv_scale).fast_round() as u32 > self.qf_threshold;
         Some(LEVELS.with_borrow_mut(|levels| {
             if levels.len() < size {
                 levels.resize(4096, 0);
@@ -597,7 +598,7 @@ impl RatePrices {
     ) -> Option<f32> {
         let table = self.tables[strategy as usize].as_ref()?;
         let size = cx * cy * 64;
-        let qf_hi = (class_qac * self.inv_scale).round() as u32 > self.qf_threshold;
+        let qf_hi = (class_qac * self.inv_scale).fast_round() as u32 > self.qf_threshold;
         Some(LEVELS.with_borrow_mut(|levels| {
             if levels.len() < size {
                 levels.resize(4096, 0);
@@ -626,7 +627,8 @@ impl RatePrices {
     /// Lower bound on a transform's rate without transforming any pixels.
     pub(crate) fn minimum_rate(&self, strategy: u8, class_qac: f32, distance: f32) -> Option<f32> {
         let table = self.tables[strategy as usize].as_ref()?;
-        let qf_hi = usize::from((class_qac * self.inv_scale).round() as u32 > self.qf_threshold);
+        let qf_hi =
+            usize::from((class_qac * self.inv_scale).fast_round() as u32 > self.qf_threshold);
         let mut bits = 0.0;
         for row in table
             .minimum_channel_bits

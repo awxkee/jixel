@@ -172,6 +172,20 @@ pub(crate) mod f32 {
         vst1q_f32 as store, vsubq_f32 as sub,
     };
 
+    /// `a * b + c` with one rounding (aarch64 always has fused multiply-add).
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub(crate) fn mul_add(a: float32x4_t, b: float32x4_t, c: float32x4_t) -> float32x4_t {
+        vfmaq_f32(c, a, b)
+    }
+
+    /// `|a - b|` in one instruction, rounded exactly as `abs(sub(a, b))`.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub(crate) fn abs_diff(a: float32x4_t, b: float32x4_t) -> float32x4_t {
+        vabdq_f32(a, b)
+    }
+
     #[inline]
     #[target_feature(enable = "neon")]
     pub(crate) fn mask_nonzero(v: float32x4_t, a: float32x4_t, b: float32x4_t) -> float32x4_t {

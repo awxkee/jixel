@@ -252,8 +252,59 @@ pub(crate) trait FastRound {
 }
 
 impl FastRound for f32 {
+    /// `f32::round` (ties away from zero) bit for bit. Without SSE4.1, x86
+    /// lowers `round` to a libm `roundf` call per value, which also stops the
+    /// surrounding loop vectorizing; WebAssembly has no such instruction either.
+    #[inline(always)]
     fn fast_round(self) -> Self {
-        self.round()
+        if cfg!(any(
+            all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                not(target_feature = "sse4.1")
+            ),
+            target_family = "wasm"
+        )) {
+            round_ties_away_portable(self)
+        } else {
+            self.round()
+        }
+    }
+}
+
+/// Branch-free ties-away rounding from SSE2-level operations only.
+#[inline(always)]
+fn round_ties_away_portable(x: f32) -> f32 {
+    // 2^23: every float at or above it is already an integer.
+    const MAGIC: f32 = 8_388_608.0;
+    let a = x.abs();
+    // Below 2^23, adding and removing 2^23 rounds to nearest, ties to even.
+    let n = (a + MAGIC) - MAGIC;
+    // A tie taken down to the even neighbor goes away from zero instead.
+    let n = if a - n == 0.5 { n + 1.0 } else { n };
+    // NaN fails the comparison and passes through; copysign keeps -0.0.
+    (if a < MAGIC { n } else { a }).copysign(x)
+}
+
+#[cfg(test)]
+#[test]
+fn portable_round_matches_f32_round() {
+    // Verified exhaustively over all 2^32 inputs; this keeps a sparse sweep
+    // plus every tie and binade edge in reach.
+    let check = |x: f32| {
+        let (want, got) = (x.round(), round_ties_away_portable(x));
+        assert!(
+            want.to_bits() == got.to_bits() || (want.is_nan() && got.is_nan()),
+            "{x:e}: {want:e} vs {got:e}"
+        );
+    };
+    for bits in (0..=u32::MAX).step_by(4093) {
+        check(f32::from_bits(bits));
+    }
+    for k in 0..(1 << 24) {
+        let tie = k as f32 + 0.5;
+        for x in [tie, -tie, tie.next_down(), tie.next_up()] {
+            check(x);
+        }
     }
 }
 

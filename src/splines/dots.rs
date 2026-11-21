@@ -235,7 +235,7 @@ pub(crate) fn is_dot(sp: &QuantizedSpline) -> bool {
     sp.points.len() == 1
 }
 
-/// Centre, [X, Y, B] color and sigma of a dot.
+/// center, [X, Y, B] color and sigma of a dot.
 pub(crate) fn dot_params(sp: &QuantizedSpline) -> (Point<f32>, [f32; 3], f32) {
     let c = Point {
         x: sp.points[0].x as f32,

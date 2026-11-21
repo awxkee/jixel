@@ -37,6 +37,7 @@ use crate::dc_group_data::{
 };
 use crate::dct::{DctInput, IdctMethods, fmla};
 use crate::image::{Image3F, Plane};
+use crate::util::FastRound;
 use std::sync::OnceLock;
 
 const R_NZ_BASE: f32 = 1.6;
@@ -1774,7 +1775,7 @@ pub(crate) fn recon_quantize_scalar<const BIASED: bool, const COMPUTE_RATE: bool
             let denominator = inverse * quant_scale;
             let scaled = denominator * coefficient;
             let quantized = if scaled.abs() >= threshold {
-                scaled.round()
+                scaled.fast_round()
             } else {
                 0.0
             };

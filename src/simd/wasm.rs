@@ -180,6 +180,20 @@ pub(crate) mod f32 {
         f32x4_splat as splat, f32x4_sub as sub,
     };
 
+    /// `a * b + c` rounded twice: baseline simd128 has no fused multiply-add.
+    #[inline]
+    #[target_feature(enable = "simd128")]
+    pub(crate) fn mul_add(a: v128, b: v128, c: v128) -> v128 {
+        f32x4_add(f32x4_mul(a, b), c)
+    }
+
+    /// `|a - b|`.
+    #[inline]
+    #[target_feature(enable = "simd128")]
+    pub(crate) fn abs_diff(a: v128, b: v128) -> v128 {
+        f32x4_abs(f32x4_sub(a, b))
+    }
+
     #[inline]
     #[target_feature(enable = "simd128")]
     pub(crate) unsafe fn load(p: *const f32) -> v128 {

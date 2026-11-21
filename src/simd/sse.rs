@@ -247,6 +247,22 @@ pub(crate) mod f32 {
     #[cfg(all(target_arch = "x86_64", feature = "sse"))]
     pub(crate) use std::arch::x86_64::{_mm_div_ps as div, _mm_max_ps as max, _mm_min_ps as min};
 
+    /// `a * b + c` rounded twice: SSE2 has no fused multiply-add.
+    #[cfg(feature = "sse")]
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    pub(crate) fn mul_add(a: __m128, b: __m128, c: __m128) -> __m128 {
+        _mm_add_ps(_mm_mul_ps(a, b), c)
+    }
+
+    /// `|a - b|`.
+    #[cfg(feature = "sse")]
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    pub(crate) fn abs_diff(a: __m128, b: __m128) -> __m128 {
+        abs(_mm_sub_ps(a, b))
+    }
+
     #[cfg(feature = "sse")]
     #[inline]
     #[target_feature(enable = "sse2")]
