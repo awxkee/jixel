@@ -33,7 +33,8 @@ use super::chroma::configure_chroma;
 use super::quantization::DistanceParams;
 use super::variants::{
     GLYPH_BITS_MARGIN, GLYPH_SINGLETON_FREE_MAX_DISTANCE, GLYPH_SINGLETON_RACE_MAX_DISTANCE,
-    GlyphStage, LATTICE_BITS_MARGIN, PreparedVarDct, UNPATCHED_BITS_MARGIN, lattice_variants,
+    GLYPH_STRAGGLER_BITS_MARGIN, GLYPH_STRAGGLER_MAX_SHARE, GlyphStage, LATTICE_BITS_MARGIN,
+    PreparedVarDct, UNPATCHED_BITS_MARGIN, UNPATCHED_DENSE_BAND, lattice_variants,
     prepare_vardct_variant,
 };
 #[cfg(feature = "splines")]
@@ -169,7 +170,19 @@ pub(super) fn encode_frame_vardct(
                 #[cfg(feature = "splines")]
                 None,
             )?;
-            if arm.estimate(ctx, scratch, distance, alpha, coeff_shifts)? < best_bits {
+            let arm_bits = arm.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
+            // A few unrepeated glyphs on a page set from the atlas: left to
+            // VarDCT they stand out beside it, and the estimate overprices
+            // the handful of extra atlas entries.
+            let repeated = glyphs.as_ref().map_or(0, GlyphStage::placements);
+            let placements = singles.placements();
+            let stragglers = placements.saturating_sub(repeated);
+            let margin = if stragglers as f64 <= GLYPH_STRAGGLER_MAX_SHARE * placements as f64 {
+                GLYPH_STRAGGLER_BITS_MARGIN
+            } else {
+                1.0
+            };
+            if arm_bits < best_bits * margin {
                 #[cfg(feature = "splines")]
                 if stage.is_some() {
                     let full = prepare_vardct_variant(
@@ -250,13 +263,36 @@ pub(super) fn encode_frame_vardct(
                     original: Option<Image3F>,
                     scratch: &mut CoderScratch|
      -> Result<PreparedVarDct, EncodeError> {
-        let Some((arm, bits)) = unpatched.take() else {
+        let Some((mut arm, mut bits)) = unpatched.take() else {
             return Ok(best);
         };
-        let best_bits = match best_bits {
+        let mut best_bits = match best_bits {
             Some(bits) => bits,
             None => best.estimate(ctx, scratch, distance, alpha, coeff_shifts)?,
         };
+        // Within the regular sample's own noise the pick is a coin toss:
+        // both frames are priced again on the dense sample. Equal bits mean
+        // the plan changed nothing.
+        if best_bits != bits && (best_bits / bits - 1.0).abs() < UNPATCHED_DENSE_BAND {
+            let dense = match (&mut arm, &original) {
+                (Some(arm), _) => {
+                    Some(arm.estimate_dense(ctx, scratch, distance, alpha, coeff_shifts)?)
+                }
+                (None, Some(source)) => Some(PreparedVarDct::estimate_regular_dense(
+                    ctx,
+                    scratch,
+                    distance,
+                    source,
+                    alpha,
+                    coeff_shifts,
+                )?),
+                (None, None) => None,
+            };
+            if let Some(dense) = dense {
+                bits = dense;
+                best_bits = best.estimate_dense(ctx, scratch, distance, alpha, coeff_shifts)?;
+            }
+        }
         Ok(if bits * UNPATCHED_BITS_MARGIN < best_bits {
             arm.unwrap_or_else(|| PreparedVarDct::regular(original.expect("unpatched source")))
         } else {

@@ -38,6 +38,12 @@ use crate::util::heap_array;
 use std::sync::OnceLock;
 
 pub(crate) const CLUSTERS_LIMIT: usize = 128;
+
+/// Clusters the ANS clusterer may open for the lossless pixel streams. The
+/// codestream allows 256 histograms per entropy code; 255 keeps `u8::MAX`
+/// free as the "unmapped" mark. Large photos fill libjxl's 128: at 255 they
+/// code 0.3-0.6% smaller for 1-2% more encode work and the same decode work.
+pub(crate) const ANS_CLUSTERS_LIMIT: usize = 255;
 /// Cluster budget of the greedy clustering without `wide_clustering`.
 pub(crate) const FAST_CLUSTERS_LIMIT: usize = 16;
 
@@ -1222,7 +1228,7 @@ fn merge_final_ans_clusters(
 /// parallel maps with the sequential tie-breaks, and the refinement passes
 /// precompute every move delta against a snapshot and recompute only the
 /// entries whose cluster changed since (exactly the sequential algorithm).
-/// `max_clusters` (at most `CLUSTERS_LIMIT`) bounds the clusters produced.
+/// `max_clusters` (at most `ANS_CLUSTERS_LIMIT`) bounds the clusters produced.
 /// `refinement_passes` is the existing relocation search budget; Slow VarDCT
 /// spends six passes, while the other callers retain two.
 pub(crate) fn cluster_histograms_ans(
@@ -1233,7 +1239,7 @@ pub(crate) fn cluster_histograms_ans(
     max_clusters: usize,
     refinement_passes: usize,
 ) -> usize {
-    assert!((1..=CLUSTERS_LIMIT).contains(&max_clusters));
+    assert!((1..=ANS_CLUSTERS_LIMIT).contains(&max_clusters));
     use super::ans::{AnsCostScratch, fast_ans_population_cost_scratch};
     use crate::coder_scratch::CoderScratch;
     use crate::thread_pool::ThreadPool;

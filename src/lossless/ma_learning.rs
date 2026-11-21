@@ -694,10 +694,6 @@ pub(super) fn learn_ma_candidate(
 /// time (a 128x128 icon: 0.21 s single-threaded, 0.14 s of it ranking).
 const MA_RANK_LEAVES: usize = MA_COARSE_MAX_LEAVES;
 
-/// The estimator's RCT runner-up is scored by the ranking learner when its
-/// estimated cost is within this factor of the best.
-pub(super) const RCT_RANK_MARGIN: f32 = 1.02;
-
 /// A ranking candidate whose 32-leaf coarse estimate trails the best coarse
 /// estimate seen so far by more than this is not scored further.
 pub(super) const RANK_COARSE_PRUNE: f64 = 1.005;

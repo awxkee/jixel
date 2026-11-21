@@ -218,7 +218,7 @@ effort_gates! {
     palette_dual,
     /// Meta-adaptive learned trees and the candidate-frame race.
     learned_tree,
-    /// Coarse-learn comparison of the palette and RGB sources and the RCT runner-up.
+    /// Coarse-learn comparison of the palette and RGB sources.
     tree_rank,
     /// 8M/16M-sample final tree learn.
     tree_dense_sampling,

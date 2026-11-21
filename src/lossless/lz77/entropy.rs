@@ -811,7 +811,12 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
         .collect();
 
     // The clusterer leaves the pinned contexts' clusters free.
-    let max_clusters = crate::entropy::CLUSTERS_LIMIT - pinned.len();
+    let cluster_limit = if ans_cluster {
+        crate::entropy::ANS_CLUSTERS_LIMIT
+    } else {
+        crate::entropy::CLUSTERS_LIMIT
+    };
+    let max_clusters = cluster_limit - pinned.len();
     let mut num_clusters = if ans_cluster {
         crate::entropy::cluster_histograms_ans(
             histograms,

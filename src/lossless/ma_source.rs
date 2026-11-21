@@ -615,8 +615,8 @@ pub(super) const PATCH_MIN_COVERAGE: f64 = 0.05;
 /// learn its 256-px layout.
 pub(super) const PALETTE_LAYOUT_MARGIN: f64 = 1.04;
 
-/// Below this many values (pixels x channels) the WP-preset and RCT
-/// runner-up rankings are skipped: each is a complete learn of the image
+/// Below this many values (pixels x channels) the WP-preset rankings are
+/// skipped: each is a complete learn of the image
 /// (20-35 ms single-threaded for a 128x128 icon coded in under a kilobyte),
 /// six to eight of them were most of a small icon's encode time, and their
 /// absolute gain on such files is a few bytes.
@@ -631,10 +631,7 @@ pub(super) fn source_values_of(xsize: usize, ysize: usize, nb_chans: usize) -> u
 }
 
 /// A per-group-palette first stage is grown into a complete frame only when
-/// it already beats the best source's own first stage. The bottom of the
-/// range separates cleanly (a winning plan lands at 0.75); the top does not
-/// (losers at 1.019 and 1.022 with a 1.65% winner between them at 1.023), so
-/// the strict bar gives up that small win to spare the losers a full encode.
+/// it already beats the best source's own first stage.
 pub(super) const PER_GROUP_MARGIN: f64 = 1.0;
 
 pub(super) use with_ma_pixels;

@@ -247,7 +247,7 @@ impl FrameCoder<'_, '_> {
         {
             return None;
         }
-        let mut regions = crate::region_frames::plan(linear, alpha)?;
+        let mut regions = crate::region_frames::plan(linear, alpha, self.pool)?;
         let mut crops: Vec<_> = regions
             .iter()
             .map(|r| crate::region_frames::crop(linear, alpha, r))
@@ -261,7 +261,8 @@ impl FrameCoder<'_, '_> {
         // frame than inside the whole, whose glyph patches cover it: it
         // stays in the base when the patches save a share of its estimate.
         if self.patches
-            && let Some(glyphs) = whole_glyphs.insert(find_lossless_glyph_patches(linear))
+            && let Some(glyphs) =
+                whole_glyphs.insert(find_lossless_glyph_patches(linear, self.pool))
         {
             let keep: Vec<bool> = regions
                 .iter()
@@ -349,7 +350,7 @@ impl FrameCoder<'_, '_> {
         // shapes: text, UI) come first; tile plans otherwise.
         let glyph_plan = match glyph_plan {
             Some(plan) => plan,
-            None if with_patches => find_lossless_glyph_patches(linear),
+            None if with_patches => find_lossless_glyph_patches(linear, self.pool),
             None => None,
         };
         let is_glyph_plan = glyph_plan.is_some();
@@ -374,6 +375,14 @@ impl FrameCoder<'_, '_> {
         // image (cannot pay for its dictionary and reference frame) skips
         // the patched encode.
         if !is_glyph_plan {
+            // A plan that cannot be used is released first: its base is a
+            // copy of the image (12 bytes per pixel) that would otherwise
+            // stay allocated through the whole regular encode.
+            if patch_coverage(&plan, linear.xsize() * linear.ysize()) < PATCH_MIN_COVERAGE {
+                drop(plan);
+                self.core(linear, alpha, self.settings, regular, true, writer);
+                return;
+            }
             let decisive_tree = self.core(
                 linear,
                 alpha,
@@ -382,8 +391,7 @@ impl FrameCoder<'_, '_> {
                 true,
                 &mut regular_writer,
             );
-            let coverage = patch_coverage(&plan, linear.xsize() * linear.ysize());
-            if decisive_tree || coverage < PATCH_MIN_COVERAGE {
+            if decisive_tree {
                 writer.append(&regular_writer);
                 return;
             }

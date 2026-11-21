@@ -45,8 +45,8 @@ pub(crate) use ans::{
     write_ans_tokens,
 };
 pub(crate) use cluster::{
-    CLUSTERS_LIMIT, FixedClusterScratch, cluster_histograms, cluster_histograms_ans,
-    cluster_histograms_fixed,
+    ANS_CLUSTERS_LIMIT, CLUSTERS_LIMIT, FixedClusterScratch, cluster_histograms,
+    cluster_histograms_ans, cluster_histograms_fixed,
 };
 pub(crate) use dlog2::f_log2;
 pub(crate) use entropy_code::{EntropyCode, FrozenTokenPrices, OwnedEntropyCode};
