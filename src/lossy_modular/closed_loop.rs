@@ -560,7 +560,7 @@ mod tests {
         let mut seed = 7u64;
         for (w, h) in [(37, 29), (64, 48), (9, 90), (130, 17), (1, 33)] {
             let scripts = [
-                (lossy_squeeze_steps(w, h, 3), 3),
+                (lossy_squeeze_steps(w, h, 3, false), 3),
                 (lossy_squeeze_steps_chroma(w, h, 3, &[1, 2]), 3),
                 (lossy_squeeze_steps_chroma(w, h, 5, &[0, 2]), 5),
                 (lossy_squeeze_steps_chroma(w, h, 1, &[]), 1),

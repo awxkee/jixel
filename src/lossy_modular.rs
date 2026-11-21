@@ -96,22 +96,32 @@ use pyramid::Pyramid;
 /// already written.
 /// Returns the frame size in bits before the fold race, for the Auto gate,
 /// or None when the image is too small to squeeze.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_xyb_frame(
     xyb: &Image3F,
     distance: f32,
     screen: bool,
+    vertical_first: bool,
     patches: &[crate::patches::PatchReference],
     speed: crate::Speed,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) -> Option<usize> {
-    let mut pyramid = Pyramid::xyb(xyb, distance, screen, pool)?;
+    let mut pyramid = Pyramid::xyb(xyb, distance, screen, vertical_first, pool)?;
     pyramid.patches = patches.to_vec();
     pyramid.group_shift = group_shift(speed);
     #[cfg(feature = "extraslow")]
     if speed.effort().lm_residual_polish() {
-        polish::polish_frame(&mut pyramid, xyb, distance, screen, pool, scratch);
+        polish::polish_frame(
+            &mut pyramid,
+            xyb,
+            distance,
+            screen,
+            vertical_first,
+            pool,
+            scratch,
+        );
     }
     race::encode(pyramid, speed, pool, scratch, writer)
 }
@@ -133,7 +143,7 @@ pub(crate) fn encode_xyb_crop_frame(
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) -> Option<usize> {
-    let mut pyramid = Pyramid::xyb(xyb, distance, screen, pool)?;
+    let mut pyramid = Pyramid::xyb(xyb, distance, screen, false, pool)?;
     pyramid.group_shift = group_shift(speed);
     pyramid.crop = Some((origin, full, last));
     race::encode(pyramid, speed, pool, scratch, writer)

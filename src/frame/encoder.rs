@@ -308,6 +308,7 @@ fn encode_modular_xyb(
             &image,
             modular_distance,
             screen,
+            ctx.modular_vertical_first && ctx.lossy_modular == crate::LossyModular::Force,
             &references,
             ctx.speed,
             &ctx.thread_pool,

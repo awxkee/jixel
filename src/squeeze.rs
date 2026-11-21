@@ -416,9 +416,14 @@ pub(crate) fn fold_quantized_step(
 }
 
 /// The XYB lossy pyramid over channels [0,num_c): a 4:2:0 chroma pre-squeeze,
-/// then [`lossy_shared_steps`] until both dimensions are <= 8
-/// (kMaxFirstPreviewSize). Valid, explicit (signaled) sequence.
-pub(crate) fn lossy_squeeze_steps(w: usize, h: usize, num_c: usize) -> Vec<SqueezeStep> {
+/// then shared steps until both dimensions are at most 8. The chroma
+/// pre-squeeze starts horizontally even when the shared steps start vertically.
+pub(crate) fn lossy_squeeze_steps(
+    w: usize,
+    h: usize,
+    num_c: usize,
+    vertical_first: bool,
+) -> Vec<SqueezeStep> {
     let mut steps = Vec::new();
     if num_c >= 3 {
         steps.extend([true, false].map(|horizontal| SqueezeStep {
@@ -428,7 +433,7 @@ pub(crate) fn lossy_squeeze_steps(w: usize, h: usize, num_c: usize) -> Vec<Squee
             num_c: 2,
         }));
     }
-    steps.extend(lossy_shared_steps(w, h, num_c));
+    steps.extend(lossy_shared_steps_with_order(w, h, num_c, vertical_first));
     steps
 }
 
@@ -458,11 +463,20 @@ pub(crate) fn default_squeeze_steps(w: usize, h: usize, num_c: usize) -> Vec<Squ
     squeeze_steps_levels(w, h, num_c, usize::MAX)
 }
 
-/// The shared steps of a lossy pyramid: [`default_squeeze_steps`], led by
-/// one vertical step on images taller than wide (libjxl's order).
 pub(crate) fn lossy_shared_steps(w: usize, h: usize, num_c: usize) -> Vec<SqueezeStep> {
+    lossy_shared_steps_with_order(w, h, num_c, false)
+}
+
+/// The shared steps of a lossy pyramid: [`default_squeeze_steps`], led by
+/// one vertical step if requested or if the image is taller than wide.
+fn lossy_shared_steps_with_order(
+    w: usize,
+    h: usize,
+    num_c: usize,
+    vertical_first: bool,
+) -> Vec<SqueezeStep> {
     const MAX_PREVIEW: usize = 8;
-    if h <= w || h <= MAX_PREVIEW {
+    if (!vertical_first && h <= w) || h <= MAX_PREVIEW {
         return default_squeeze_steps(w, h, num_c);
     }
     let mut steps = vec![SqueezeStep {
@@ -514,6 +528,32 @@ pub(crate) fn squeeze_steps_levels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertical_first_only_changes_the_shared_xyb_steps() {
+        let steps = |w, h, vertical_first| {
+            lossy_squeeze_steps(w, h, 3, vertical_first)
+                .into_iter()
+                .map(|s| (s.horizontal, s.in_place, s.begin_c, s.num_c))
+                .collect::<Vec<_>>()
+        };
+        let chroma = [(true, false, 1, 2), (false, false, 1, 2)];
+        let horizontal = (true, true, 0, 3);
+        let vertical = (false, true, 0, 3);
+        assert_eq!(
+            steps(27, 17, true),
+            [
+                chroma.as_slice(),
+                &[vertical, horizontal, vertical, horizontal]
+            ]
+            .concat(),
+        );
+        assert_eq!(steps(17, 27, true), steps(17, 27, false));
+        assert_eq!(
+            steps(17, 8, true),
+            [chroma.as_slice(), &[horizontal, horizontal]].concat(),
+        );
+    }
 
     fn rnd(seed: &mut u64) -> i32 {
         *seed = seed
