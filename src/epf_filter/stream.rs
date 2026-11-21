@@ -27,8 +27,11 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Bounded row rings for all three EPF stages. Later stages update the output
-//! in place; only the rows crossing worker boundaries need a snapshot.
+//! Bounded row rings for all three EPF stages, fused into one pass. Each stage
+//! filters straight into the next stage's input ring, so the frame is read
+//! once and written once whatever the pass count, as a decoder's row pipeline
+//! does. Workers own row bands; band edges recompute the later stages' halos.
+//! Bands walk in column strips so every ring of the chain stays in L1.
 use super::kernels::{FilterRow, Kernels, Neighbor};
 use super::{LoopFilter, Stage, mirror};
 use crate::coder_scratch::CoderScratch;
@@ -44,17 +47,58 @@ fn slot(row: isize, rows: usize, stride: usize) -> usize {
     row.rem_euclid(rows as isize) as usize * stride
 }
 
+/// The columns one stage covers in the current strip.
+#[derive(Clone, Copy, Default)]
+struct Span {
+    /// Output columns; `lo` is block aligned so lanes never straddle a block.
+    lo: usize,
+    hi: usize,
+    /// Frame column of ring index 0: left of zero at the frame's left edge.
+    origin: isize,
+    stride: usize,
+}
+
+impl Span {
+    fn width(&self) -> usize {
+        self.hi - self.lo
+    }
+    /// Ring index of output column `lo`.
+    fn offset(&self) -> usize {
+        (self.lo as isize - self.origin) as usize
+    }
+}
+
+/// One stage's rings: mirrored-padded input rows, per-direction differences
+/// (patch stages) and SADs, all indexed by absolute frame row.
 #[derive(Default)]
-pub(super) struct Scratch {
+struct Rings {
+    span: Span,
     pixels: [Vec<f32>; 3],
     difference: [Vec<f32>; 6],
     sad: [Vec<f32>; 6],
-    halo: [Vec<f32>; 3],
 }
 
-impl Scratch {
-    fn prepare(&mut self, stage: &Stage, w: usize) {
-        let stride = w + 2 * stage.border;
+#[derive(Default)]
+pub(super) struct Scratch {
+    rings: [Rings; 3],
+}
+
+/// What every band shares: the stage chain and its per-frame inputs.
+pub(super) struct Chain<'a> {
+    pub(super) stages: &'a [(&'a Stage, f32)],
+    pub(super) source: &'a Image3F,
+    pub(super) lf: &'a LoopFilter,
+    pub(super) sigma: &'a [f32],
+    pub(super) blocks_w: usize,
+    pub(super) kernels: Kernels,
+    /// Target strip width in pixels, a multiple of the 8-pixel block.
+    pub(super) strip: usize,
+}
+
+impl Rings {
+    fn prepare(&mut self, stage: &Stage, span: Span) {
+        self.span = span;
+        let stride = span.stride;
         for p in &mut self.pixels {
             grow(p, (2 * stage.border + 1) * stride);
         }
@@ -65,65 +109,54 @@ impl Scratch {
             grow(&mut self.sad[i], (dy as usize + 1) * stride);
         }
     }
-    fn snapshot(&mut self, image: &Image3F, first: usize, rows: usize, b: usize) {
+    fn start(&self, stage: &Stage, row: isize) -> usize {
+        slot(row, 2 * stage.border + 1, self.span.stride)
+    }
+    /// Frame columns `lo..hi` of input row `row`, for the previous stage to fill.
+    fn row_mut(&mut self, stage: &Stage, row: isize, lo: usize, hi: usize) -> [&mut [f32]; 3] {
+        let start = self.start(stage, row) + (lo as isize - self.span.origin) as usize;
+        self.pixels
+            .each_mut()
+            .map(|p| &mut p[start..start + hi - lo])
+    }
+    /// Mirror the columns of a filled input row that lie outside the frame.
+    fn pad(&mut self, stage: &Stage, row: isize, w: usize) {
+        let Span { origin, stride, .. } = self.span;
+        let end = origin + stride as isize;
+        if origin >= 0 && end <= w as isize {
+            return;
+        }
+        let start = self.start(stage, row);
+        let index = |x: isize| (x - origin) as usize;
+        for p in &mut self.pixels {
+            let dst = &mut p[start..start + stride];
+            for x in (origin..0).chain(w as isize..end) {
+                dst[index(x)] = dst[index(mirror(x, w as isize) as isize)];
+            }
+        }
+    }
+    fn load_source(&mut self, stage: &Stage, image: &Image3F, row: isize) {
         let w = image.xsize();
-        for c in 0..3 {
-            grow(&mut self.halo[c], 2 * b * w);
-            for i in 0..2 * b {
-                let y = if i < b {
-                    first as isize + i as isize - b as isize
-                } else {
-                    (first + rows + i - b) as isize
-                };
-                self.halo[c][i * w..(i + 1) * w]
-                    .copy_from_slice(image.plane_row(c, mirror(y, image.ysize() as isize)));
-            }
+        let y = mirror(row, image.ysize() as isize);
+        let lo = self.span.origin.max(0) as usize;
+        let hi = (self.span.origin + self.span.stride as isize).min(w as isize) as usize;
+        for (c, dst) in self.row_mut(stage, row, lo, hi).into_iter().enumerate() {
+            dst.copy_from_slice(&image.plane_row(c, y)[lo..hi]);
+        }
+        self.pad(stage, row, w);
+    }
+    /// A row outside the frame repeats its mirror, already in the window.
+    fn reflect(&mut self, stage: &Stage, row: isize, h: usize) {
+        let stride = self.span.stride;
+        let from = self.start(stage, mirror(row, h as isize) as isize);
+        let to = self.start(stage, row);
+        for p in &mut self.pixels {
+            p.copy_within(from..from + stride, to);
         }
     }
-    fn load_row(
-        &mut self,
-        row: isize,
-        source: Option<&Image3F>,
-        band: &[&mut [f32]; 3],
-        first: usize,
-        rows: usize,
-        w: usize,
-        b: usize,
-    ) {
-        let stride = w + 2 * b;
-        let start = slot(row, 2 * b + 1, stride);
-        for c in 0..3 {
-            let src = if let Some(image) = source {
-                image.plane_row(c, mirror(first as isize + row, image.ysize() as isize))
-            } else if row < 0 {
-                let i = (row + b as isize) as usize * w;
-                &self.halo[c][i..i + w]
-            } else if row >= rows as isize {
-                let i = (b + row as usize - rows) * w;
-                &self.halo[c][i..i + w]
-            } else {
-                let i = row as usize * w;
-                &band[c][i..i + w]
-            };
-            let dst = &mut self.pixels[c][start..start + stride];
-            dst[b..b + w].copy_from_slice(src);
-            for x in 0..b {
-                dst[b - 1 - x] = src[mirror(-1 - x as isize, w as isize)];
-                dst[b + w + x] = src[mirror((w + x) as isize, w as isize)];
-            }
-        }
-    }
-    fn difference(
-        &mut self,
-        stage: &Stage,
-        dir: usize,
-        row: isize,
-        w: usize,
-        lf: &LoopFilter,
-        k: Kernels,
-    ) {
+    fn difference(&mut self, stage: &Stage, dir: usize, row: isize, lf: &LoopFilter, k: Kernels) {
         let (dx, dy) = stage.dirs[dir];
-        let stride = w + 2 * stage.border;
+        let stride = self.span.stride;
         let lo = (-dx).max(0) as usize;
         let hi = stride - dx.max(0) as usize;
         let a = slot(row, 2 * stage.border + 1, stride) + lo;
@@ -143,9 +176,9 @@ impl Scratch {
             &mut dst[start..start + n],
         );
     }
-    fn patch(&mut self, stage: &Stage, dir: usize, row: isize, w: usize, k: Kernels) {
+    fn patch(&mut self, stage: &Stage, dir: usize, row: isize, k: Kernels) {
         let (dx, dy) = stage.dirs[dir];
-        let stride = w + 2 * stage.border;
+        let stride = self.span.stride;
         let lo = (-dx).max(0) as usize + 1;
         let hi = stride - dx.max(0) as usize - 1;
         let src = &self.difference[dir];
@@ -164,112 +197,190 @@ impl Scratch {
             &mut self.sad[dir][start + lo..start + hi],
         );
     }
-    fn render(
-        &mut self,
-        source: Option<&Image3F>,
-        band: &mut [&mut [f32]; 3],
-        first: usize,
-        w: usize,
-        stage: &Stage,
-        lf: &LoopFilter,
-        sigma: &[f32],
-        blocks_w: usize,
-        sm: f32,
-        k: Kernels,
-    ) {
-        self.prepare(stage, w);
-        let b = stage.border;
-        let rows = band[0].len() / w;
-        let stride = w + 2 * b;
-        for y in -(b as isize)..=b as isize {
-            self.load_row(y, source, band, first, rows, w, b);
-        }
+    /// SADs for output row `y`: the whole lead-in on a strip's first row,
+    /// one new row of differences after that.
+    fn sads(&mut self, stage: &Stage, y: isize, first: bool, lf: &LoopFilter, k: Kernels) {
         for (dir, &(_, dy)) in stage.dirs.iter().enumerate() {
-            if stage.patch {
-                self.difference(stage, dir, -dy - 1, w, lf, k);
-                self.difference(stage, dir, -dy, w, lf, k);
-                for y in -dy..=0 {
-                    self.difference(stage, dir, y + 1, w, lf, k);
-                    self.patch(stage, dir, y, w, k);
-                }
-            } else {
-                for y in -dy..=0 {
-                    self.difference(stage, dir, y, w, lf, k);
-                }
-            }
-        }
-        for r in 0..rows {
-            let y = r as isize;
-            if r > 0 {
-                self.load_row(y + b as isize, source, band, first, rows, w, b);
-                for dir in 0..stage.dirs.len() {
-                    self.difference(stage, dir, if stage.patch { y + 1 } else { y }, w, lf, k);
-                    if stage.patch {
-                        self.patch(stage, dir, y, w, k);
+            match (first, stage.patch) {
+                (true, true) => {
+                    self.difference(stage, dir, y - dy - 1, lf, k);
+                    self.difference(stage, dir, y - dy, lf, k);
+                    for r in y - dy..=y {
+                        self.difference(stage, dir, r + 1, lf, k);
+                        self.patch(stage, dir, r, k);
                     }
                 }
+                (true, false) => {
+                    for r in y - dy..=y {
+                        self.difference(stage, dir, r, lf, k);
+                    }
+                }
+                (false, true) => {
+                    self.difference(stage, dir, y + 1, lf, k);
+                    self.patch(stage, dir, y, k);
+                }
+                (false, false) => self.difference(stage, dir, y, lf, k),
             }
-            let center = slot(y, 2 * b + 1, stride) + b;
-            let neighbors: [Neighbor<'_>; 12] = std::array::from_fn(|i| {
-                if i >= stage.neighbors.len() {
-                    return Neighbor {
-                        pixels: [&[]; 3],
-                        sad: &[],
-                    };
-                }
-                let (dir, along) = stage.neighbors[i];
-                let (dx, dy) = stage.dirs[dir];
-                let (ny, nx, sy, sx) = if along {
-                    (y + dy, b as isize + dx, y, b)
-                } else {
-                    (y - dy, b as isize - dx, y - dy, (b as isize - dx) as usize)
-                };
-                let at = slot(ny, 2 * b + 1, stride) + nx as usize;
-                let sad = slot(sy, dy as usize + 1, stride) + sx;
-                Neighbor {
-                    pixels: self.pixels.each_ref().map(|p| &p[at..at + w]),
-                    sad: &self.sad[dir][sad..sad + w],
-                }
-            });
-            let global_y = first + r;
-            let row = FilterRow {
-                center: self.pixels.each_ref().map(|p| &p[center..center + w]),
-                neighbors: &neighbors[..stage.neighbors.len()],
-                sigma: &sigma[(global_y / 8) * blocks_w..(global_y / 8 + 1) * blocks_w],
-                border: global_y.is_multiple_of(8) || global_y % 8 == 7,
-                sm,
-                bsm: sm * lf.border_sad_mul,
-            };
-            (k.filter)(row, band.each_mut().map(|p| &mut p[r * w..(r + 1) * w]));
         }
     }
+    fn filter(&self, stage: &Stage, sm: f32, y: isize, chain: &Chain<'_>, out: [&mut [f32]; 3]) {
+        let b = stage.border;
+        let (stride, off, w) = (
+            self.span.stride,
+            self.span.offset() as isize,
+            self.span.width(),
+        );
+        let center = slot(y, 2 * b + 1, stride) + off as usize;
+        let neighbors: [Neighbor<'_>; 12] = std::array::from_fn(|i| {
+            if i >= stage.neighbors.len() {
+                return Neighbor {
+                    pixels: [&[]; 3],
+                    sad: &[],
+                };
+            }
+            let (dir, along) = stage.neighbors[i];
+            let (dx, dy) = stage.dirs[dir];
+            let (ny, nx, sy, sx) = if along {
+                (y + dy, off + dx, y, off)
+            } else {
+                (y - dy, off - dx, y - dy, off - dx)
+            };
+            let at = slot(ny, 2 * b + 1, stride) + nx as usize;
+            let sad = slot(sy, dy as usize + 1, stride) + sx as usize;
+            Neighbor {
+                pixels: self.pixels.each_ref().map(|p| &p[at..at + w]),
+                sad: &self.sad[dir][sad..sad + w],
+            }
+        });
+        let gy = y as usize;
+        let blocks = (gy / 8) * chain.blocks_w;
+        let row = FilterRow {
+            center: self.pixels.each_ref().map(|p| &p[center..center + w]),
+            neighbors: &neighbors[..stage.neighbors.len()],
+            sigma: &chain.sigma[blocks + self.span.lo / 8..blocks + self.span.hi.div_ceil(8)],
+            border: gy.is_multiple_of(8) || gy % 8 == 7,
+            sm,
+            bsm: sm * chain.lf.border_sad_mul,
+        };
+        (chain.kernels.filter)(row, out);
+    }
+}
+
+/// One band's walk through the chain. Stage `s` produces frame rows from
+/// `begin[s]` in order; the last stage's rows are the band.
+struct Band<'a, 'b> {
+    chain: &'a Chain<'b>,
+    rings: &'a mut [Rings; 3],
+    begin: [usize; 3],
+    next: [usize; 3],
+    first: usize,
+    out: [&'a mut [f32]; 3],
+}
+
+impl Band<'_, '_> {
+    /// Produce stage `s` row `y`, pulling the input rows it needs first.
+    fn produce(&mut self, s: usize, y: usize) {
+        let chain = self.chain;
+        let (stage, sm) = chain.stages[s];
+        let (w, h) = (chain.source.xsize(), chain.source.ysize());
+        let b = stage.border as isize;
+        let yi = y as isize;
+        let first = y == self.begin[s];
+        // Rows y - b..=y + b of the stage input must be in the ring.
+        let rows = if first {
+            yi - b..=yi + b
+        } else {
+            yi + b..=yi + b
+        };
+        if s == 0 {
+            for r in rows {
+                self.rings[0].load_source(stage, chain.source, r);
+            }
+        } else {
+            let last_real = (yi + b).min(h as isize - 1) as usize;
+            while self.next[s - 1] <= last_real {
+                let r = self.next[s - 1];
+                self.produce(s - 1, r);
+            }
+            for r in rows {
+                if r < 0 || r >= h as isize {
+                    self.rings[s].reflect(stage, r, h);
+                }
+            }
+        }
+        self.rings[s].sads(stage, yi, first, chain.lf, chain.kernels);
+        let (done, rest) = self.rings.split_at_mut(s + 1);
+        let ring = &done[s];
+        let Span { lo, hi, .. } = ring.span;
+        if s + 1 == chain.stages.len() {
+            let r = (y - self.first) * w;
+            let out = self.out.each_mut().map(|p| &mut p[r + lo..r + hi]);
+            ring.filter(stage, sm, yi, chain, out);
+        } else {
+            let (next_stage, _) = chain.stages[s + 1];
+            let out = rest[0].row_mut(next_stage, yi, lo, hi);
+            ring.filter(stage, sm, yi, chain, out);
+            rest[0].pad(next_stage, yi, w);
+        }
+        self.next[s] = y + 1;
+    }
+}
+
+/// Spans of every stage for the final-stage columns `x0..x1`: each earlier
+/// stage widens by the later stage's border, out to whole blocks.
+fn spans(stages: &[(&Stage, f32)], w: usize, x0: usize, x1: usize) -> [Span; 3] {
+    let n = stages.len();
+    let mut spans = [Span::default(); 3];
+    let (mut lo, mut hi) = (x0, x1);
+    for s in (0..n).rev() {
+        spans[s].lo = lo;
+        spans[s].hi = hi;
+        let b = stages[s].0.border;
+        lo = lo.saturating_sub(b) / 8 * 8;
+        hi = (hi + b).next_multiple_of(8).min(w);
+    }
+    for s in 0..n {
+        let b = stages[s].0.border as isize;
+        let (lo, hi) = (spans[s].lo as isize, spans[s].hi as isize);
+        // The ring holds the previous stage's whole output, plus mirrored
+        // columns where this stage's border leaves the frame.
+        let (start, end) = if s == 0 {
+            (lo - b, hi + b)
+        } else {
+            let prev = spans[s - 1];
+            (
+                (prev.lo as isize).min(lo - b),
+                (prev.hi as isize).max(hi + b),
+            )
+        };
+        spans[s].origin = start;
+        spans[s].stride = (end - start) as usize;
+    }
+    spans
 }
 
 pub(super) fn render(
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
-    source: Option<&Image3F>,
-    image: &mut Image3F,
-    stage: &Stage,
-    lf: &LoopFilter,
-    sigma: &[f32],
-    blocks_w: usize,
-    sm: f32,
-    k: Kernels,
+    chain: &Chain<'_>,
+    output: &mut Image3F,
     work: &mut [Scratch],
 ) {
-    let (w, h) = (image.xsize(), image.ysize());
+    let (w, h) = (output.xsize(), output.ysize());
+    let n = chain.stages.len();
     let band_rows = h.div_ceil(work.len());
-    if source.is_none() {
-        // Snapshot all boundaries before any worker can overwrite its band.
-        for (i, work) in work.iter_mut().enumerate() {
-            let first = i * band_rows;
-            if first < h {
-                work.snapshot(image, first, band_rows.min(h - first), stage.border);
+    // Strip starts are block aligned; a narrow remainder joins the last strip.
+    let strips = ((w + chain.strip / 2) / chain.strip).max(1);
+    let bounds: Vec<usize> = (0..=strips)
+        .map(|i| {
+            if i == strips {
+                w
+            } else {
+                i * w / strips / 8 * 8
             }
-        }
-    }
-    let [a, b, c] = image.all_planes_mut().map(Plane::as_mut_slice);
+        })
+        .collect();
+    let [a, b, c] = output.all_planes_mut().map(Plane::as_mut_slice);
     let mut bands: Vec<_> = a
         .chunks_mut(band_rows * w)
         .zip(b.chunks_mut(band_rows * w))
@@ -278,19 +389,43 @@ pub(super) fn render(
         .enumerate()
         .map(|(i, (((a, b), c), work))| (i * band_rows, [a, b, c], work))
         .collect();
-    pool.steal_for_each_mut(scratch, &mut bands, |_, (first, band, work), _| {
-        work.render(source, band, *first, w, stage, lf, sigma, blocks_w, sm, k);
+    pool.steal_for_each_mut(scratch, &mut bands, |_, (first, out, work), _| {
+        let first = *first;
+        let last = first + out[0].len() / w;
+        // Each earlier stage starts its later stage's border above the band.
+        let mut begin = [0; 3];
+        let mut lo = first;
+        for s in (0..n).rev() {
+            begin[s] = lo;
+            lo = lo.saturating_sub(chain.stages[s].0.border);
+        }
+        let mut band = Band {
+            chain,
+            rings: &mut work.rings,
+            begin,
+            next: begin,
+            first,
+            out: out.each_mut().map(|p| &mut **p),
+        };
+        for strip in bounds.windows(2) {
+            let spans = spans(chain.stages, w, strip[0], strip[1]);
+            for ((rings, &(stage, _)), span) in band.rings.iter_mut().zip(chain.stages).zip(spans) {
+                rings.prepare(stage, span);
+            }
+            band.next = begin;
+            for y in first..last {
+                band.produce(n - 1, y);
+            }
+        }
     });
 }
 
 #[cfg(test)]
 impl Scratch {
     pub(super) fn floats(&self) -> usize {
-        self.pixels
+        self.rings
             .iter()
-            .chain(&self.difference)
-            .chain(&self.sad)
-            .chain(&self.halo)
+            .flat_map(|r| r.pixels.iter().chain(&r.difference).chain(&r.sad))
             .map(Vec::capacity)
             .sum()
     }

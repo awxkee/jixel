@@ -465,7 +465,7 @@ fn best_shift(cost: &[u16; SHIFT_LANES], step: i32) -> i32 {
 
 /// Free both axes: every column, then every row, moves to the coordinate
 /// shift that best matches the current profile. This absorbs what the
-/// parametric geometry cannot (off-centre or slightly non-elliptic fields,
+/// parametric geometry cannot (off-center or slightly non-elliptic fields,
 /// separable products) while the representation stays `P[U(x) + V(y)]`.
 fn free_axes(
     pool: &crate::thread_pool::ThreadPool,
@@ -603,12 +603,12 @@ pub(crate) fn fit_residual(
     }
     // Circles in pixels, then the plane's own aspect and its neighbors.
     let aspect = ((height - 1) as f64 / (width - 1) as f64).powi(2);
-    let mut centres = vec![(0.5, 0.5)];
+    let mut centers = vec![(0.5, 0.5)];
     let moment = moment_geometry(&coarse, width, height);
     if let Some(Geometry::Quadratic { cx, cy, .. }) = moment {
-        centres.push((cx, cy));
+        centers.push((cx, cy));
     }
-    for (cx, cy) in centres {
+    for (cx, cy) in centers {
         geometries.extend(
             [aspect, 1.0, 0.5 * aspect, 2.0 * aspect].map(|ratio| Geometry::Quadratic {
                 cx,
@@ -698,7 +698,7 @@ pub(crate) fn fit_residual(
         *a += RESIDUAL_MARGIN as i32;
     }
     let mut p = free_axes(pool, data, width, &mut u, &mut v)?;
-    // Re-centre so the nested coder sees non-negative axes.
+    // Re-center so the nested coder sees non-negative axes.
     let (umin, vmin) = (*u.iter().min()?, *v.iter().min()?);
     let shift = umin + vmin;
     for a in &mut u {

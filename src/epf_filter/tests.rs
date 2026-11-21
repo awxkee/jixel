@@ -138,14 +138,28 @@ fn image(w: usize, h: usize) -> Image3F {
     }
     image
 }
-fn assert_image_eq(actual: &Image3F, expected: &Image3F, context: &str) {
+/// Fused backends round each `mul_add` once; the oracle and the unfused
+/// backends round the product and the sum separately.
+const FMA_TOLERANCE: f32 = 1e-5;
+fn close(actual: f32, expected: f32, tolerance: f32) -> bool {
+    if tolerance == 0.0 {
+        actual.to_bits() == expected.to_bits()
+    } else {
+        (actual - expected).abs() <= tolerance * expected.abs().max(1.0)
+    }
+}
+/// Scalar shares the oracle's operation order and must match it bit for bit.
+fn tolerance(name: &str) -> f32 {
+    if name == "scalar" { 0.0 } else { FMA_TOLERANCE }
+}
+fn assert_image_close(actual: &Image3F, expected: &Image3F, tolerance: f32, context: &str) {
     for c in 0..3 {
         for y in 0..actual.ysize() {
             for x in 0..actual.xsize() {
-                assert_eq!(
-                    actual.plane_row(c, y)[x].to_bits(),
-                    expected.plane_row(c, y)[x].to_bits(),
-                    "{context}, channel={c}, ({x},{y})"
+                let (a, e) = (actual.plane_row(c, y)[x], expected.plane_row(c, y)[x]);
+                assert!(
+                    close(a, e, tolerance),
+                    "{context}, channel={c}, ({x},{y}): {a} vs {e}"
                 );
             }
         }
@@ -153,7 +167,10 @@ fn assert_image_eq(actual: &Image3F, expected: &Image3F, context: &str) {
 }
 #[test]
 fn streamed_stages_match_scalar_oracle_with_mixed_blocks_all_tails_and_workers() {
-    for (w, h) in (1..=17).map(|w| (w, 19 - w)).chain([(35, 27), (65, 49)]) {
+    for (w, h) in (1..=17)
+        .map(|w| (w, 19 - w))
+        .chain([(35, 27), (65, 49), (130, 11)])
+    {
         let image = image(w, h);
         let blocks = FrameBlocks {
             xsize: w.div_ceil(8),
@@ -180,16 +197,21 @@ fn streamed_stages_match_scalar_oracle_with_mixed_blocks_all_tails_and_workers()
         for threads in [1, 2, 4] {
             let pool = ThreadPool::new(threads);
             let mut scratch = CoderScratch::default();
-            for (name, kernels) in kernels::available() {
+            for ((name, kernels), strip) in kernels::available()
+                .into_iter()
+                .flat_map(|k| [8, 24, 256].map(|strip| (k, strip)))
+            {
                 let mut epf = Epf::new(&pool, &image, &blocks);
                 epf.kernels = kernels;
+                epf.strip = strip;
                 for (lf, sharp, expected) in &candidates {
                     let actual = epf.apply(&pool, &mut scratch, lf, *sharp);
-                    assert_image_eq(
+                    assert_image_close(
                         actual,
                         expected,
+                        tolerance(name),
                         &format!(
-                            "{name}, {w}x{h}, workers={threads}, iters={}, sharpness={sharp}",
+                            "{name}, strip={strip}, {w}x{h}, workers={threads}, iters={}, sharpness={sharp}",
                             lf.epf_iters
                         ),
                     );
@@ -221,7 +243,7 @@ fn row_scratch_depends_on_width_and_workers_and_noop_does_not_allocate_output() 
         );
         epf.apply(&pool, &mut scratch, &lf, 7);
         let floats = epf.work.iter().map(stream::Scratch::floats).sum::<usize>();
-        assert!(floats <= 80 * (w + 6) * pool.num_threads(), "{floats}");
+        assert!(floats <= 90 * (w + 6) * pool.num_threads(), "{floats}");
         if let Some(size) = size {
             assert_eq!(floats, size);
         } else {
@@ -248,10 +270,11 @@ fn gaborish_matches_coordinate_oracle_without_padding() {
                 }
             }
         }
-        assert_image_eq(&gaborish(&image), &expected, "gaborish selected");
+        let selected = gaborish(&image);
+        assert_image_close(&selected, &expected, FMA_TOLERANCE, "gaborish selected");
         let mut in_place = image.clone();
         gaborish_in_place(&mut in_place);
-        assert_image_eq(&in_place, &expected, "gaborish in place");
+        assert_image_close(&in_place, &selected, 0.0, "gaborish in place");
         for (name, k) in kernels::available() {
             let mut actual = Image3F::new(w, 7);
             for c in 0..3 {
@@ -267,7 +290,7 @@ fn gaborish_matches_coordinate_oracle_without_padding() {
                     );
                 }
             }
-            assert_image_eq(&actual, &expected, name);
+            assert_image_close(&actual, &expected, tolerance(name), name);
         }
     }
 }
@@ -317,11 +340,12 @@ fn sigma_and_dc_kernels_match_scalar_bits() {
             let mut b = vec![0.; n * 64];
             (scalar.project)(&matrix, &delta, cx, &mut a);
             (k.project)(&matrix, &delta, cx, &mut b);
-            assert_eq!(
-                a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                "{name}, projection n={n}"
-            );
+            for (i, (&a, &b)) in a.iter().zip(&b).enumerate() {
+                assert!(
+                    close(b, a, tolerance(name)),
+                    "{name}, projection n={n}, {i}: {b} vs {a}"
+                );
+            }
         }
     }
 }

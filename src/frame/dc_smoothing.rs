@@ -37,7 +37,7 @@ use crate::dct::fmla;
 use crate::haar::{CHROMA_DC_SQUEEZE_STEP, haar_smooth};
 use crate::image::Image3F;
 use crate::thread_pool::ThreadPool;
-use crate::util::{EncodeError, try_vec};
+use crate::util::{EncodeError, FastRound, try_vec};
 
 impl BdcCompensation {
     pub(super) fn new(distp: &DistanceParams) -> Self {
@@ -432,7 +432,7 @@ pub(super) fn flatten_chroma_dc(
                         yq,
                     );
                 }
-                dc.quant_dc.plane_row_mut(c, ly)[lx] = target.round() as i16;
+                dc.quant_dc.plane_row_mut(c, ly)[lx] = target.fast_round() as i16;
             }
         }
     }
@@ -568,7 +568,7 @@ pub(super) fn choose_chroma_dc_coding(
         let cfl_fine = cfl_factor(fine);
         // Level on the fine lattice of a value given in current-step units.
         let fine_level = |value: f32, y_level: f32| -> i32 {
-            ((value + y_level * cfl_coarse) / ratio - y_level * cfl_fine).round() as i32
+            ((value + y_level * cfl_coarse) / ratio - y_level * cfl_fine).fast_round() as i32
         };
         // The candidates smooth, quantize and price on the pool, each in its
         // own buffers, and are judged in step order afterwards: the price is
@@ -811,7 +811,7 @@ mod tests {
                             } else {
                                 sb.row_mut(ly)[lx] = source;
                             }
-                            dc.quant_dc.plane_row_mut(c, ly)[lx] = target.round() as i16;
+                            dc.quant_dc.plane_row_mut(c, ly)[lx] = target.fast_round() as i16;
                         }
                     }
                 }

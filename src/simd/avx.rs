@@ -212,6 +212,20 @@ pub(crate) mod f32 {
         _mm256_storeu_ps as store, _mm256_sub_ps as sub,
     };
 
+    /// `a * b + c` with one rounding. Callers must have checked `fma`.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(crate) fn mul_add(a: __m256, b: __m256, c: __m256) -> __m256 {
+        _mm256_fmadd_ps(a, b, c)
+    }
+
+    /// `|a - b|`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(crate) fn abs_diff(a: __m256, b: __m256) -> __m256 {
+        abs(_mm256_sub_ps(a, b))
+    }
+
     #[inline]
     #[target_feature(enable = "avx2")]
     pub(crate) fn abs(v: __m256) -> __m256 {
