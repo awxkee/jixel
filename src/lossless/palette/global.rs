@@ -93,6 +93,126 @@ impl GlobalPalette {
                 num_c: self.num_c as u32,
                 nb_colors: nb_colors as u32,
             },
+            hshift: 0,
+            vshift: 0,
+            group_channels: Vec::new(),
+        }
+    }
+}
+
+/// A two-color global palette with its index image packed two pixels to a
+/// sample. One Squeeze of a 0 / 1 index channel leaves an average in 0..=1
+/// and a residual in -1..=1 whose smoothing term is always zero, so each
+/// pixel pair is one of four (average, residual) tuples, and a Palette over
+/// those two channels codes one index per pair. The half-size index image
+/// gives the tree twice the neighborhood and LZ77 a wider alphabet.
+pub(in crate::lossless) struct PackedPalette<'a> {
+    base: &'a GlobalPalette,
+    /// The second palette: its averages, then its residuals.
+    pub(super) tuples: Vec<i32>,
+    pub(super) indices: Vec<u16>,
+    pub(super) packed_colors: usize,
+    /// Pairs lie along rows; otherwise along columns.
+    pub(super) horizontal: bool,
+}
+
+impl<'a> PackedPalette<'a> {
+    /// `None` unless the palette has two colors and the samples pair up
+    /// along a row or, failing that, along a column: the average channel of
+    /// an odd size is one sample longer than the residual channel, and a
+    /// Palette needs equal channels.
+    pub(in crate::lossless) fn new(
+        base: &'a GlobalPalette,
+        xsize: usize,
+        ysize: usize,
+    ) -> Option<Self> {
+        if base.nb_colors != 2 || xsize == 0 || ysize == 0 {
+            return None;
+        }
+        let horizontal = xsize.is_multiple_of(2);
+        if !horizontal && !ysize.is_multiple_of(2) {
+            return None;
+        }
+        // Pair codes `2 * first + second`, in index order.
+        let codes: Vec<u8> = if horizontal {
+            base.indices
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| (pair[0] * 2 + pair[1]) as u8)
+                .collect()
+        } else {
+            base.indices
+                .chunks_exact(2 * xsize)
+                .flat_map(|rows| {
+                    let (top, bottom) = rows.split_at(xsize);
+                    top.iter().zip(bottom).map(|(&t, &b)| (t * 2 + b) as u8)
+                })
+                .collect()
+        };
+        let mut used = [false; 4];
+        for &code in &codes {
+            used[usize::from(code)] = true;
+        }
+        let mut index_of = [0u16; 4];
+        let (mut averages, mut residuals) = (Vec::new(), Vec::new());
+        for code in 0..4usize {
+            if !used[code] {
+                continue;
+            }
+            index_of[code] = averages.len() as u16;
+            let (first, second) = ((code >> 1) as i32, (code & 1) as i32);
+            averages.push((first + second + i32::from(first > second)) >> 1);
+            residuals.push(first - second);
+        }
+        let packed_colors = averages.len();
+        averages.extend(residuals);
+        Some(Self {
+            base,
+            tuples: averages,
+            indices: codes
+                .iter()
+                .map(|&code| index_of[usize::from(code)])
+                .collect(),
+            packed_colors,
+            horizontal,
+        })
+    }
+
+    pub(in crate::lossless) fn source(&self, xsize: usize, ysize: usize) -> MaSource<'_> {
+        let (hshift, vshift) = (u32::from(self.horizontal), u32::from(!self.horizontal));
+        MaSource {
+            channels: vec![
+                MaChannel {
+                    w: self.packed_colors,
+                    h: 2,
+                    meta: true,
+                    pixels: MaPixels::I32(&self.tuples),
+                    constant: None,
+                },
+                MaChannel {
+                    w: self.base.nb_colors,
+                    h: self.base.num_c,
+                    meta: true,
+                    pixels: MaPixels::I32(&self.base.palette),
+                    constant: None,
+                },
+                MaChannel {
+                    w: xsize >> hshift,
+                    h: ysize >> vshift,
+                    meta: false,
+                    pixels: MaPixels::U16(&self.indices),
+                    constant: None,
+                },
+            ],
+            transform: MaTransform::PackedPalette {
+                num_c: self.base.num_c as u32,
+                nb_colors: self.base.nb_colors as u32,
+                packed_colors: self.packed_colors as u32,
+                horizontal: self.horizontal,
+            },
+            hshift,
+            vshift,
             group_channels: Vec::new(),
         }
     }

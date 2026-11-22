@@ -247,9 +247,12 @@ pub(super) fn write_learned_tree_frame(
         }
         group_constant.map_or(ConstantTail::NONE, |(p, _)| {
             let ch = &source.channels[p.channel];
-            let x0 = (group_index % xsize_groups) * gdim;
-            let y0 = (group_index / xsize_groups) * gdim;
-            cand.constant_tail(gdim.min(ch.w - x0), gdim.min(ch.h - y0))
+            let x0 = (group_index % xsize_groups) * source.group_columns(gdim);
+            let y0 = (group_index / xsize_groups) * source.group_rows(gdim);
+            cand.constant_tail(
+                source.group_columns(gdim).min(ch.w - x0),
+                source.group_rows(gdim).min(ch.h - y0),
+            )
         })
     };
     let group_tokens: Vec<RawTokens> = pool.steal_map_with_threads(
@@ -257,8 +260,8 @@ pub(super) fn write_learned_tree_frame(
         num_ac_groups,
         group_lz_threads(speed, pool),
         |group_index, _scratch| {
-            let x0 = (group_index % xsize_groups) * gdim;
-            let y0 = (group_index / xsize_groups) * gdim;
+            let x0 = (group_index % xsize_groups) * source.group_columns(gdim);
+            let y0 = (group_index / xsize_groups) * source.group_rows(gdim);
             if let Some(over) = source.group_override(group_index) {
                 let num_values = over.channels.iter().map(|ch| ch.w * ch.h).sum();
                 let mut toks = RawTokens::with_capacity(num_values);
@@ -279,14 +282,15 @@ pub(super) fn write_learned_tree_frame(
                 .iter()
                 .map(|p| {
                     let ch = &source.channels[p.channel];
-                    gdim.min(ch.w - x0) * gdim.min(ch.h - y0)
+                    source.group_columns(gdim).min(ch.w - x0)
+                        * source.group_rows(gdim).min(ch.h - y0)
                 })
                 .sum();
             let mut toks = RawTokens::with_capacity(num_values);
             for p in &group_placement {
                 let ch = &source.channels[p.channel];
-                let gw = gdim.min(ch.w - x0);
-                let gh = gdim.min(ch.h - y0);
+                let gw = source.group_columns(gdim).min(ch.w - x0);
+                let gh = source.group_rows(gdim).min(ch.h - y0);
                 tokenize(
                     p,
                     ac_stream_id(num_dc_groups, group_index),
