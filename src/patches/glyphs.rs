@@ -145,6 +145,10 @@ struct GlyphShape {
     label: u32,
     bg: [i32; 3],
     hash: u64,
+    /// The shape sits on smooth ground (a gradient) rather than on a flat
+    /// tile color: its occurrences differ with the ground under them, and
+    /// templates match them by coverage instead of by mask and color.
+    soft: bool,
 }
 
 /// The frame on the modular XYB lattice: planes Y, X, B (the rounded B
@@ -229,6 +233,7 @@ impl Lattice {
             label: owner,
             bg,
             hash,
+            soft: false,
         })
     }
 }
@@ -251,10 +256,36 @@ pub(crate) fn plan_lossy_glyph_patches(
     }
     let lattice = Lattice::new(xyb, params.coarse);
     let keys = ink::color_keys(ctx, &lattice);
-    let ink = ink::ink_mask(&keys, width, height)?;
-    let mut components = components::label_components(&lattice, &ink, &keys, params.min_contrast);
+    let mut ink = ink::ink_mask(&keys, width, height);
+    // Smooth ground is taken where it is what the frame's ink mostly was:
+    // a ramp under labels, a wallpaper under text. A page with photos and
+    // shaded headers gives up a third of its ink the same way, and the
+    // glyph plan it had on flat colors alone is the better one.
+    let flat_ink = ink::ink_share(&ink);
+    // Ground that cannot reach its share of the frame is not looked for.
+    let mut ground = if flat_ink >= ink::GROUND_MIN_FRAME_SHARE {
+        ink::absorb_smooth_ground(&lattice, &mut ink)
+    } else {
+        None
+    };
+    if let Some(taken) = &ground {
+        let share = flat_ink - ink::ink_share(&ink);
+        if share < ink::GROUND_MIN_FRAME_SHARE || share < ink::GROUND_MIN_INK_SHARE * flat_ink {
+            taken.give_back(&mut ink);
+            ground = None;
+        }
+    }
+    if ink::ink_share(&ink) > ink::GLYPH_MAX_INK_SHARE {
+        return None;
+    }
+    let mut components =
+        components::label_components(&lattice, &ink, &keys, ground.as_ref(), params.min_contrast);
     let grid = grid::detect_glyph_grid(&ink, width, height, &components.whole_shapes());
-    drop((ink, keys));
+    if ground.is_some() {
+        ctx.smooth_ground
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    drop((ink, keys, ground));
     let splits = match &grid {
         Some(grid) => grid::split_touching_glyphs(grid, &lattice, &mut components, params),
         None => Vec::new(),

@@ -801,6 +801,7 @@ impl BlockCtx {
             ans_histograms: &empty_histograms,
             ans_symbols: &empty_syms,
             ans_reverse_maps: &empty_reverse_maps,
+            lz_min_symbol: 0,
         };
         crate::entropy::write_context_map(&cm_entropy, &mut scratch.huffman_pool, w);
     }

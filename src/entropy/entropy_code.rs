@@ -48,6 +48,10 @@ pub(crate) struct EntropyCode<'a> {
     pub(crate) ans_histograms: &'a [AnsHistogram],
     pub(crate) ans_symbols: &'a [Vec<AnsEncSymbolInfo>],
     pub(crate) ans_reverse_maps: &'a [u16],
+    /// First LZ77 length symbol the code was built for, when its builder
+    /// raised it above the stream's default; 0 otherwise. Literal symbols
+    /// stay below it, so the writers must signal and use this value.
+    pub(crate) lz_min_symbol: u32,
 }
 
 /// Owned entropy code: heap-allocated context_map and prefix_codes,
@@ -84,6 +88,7 @@ impl OwnedEntropyCode {
             ans_histograms: &self.ans_histograms,
             ans_symbols: &self.ans_symbols,
             ans_reverse_maps: &self.ans_reverse_maps,
+            lz_min_symbol: 0,
         }
     }
 }

@@ -67,6 +67,7 @@ pub(in crate::lossless) fn write_lz_section_tail<T: LzTokenSource>(
     min_symbol: u32,
     w: &mut BitWriter,
 ) {
+    let min_symbol = code.lz_min_symbol.max(min_symbol);
     if code.use_prefix_code {
         for t in lz_tokens(tokens) {
             write_lz_token(t, distance_context, code, min_symbol, w);
@@ -189,6 +190,7 @@ pub(in crate::lossless) fn write_lz_token(
     min_symbol: u32,
     w: &mut BitWriter,
 ) {
+    let min_symbol = code.lz_min_symbol.max(min_symbol);
     if t.is_lz77() {
         let (len_tok, len_nbits, len_bits) = lz77_length_encode(t.value);
         let sym = min_symbol + len_tok;
@@ -286,7 +288,7 @@ pub(crate) fn write_tree_lz77(
     crate::entropy::write_raced_token_stream(tree_tokens, NUM_TREE_CONTEXTS, huffman_pool, w);
 
     // Pixel entropy code: LZ77 ENABLED for the main bitstream.
-    write_lz77_header(min_symbol, w);
+    write_lz77_header(pixel_code.lz_min_symbol.max(min_symbol), w);
     // The decoder appends an extra context (distance) when LZ77 is on, so the
     // context map we write must already include it as its last entry.
     write_entropy_code(pixel_code, huffman_pool, w);

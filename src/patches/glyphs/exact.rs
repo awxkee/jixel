@@ -27,7 +27,10 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use super::templates::GlyphTemplates;
-use super::{GLYPH_ATLAS_MAX_WIDTH, GlyphParams, GlyphShape, Lattice, LossyGlyphPatches};
+use super::{
+    GLYPH_ATLAS_MAX_WIDTH, GLYPH_MIN_REPEAT_PIXELS, GlyphParams, GlyphShape, Lattice,
+    LossyGlyphPatches,
+};
 use crate::image::Image3F;
 use crate::patches::color_key::round_to_multiple;
 use crate::patches::{MODULAR_PATCH_REF_ID, PatchReference};
@@ -93,10 +96,18 @@ fn group_identical_shapes(
             None => groups.push(vec![i]),
         }
     }
+    // An unrepeated shape on smooth ground is a piece of a picture more
+    // often than a glyph (the cells of a matrix plot, what a photo keeps
+    // between its smooth parts): there only repeats are placed, whatever
+    // the page allows elsewhere.
+    let stands = |g: &Group| {
+        let s = &shapes[g[0]];
+        !s.soft || (g.len() >= 2 && (g.len() - 1) * s.w * s.h >= GLYPH_MIN_REPEAT_PIXELS)
+    };
     buckets
         .into_values()
         .flatten()
-        .filter(|g| g.len() >= min_occurrences)
+        .filter(|g| g.len() >= min_occurrences && stands(g))
         .collect()
 }
 

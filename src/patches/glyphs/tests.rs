@@ -346,3 +346,122 @@ fn lossy_glyph_patches_reconstruct_and_flatten_the_base() {
     assert_eq!(all.references.len(), 3);
     assert_glyph_plan_reconstructs(&img, &all);
 }
+
+/// A ramp of 12-pixel steps (two luma lattice units each) with one bright
+/// antialiased mark per step; every other mark has a dark rule against its
+/// left edge and is one pixel wider for it. Returns the page and the box
+/// corners.
+fn ramp_glyph_page() -> (Image3F, Vec<(usize, usize)>) {
+    let (w, h) = (240usize, 96usize);
+    let ground = |x: usize| {
+        let step = (x / 12) as f32;
+        [
+            2.0f32 / 4096.0,
+            (120.0 + 2.0 * step) / 512.0,
+            (60.0 + step) / 256.0,
+        ]
+    };
+    let ink = [0.0f32, 420.0 / 512.0, 210.0 / 256.0];
+    let mut img = Image3F::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            for (c, value) in ground(x).into_iter().enumerate() {
+                img.plane_row_mut(c, y)[x] = value;
+            }
+        }
+    }
+    let mut marks = Vec::new();
+    for k in 0..18 {
+        let (x0, y0) = (12 * k + 15, 10 + (k % 3) * 27);
+        marks.push((x0 - usize::from(k % 2 == 0), y0));
+        for dy in 0..7 {
+            for dx in 0..5 {
+                let a = 0.25 + ((dx * 3 + dy * 5) % 4) as f32 * 0.25;
+                let bg = ground(x0 + dx);
+                for c in 0..3 {
+                    img.plane_row_mut(c, y0 + dy)[x0 + dx] = bg[c] * (1.0 - a) + ink[c] * a;
+                }
+            }
+        }
+        if k % 2 == 0 {
+            // A rule in another color against the mark's left edge.
+            for dy in 0..7 {
+                img.plane_row_mut(1, y0 + dy)[x0 - 1] = 20.0 / 512.0;
+            }
+        }
+    }
+    (img, marks)
+}
+
+#[test]
+fn smooth_ground_goes_back_to_the_background() {
+    let (img, marks) = ramp_glyph_page();
+    let lattice = Lattice::new(&img, 1);
+    let keys = ink::color_keys(&glyph_ctx(), &lattice);
+    let (w, h) = (img.xsize(), img.ysize());
+    let mut mask = ink::ink_mask(&keys, w, h);
+    // The tile vote keeps a few steps of the ramp and calls the rest ink.
+    let flat_ink = mask.iter().filter(|&&p| p).count();
+    assert!(flat_ink > w * h / 4);
+    let flat_mask = mask.clone();
+    let ground = ink::absorb_smooth_ground(&lattice, &mut mask).expect("a ramp");
+    // A frame that does not use its ground gets the flat mask back.
+    let mut restored = mask.clone();
+    ground.give_back(&mut restored);
+    assert_eq!(restored, flat_mask);
+    // What is left is the marks and their rules, nothing of the ramp.
+    let expected = marks.len() * 35 + marks.len().div_ceil(2) * 7;
+    assert_eq!(mask.iter().filter(|&&p| p).count(), expected);
+    for &(x0, y0) in &marks {
+        assert!(mask[y0 * w + x0] && !ground.holds(x0, y0));
+        assert!(!mask[(y0 - 1) * w + x0]);
+    }
+    let held = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .filter(|&(x, y)| ground.holds(x, y))
+        .count();
+    assert_eq!(held, flat_ink - expected);
+    // A step the tile vote kept flat continues the ramp around it.
+    let (x, y) = (0..w)
+        .map(|x| (x, 50))
+        .find(|&(x, y)| !mask[y * w + x] && !ground.holds(x, y))
+        .expect("a flat step");
+    let color = std::array::from_fn(|c| lattice.planes[c][y * w + x]);
+    assert!(ground.continues(x, y, color));
+    assert!(!ground.continues(x, y, [color[0] + 200, color[1], color[2]]));
+}
+
+#[test]
+fn glyphs_on_a_ramp_share_entries_and_reconstruct() {
+    let (img, marks) = ramp_glyph_page();
+    // Additive entries need identical occurrences, and on a ramp every
+    // step shifts the mark: nothing repeats.
+    assert!(find_lossy_glyph_patches(&glyph_ctx(), &img, &glyph_params(2)).is_none());
+
+    // One blend-above template serves every step of the ramp: one for the
+    // plain mark and one for the mark with its rule.
+    let params = GlyphParams {
+        templates: true,
+        ..glyph_params(2)
+    };
+    let plan = find_lossy_glyph_patches(&glyph_ctx(), &img, &params).expect("plan");
+    assert_eq!(plan.references.len(), 2);
+    assert!(plan.references.iter().all(|r| r.mul && !r.add));
+    let mut widths: Vec<usize> = plan.references.iter().map(|r| r.width).collect();
+    widths.shared_sort();
+    assert_eq!(widths, [5, 6]);
+    let mut positions: Vec<(usize, usize)> = plan
+        .references
+        .iter()
+        .flat_map(|r| r.positions.iter().copied())
+        .collect();
+    positions.shared_sort();
+    let mut expected = marks.clone();
+    expected.shared_sort();
+    assert_eq!(positions, expected);
+    // Under a quarter-covered pixel the base carries the difference and is
+    // the ramp again.
+    let (x0, y0) = marks[1];
+    let ground = (120.0 + 2.0 * ((x0 / 12) as f32)) / 512.0;
+    assert!((plan.base.plane_row(1, y0)[x0] - ground).abs() <= 4.0 / 512.0);
+}
