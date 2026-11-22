@@ -68,8 +68,9 @@ pub(crate) fn palette_row_scalar(above: &[i32], row: &[i32], out: &mut [[i32; 4]
 mod tests;
 
 pub(super) use global::{
-    GlobalPalette, OrderRace, PALETTE_COARSE_MARGIN, PALETTE_FINAL_MARGIN, PackedPalette,
-    SCREEN_MIN_SHARE, bilevel_screen_share, build_global_palettes, screen_share,
+    GlobalPalette, LARGE_PALETTE_COARSE_MARGIN, OrderRace, PALETTE_COARSE_MARGIN,
+    PALETTE_FINAL_MARGIN, PackedPalette, SCREEN_MIN_SHARE, bilevel_screen_share,
+    build_global_palettes, screen_share,
 };
 pub(super) use local::{
     LOCAL_PALETTE_MAX_COLORS, LocalPaletteGroup, build_local_palette_group_limited,

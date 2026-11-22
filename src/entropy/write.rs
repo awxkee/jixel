@@ -28,9 +28,10 @@
  */
 
 use super::ans::{
-    ANS_TAB_SIZE, AnsEncSymbolInfo, AnsHistogram, AnsTokenCodeRef, ans_tokens_bits_under,
-    build_symbol_info, choose_use_prefix_code, encode_histogram, fast_ans_population_cost,
-    normalize_counts_into, optimize_ans_histogram, refine_ans_histogram_precision,
+    ANS_TAB_SIZE, AnsEncSymbolInfo, AnsHistogram, AnsTokenCodeRef, WIDE_TABLE_ENTRIES,
+    ans_tokens_bits_under, build_symbol_info, build_symbol_info_wide, choose_use_prefix_code,
+    encode_histogram, fast_ans_population_cost, normalize_counts_into, optimize_ans_histogram,
+    refine_ans_histogram_precision,
 };
 use super::cluster::cluster_histograms;
 use super::entropy_code::{EntropyCode, OwnedEntropyCode};
@@ -49,6 +50,19 @@ pub(crate) const ANS_ENABLED: bool = true;
 
 #[allow(unused)]
 pub(crate) const ANS_LOG_ALPHA_SIZE: u32 = 7;
+
+/// `log_alpha_size` of a wide lossless code (`WIDE_TABLE_ENTRIES` symbols).
+pub(crate) const WIDE_LOG_ALPHA_SIZE: u32 = 8;
+
+/// Bits of a configuration's split exponent, `ceil_log2(log_alpha_size + 1)`:
+/// 3 for the usual ANS code, 4 for a wide one.
+fn uint_config_split_width(log_alpha: u32) -> usize {
+    if log_alpha == WIDE_LOG_ALPHA_SIZE {
+        4
+    } else {
+        3
+    }
+}
 
 /// ANS fields accumulated while building an entropy code. The prefix-only
 /// default owns no table storage.
@@ -424,28 +438,32 @@ impl HybridUintSamples {
         .collect()
     }
 
-    /// Search the remaining legal integer configurations on a bounded probe.
-    /// Four proxy finalists and the incumbent receive the full table search;
-    /// the caller then verifies the complete bundle on the original tokens.
     /// [`select_free_config`] for every cluster, with the clusters' summed
-    /// cost. `maxima` are the clusters' largest values over all their tokens,
-    /// not only the sampled ones.
+    /// cost; `wide` searches the 256-symbol alphabet of a wide code. `maxima`
+    /// are the clusters' largest values over all their tokens, not only the
+    /// sampled ones.
     pub(crate) fn select_free(
         &self,
         incumbents: &[HybridUintConfig],
         maxima: &[u32],
         limit: u32,
+        wide: bool,
         pool: Option<&ThreadPool>,
         scratch: &mut CoderScratch,
     ) -> (Vec<HybridUintConfig>, f64) {
         let one = |i: usize| {
-            select_free_config(
-                &self.values[i],
-                self.strides[i],
-                incumbents[i],
-                maxima[i],
-                limit,
-            )
+            let (values, stride) = (&self.values[i], self.strides[i]);
+            if wide {
+                select_free_config_of::<WIDE_TABLE_ENTRIES>(
+                    values,
+                    stride,
+                    incumbents[i],
+                    maxima[i],
+                    limit,
+                )
+            } else {
+                select_free_config(values, stride, incumbents[i], maxima[i], limit)
+            }
         };
         let picked: Vec<(HybridUintConfig, f64)> = match pool {
             Some(pool) if pool.num_threads() > 1 && self.values.len() >= 4 => {
@@ -457,6 +475,9 @@ impl HybridUintSamples {
         (picked.into_iter().map(|(config, _)| config).collect(), bits)
     }
 
+    /// Search the remaining legal integer configurations on a bounded probe.
+    /// Four proxy finalists and the incumbent receive the full table search;
+    /// the caller then verifies the complete bundle on the original tokens.
     fn select_expanded_with_pool(
         &self,
         incumbents: &[HybridUintConfig],
@@ -585,10 +606,25 @@ fn select_free_config(
     max_value: u32,
     limit: u32,
 ) -> (HybridUintConfig, f64) {
+    select_free_config_of::<ALPHABET_SIZE>(values, stride, incumbent, max_value, limit)
+}
+
+/// [`select_free_config`] over an `N`-symbol alphabet: `ALPHABET_SIZE`, or
+/// `WIDE_TABLE_ENTRIES` for a wide code, whose split exponent reaches 8 and
+/// takes one more header bit.
+fn select_free_config_of<const N: usize>(
+    values: &[u32],
+    stride: usize,
+    incumbent: HybridUintConfig,
+    max_value: u32,
+    limit: u32,
+) -> (HybridUintConfig, f64) {
     if values.is_empty() {
         return (incumbent, 0.0);
     }
-    let limit = limit.min(ALPHABET_SIZE as u32);
+    let log_alpha = N.trailing_zeros();
+    let split_width = uint_config_split_width(log_alpha);
+    let limit = limit.min(N as u32);
     // Distinct values with their counts: every candidate then costs one pass
     // over these, not over the samples.
     let mut sorted = values.to_vec();
@@ -601,7 +637,7 @@ fn select_free_config(
         }
     }
     let histogram_of = |config: HybridUintConfig| {
-        let mut counts = [0u32; ALPHABET_SIZE];
+        let mut counts = [0u32; N];
         let mut extra = 0u64;
         for &(value, count) in &distinct {
             let (symbol, bits, _) = uint_encode_with_config(value, config);
@@ -611,7 +647,7 @@ fn select_free_config(
         (counts, extra)
     };
     let mut candidates: Vec<(f64, HybridUintConfig)> = Vec::new();
-    for split in 0..=ANS_LOG_ALPHA_SIZE as u8 {
+    for split in 0..=log_alpha as u8 {
         for msb in 0..=split {
             for lsb in 0..=split - msb {
                 let config = HybridUintConfig {
@@ -642,7 +678,7 @@ fn select_free_config(
         super::ans::ans_data_bits(&counts, &table.freqs)
             + super::ans::ans_table_bits(&table)
             + extra as f64 * stride as f64
-            + hybrid_uint_config_bits(config, 3) as f64
+            + hybrid_uint_config_bits(config, split_width) as f64
     };
     let mut best = incumbent;
     let mut best_cost = cost(incumbent);
@@ -1586,6 +1622,27 @@ pub(crate) fn build_ans_code_parts(
     (storage.histograms, storage.symbols, storage.reverse_maps)
 }
 
+/// `build_ans_code_parts` for a wide code: tables of `WIDE_TABLE_ENTRIES`
+/// symbols with the precision search, coded under `WIDE_LOG_ALPHA_SIZE`.
+pub(crate) fn build_wide_ans_code_parts(
+    counts: &[[u32; WIDE_TABLE_ENTRIES]],
+) -> (Vec<AnsHistogram>, Vec<Vec<AnsEncSymbolInfo>>, Vec<u16>) {
+    let histograms: Vec<AnsHistogram> = counts
+        .iter()
+        .map(|counts| {
+            let base = optimize_ans_histogram(counts);
+            refine_ans_histogram_precision(counts, &base).unwrap_or(base)
+        })
+        .collect();
+    let mut reverse_maps = vec![0u16; counts.len() * ANS_TAB_SIZE as usize];
+    let symbols = histograms
+        .iter()
+        .zip(reverse_maps.chunks_mut(ANS_TAB_SIZE as usize))
+        .map(|(histogram, reverse)| build_symbol_info_wide(&histogram.freqs, reverse))
+        .collect();
+    (histograms, symbols, reverse_maps)
+}
+
 fn build_ans_storage(histograms: &[Histogram], pool: Option<&ThreadPool>) -> AnsCodeStorage {
     let selected_histograms = histograms
         .iter()
@@ -1617,6 +1674,7 @@ impl AnsBundleRef<'_> {
             ans_symbols: self.symbols,
             ans_reverse_maps: self.reverse_maps,
             lz_min_symbol: 0,
+            ans_log_alpha: ANS_LOG_ALPHA_SIZE,
         }
     }
 
@@ -3578,7 +3636,10 @@ pub(crate) fn write_entropy_code(
 
 fn write_ans_params(code: &EntropyCode, w: &mut BitWriter) {
     w.write(1, 0); // use_prefix_code = 0
-    w.write(2, (ANS_LOG_ALPHA_SIZE - 5) as u64); // log_alpha_size = 7
+    let log_alpha = code.ans_log_alpha;
+    debug_assert!(log_alpha == ANS_LOG_ALPHA_SIZE || log_alpha == WIDE_LOG_ALPHA_SIZE);
+    w.write(2, (log_alpha - 5) as u64); // log_alpha_size: 7, or 8 for a wide code
+    let split_width = uint_config_split_width(log_alpha);
     // Per-histogram hybrid-uint config. This used to hardcode (4, 2, 0), which
     // silently contradicted `hybrid_uint_configs` the moment anything but the
     // default was selected — the header would advertise one configuration while
@@ -3589,11 +3650,11 @@ fn write_ans_params(code: &EntropyCode, w: &mut BitWriter) {
         .iter()
         .take(code.ans_histograms.len())
     {
-        write_uint_config(config, 3, w);
+        write_uint_config(config, split_width, w);
     }
     // The normalized distributions, in clustered-histogram order.
     for histogram in code.ans_histograms.iter() {
-        encode_histogram(histogram, ANS_LOG_ALPHA_SIZE, w);
+        encode_histogram(histogram, log_alpha, w);
     }
 }
 

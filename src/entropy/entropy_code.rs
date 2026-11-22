@@ -52,6 +52,9 @@ pub(crate) struct EntropyCode<'a> {
     /// raised it above the stream's default; 0 otherwise. Literal symbols
     /// stay below it, so the writers must signal and use this value.
     pub(crate) lz_min_symbol: u32,
+    /// `log_alpha_size` of an ANS code: 7, or 8 for a wide lossless code
+    /// (its tables then hold `WIDE_TABLE_ENTRIES` symbols).
+    pub(crate) ans_log_alpha: u32,
 }
 
 /// Owned entropy code: heap-allocated context_map and prefix_codes,
@@ -89,6 +92,7 @@ impl OwnedEntropyCode {
             ans_symbols: &self.ans_symbols,
             ans_reverse_maps: &self.ans_reverse_maps,
             lz_min_symbol: 0,
+            ans_log_alpha: super::write::ANS_LOG_ALPHA_SIZE,
         }
     }
 }

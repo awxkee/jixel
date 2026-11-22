@@ -57,8 +57,8 @@ use crate::lossless::ma_source::{
     rgb_ma_source, source_values_of,
 };
 use crate::lossless::palette::{
-    self, GlobalPalette, OrderRace, PALETTE_COARSE_MARGIN, PALETTE_FINAL_MARGIN, PackedPalette,
-    build_global_palettes,
+    self, GlobalPalette, LARGE_PALETTE_COARSE_MARGIN, OrderRace, PALETTE_COARSE_MARGIN,
+    PALETTE_FINAL_MARGIN, PackedPalette, build_global_palettes,
 };
 use crate::patches::ModularFrameKind;
 use crate::thread_pool::ThreadPool;
@@ -107,6 +107,7 @@ pub(super) fn learn_tree_candidates(
     let effort = frame.effort;
 
     // 5a: the global palette, when the frame has one.
+    let vector = matches!(frame.tree_search, TreeSearch::Vector);
     let palettes = if effort.tree_global_palette {
         build_global_palettes(
             frame.ycocg,
@@ -119,11 +120,19 @@ pub(super) fn learn_tree_candidates(
             // loses the layered arm its race against the VarDCT stack (31
             // illustrations and comics, 7 distances: two gain 14.5 % and
             // 25.3 % at equal SSIMULACRA2, none loses over 0.6 %).
-            (effort.palette_order_race || matches!(frame.tree_search, TreeSearch::Vector))
-                .then_some(OrderRace {
-                    min_symbol: frame.min_symbol,
-                    use_wp: frame.use_wp,
-                }),
+            (effort.palette_order_race || effort.palette_large || vector).then_some(OrderRace {
+                min_symbol: frame.min_symbol,
+                use_wp: frame.use_wp,
+                // A vector-layer frame keeps its palette in place of
+                // the RGB tree.
+                large: effort.palette_large && !vector,
+                small: effort.palette_order_race || vector,
+                // A vector-layer frame is flat by construction, which
+                // is what the ramp order is for (a manga page at
+                // distance 0.5 and 1: 15 % and 9 % smaller; 116 other
+                // lossy encodes unchanged at equal time).
+                ramp: vector,
+            }),
             pool,
             scratch,
         )
@@ -154,6 +163,7 @@ pub(super) fn learn_tree_candidates(
     if tournament.decisive {
         color.release_planes();
     }
+    let large_palette = palette.as_ref().is_some_and(GlobalPalette::is_large);
     let bits_before_palette = best.bits();
     if sources.palette
         && let Some(palette) = &palette
@@ -173,7 +183,9 @@ pub(super) fn learn_tree_candidates(
     // A global palette that already won leaves nothing for per-group ones,
     // and building them would scan the image for nothing.
     let global_palette_won = best.bits() != bits_before_palette;
-    if effort.tree_group_palette && frame.num_color == 3 && !global_palette_won {
+    // A large palette is one more candidate: it does not stand in for the
+    // per-group ones.
+    if effort.tree_group_palette && frame.num_color == 3 && (large_palette || !global_palette_won) {
         tournament.learn_group_palettes(frame, color, &sources, best, pool, scratch);
     }
 
@@ -194,9 +206,22 @@ pub(super) fn learn_tree_candidates(
 const ORDER_RACE_MARGIN: f64 = 1.02;
 const ORDER_RACE_BOTH_MAX_BITS: f64 = 65536.0;
 
+/// A large palette's frame at most this share of the RGB frame's bits ends
+/// the per-group palettes' race by its coarse learn.
+const LARGE_PALETTE_CLEAR_LEAD: f64 = 0.92;
+
 /// The co-occurrence-ordered per-group palettes replace the color-sorted
 /// ones only when their first-stage estimate leads by this factor.
 const ORDERED_GROUP_PALETTE_MARGIN: f64 = 0.97;
+
+/// A per-group-palette frame wins while within 1 % of the smallest other
+/// frame: its groups decode one index plane where the others decode every
+/// color plane. A 6.7 MP screenshot whose palette frame trailed by 0.56 %
+/// decodes at 13.4 MP/s on one thread with it and 4.9 without, for 0.27 % of
+/// the file; of 49 screenshots, composites, illustrations and comics that is
+/// the only file the credit changes. A wider credit buys less: at 4 % a
+/// second file changes, 0.88 % larger for 9 % of decode speed.
+const GROUP_PALETTE_CREDIT: f64 = 0.99;
 
 /// Groups a frame keeps under its large layout. One modular group decodes
 /// on one thread, so an image under ~4 MP in 1024-px groups decodes on one
@@ -450,9 +475,14 @@ impl SourcePlan {
         {
             self.final_sampling = MA_DENSE_SAMPLING;
         }
-        self.rgb = rgb_coarse <= palette_coarse * PALETTE_COARSE_MARGIN;
-        self.palette =
-            palette_stage.is_some() && palette_coarse <= rgb_coarse * PALETTE_COARSE_MARGIN;
+        let large_palette = palette.is_some_and(GlobalPalette::is_large);
+        self.rgb = large_palette || rgb_coarse <= palette_coarse * PALETTE_COARSE_MARGIN;
+        let palette_margin = if large_palette {
+            LARGE_PALETTE_COARSE_MARGIN
+        } else {
+            PALETTE_COARSE_MARGIN
+        };
+        self.palette = palette_stage.is_some() && palette_coarse <= rgb_coarse * palette_margin;
 
         // Small images stop here: the preset ranking costs more than it finds.
         let rank_more = source_values_of(xsize, ysize, frame.coded_chans) >= RANK_MIN_VALUES;
@@ -706,20 +736,38 @@ impl Tournament {
                 }
             }
         }
+        // A large palette learns the first layout only: the second changed
+        // no file of thirteen and took a fifth of their encode time.
+        let palette_layouts = if palette.is_large() {
+            &layouts.all[..1]
+        } else {
+            &layouts.all[..]
+        };
         let Some(raced) = raced else {
             if let Some((layout, cand, coarse)) = self.learn_palette_layouts(
                 frame,
                 sources,
                 &source,
-                &layouts.all,
+                palette_layouts,
                 first_stage,
                 pool,
                 scratch,
             ) {
+                let before = best.bits();
                 self.write_palette(
                     frame, color, sources, &source, layout, &cand, best, pool, scratch,
                 );
-                self.best_source_coarse = self.best_source_coarse.min(coarse);
+                // The per-group palettes still race a large palette whose
+                // frame leads the RGB one by little: its coarse learn pruned
+                // them on a screenshot they coded 0.3 % smaller. Past that
+                // lead (10-30 % on seven frames) they only cost time.
+                let narrow = palette.is_large()
+                    && before.zip(best.bits()).is_some_and(|(before, after)| {
+                        after as f64 > before as f64 * LARGE_PALETTE_CLEAR_LEAD
+                    });
+                if !narrow {
+                    self.best_source_coarse = self.best_source_coarse.min(coarse);
+                }
             }
             return;
         };
@@ -728,7 +776,7 @@ impl Tournament {
         // `ORDER_RACE_MARGIN` stops; the rest learn the other layouts and
         // are written.
         let raced_source = raced.source(frame.xsize, frame.ysize);
-        let (head, tail) = layouts.all.split_at(1);
+        let (head, tail) = palette_layouts.split_at(1);
         let mut learns = [(&source, first_stage), (&raced_source, None)].map(|(source, stage)| {
             let learn =
                 self.learn_palette_layouts(frame, sources, source, head, stage, pool, scratch);
@@ -993,6 +1041,6 @@ impl Tournament {
             self.decisive = true;
             color.release_planes();
         }
-        best.offer(candidate);
+        best.offer_credited(candidate, GROUP_PALETTE_CREDIT);
     }
 }

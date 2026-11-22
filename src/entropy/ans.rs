@@ -70,9 +70,11 @@ pub(crate) struct AnsHistogram {
 // Alias-table geometry for the 128-symbol alphabet (log_alpha_size = 7).
 const LOG_ALPHA_SIZE: usize = 7;
 const TABLE_ENTRIES: usize = 1 << LOG_ALPHA_SIZE; // 128
-const LOG_ENTRY_SIZE: usize = ANS_LOG_TAB_SIZE as usize - LOG_ALPHA_SIZE; // 5
-const ENTRY_SIZE: u32 = 1 << LOG_ENTRY_SIZE; // 32
-const ENTRY_SIZE_M1: u32 = ENTRY_SIZE - 1;
+
+/// Symbols of a wide code (`log_alpha_size = 8`), the largest the format has.
+/// Only the lossless pixel streams build one, after clustering; every
+/// histogram pass before that stays at `TABLE_ENTRIES`.
+pub(crate) const WIDE_TABLE_ENTRIES: usize = 256;
 
 pub(crate) fn normalize_counts(counts: &[u32], freqs: &mut Vec<u16>) {
     let n = counts.len();
@@ -386,9 +388,11 @@ struct AliasEntry {
     freq1_xor_freq0: u32,
 }
 
-fn init_alias_table(distribution_in: &[u16]) -> [AliasEntry; TABLE_ENTRIES] {
+/// The decoder's alias table of an `N`-symbol alphabet (`N` = 128 or 256):
+/// `N` buckets of `ANS_TAB_SIZE / N` slots.
+fn init_alias_table<const N: usize>(distribution_in: &[u16]) -> [AliasEntry; N] {
     let range = ANS_TAB_SIZE;
-    let entry_size = ENTRY_SIZE;
+    let entry_size = ANS_TAB_SIZE / N as u32;
     let mut dist: Vec<u32> = distribution_in.iter().map(|&x| x as u32).collect();
     while dist.last() == Some(&0) {
         dist.pop();
@@ -396,10 +400,10 @@ fn init_alias_table(distribution_in: &[u16]) -> [AliasEntry; TABLE_ENTRIES] {
     if dist.is_empty() {
         dist.push(range);
     }
-    let mut a = [AliasEntry::default(); TABLE_ENTRIES];
+    let mut a = [AliasEntry::default(); N];
 
     if let Some(sym) = dist.iter().position(|&v| v == ANS_TAB_SIZE) {
-        for i in 0..TABLE_ENTRIES {
+        for i in 0..N {
             a[i].right_value = sym as u32;
             a[i].cutoff = 0;
             a[i].offsets1 = entry_size * i as u32;
@@ -409,9 +413,9 @@ fn init_alias_table(distribution_in: &[u16]) -> [AliasEntry; TABLE_ENTRIES] {
         return a;
     }
 
-    let mut underfull: Vec<u32> = Vec::with_capacity(TABLE_ENTRIES);
-    let mut overfull: Vec<u32> = Vec::with_capacity(TABLE_ENTRIES);
-    let mut cutoffs = [0u32; TABLE_ENTRIES];
+    let mut underfull: Vec<u32> = Vec::with_capacity(N);
+    let mut overfull: Vec<u32> = Vec::with_capacity(N);
+    let mut cutoffs = [0u32; N];
     for (i, (&dist, cutoff)) in dist.iter().zip(cutoffs.iter_mut()).enumerate() {
         *cutoff = dist;
         if *cutoff > entry_size {
@@ -420,9 +424,7 @@ fn init_alias_table(distribution_in: &[u16]) -> [AliasEntry; TABLE_ENTRIES] {
             underfull.push(i as u32);
         }
     }
-    for (i, cutoff) in
-        (dist.len()..TABLE_ENTRIES).zip(cutoffs[dist.len()..TABLE_ENTRIES].iter_mut())
-    {
+    for (i, cutoff) in (dist.len()..N).zip(cutoffs[dist.len()..N].iter_mut()) {
         *cutoff = 0;
         underfull.push(i as u32);
     }
@@ -438,11 +440,7 @@ fn init_alias_table(distribution_in: &[u16]) -> [AliasEntry; TABLE_ENTRIES] {
             overfull.push(over);
         }
     }
-    for (i, (&cutoff, a)) in cutoffs[..TABLE_ENTRIES]
-        .iter()
-        .zip(a[..TABLE_ENTRIES].iter_mut())
-        .enumerate()
-    {
+    for (i, (&cutoff, a)) in cutoffs[..N].iter().zip(a[..N].iter_mut()).enumerate() {
         if cutoff == entry_size {
             a.right_value = i as u32;
             a.offsets1 = 0;
@@ -466,9 +464,10 @@ struct AliasSymbol {
 }
 
 #[inline]
-fn alias_lookup(a: &[AliasEntry; TABLE_ENTRIES], value: u32) -> AliasSymbol {
-    let i = (value >> LOG_ENTRY_SIZE) as usize;
-    let pos = value & ENTRY_SIZE_M1;
+fn alias_lookup<const N: usize>(a: &[AliasEntry; N], value: u32) -> AliasSymbol {
+    let entry_size = ANS_TAB_SIZE / N as u32;
+    let i = (value / entry_size) as usize;
+    let pos = value & (entry_size - 1);
     let greater = pos >= a[i].cutoff;
     let offsets1_or_0 = if greater { a[i].offsets1 } else { 0 };
     AliasSymbol {
@@ -495,9 +494,25 @@ pub(crate) struct AnsEncSymbolInfo {
 /// many entries. The caller owns the storage so tables for every histogram can
 /// share one allocation without placing an 8 KiB temporary on the stack.
 pub(crate) fn build_symbol_info(freqs: &[u16], reverse_map: &mut [u16]) -> Vec<AnsEncSymbolInfo> {
+    build_symbol_info_of::<TABLE_ENTRIES>(freqs, reverse_map)
+}
+
+/// `build_symbol_info` for a wide code's `WIDE_TABLE_ENTRIES` symbols.
+pub(crate) fn build_symbol_info_wide(
+    freqs: &[u16],
+    reverse_map: &mut [u16],
+) -> Vec<AnsEncSymbolInfo> {
+    build_symbol_info_of::<WIDE_TABLE_ENTRIES>(freqs, reverse_map)
+}
+
+fn build_symbol_info_of<const N: usize>(
+    freqs: &[u16],
+    reverse_map: &mut [u16],
+) -> Vec<AnsEncSymbolInfo> {
     assert_eq!(reverse_map.len(), ANS_TAB_SIZE as usize);
+    debug_assert!(freqs.len() <= N);
     reverse_map.fill(0);
-    let alias = init_alias_table(freqs);
+    let alias = init_alias_table::<N>(freqs);
     let mut reverse_offset = 0u16;
     let symbols: Vec<AnsEncSymbolInfo> = freqs
         .iter()
@@ -790,7 +805,7 @@ pub(crate) fn encode_histogram<W: HistogramWriter>(
     while alphabet_size > 0 && freqs[alphabet_size - 1] == 0 {
         alphabet_size -= 1;
     }
-    debug_assert!(alphabet_size <= TABLE_ENTRIES);
+    debug_assert!(alphabet_size <= WIDE_TABLE_ENTRIES);
     if histogram.method == 0 {
         w.write(1, 0); // non-small
         w.write(1, 1); // uniform
@@ -843,7 +858,7 @@ pub(crate) fn encode_histogram<W: HistogramWriter>(
     let omit_pos = histogram.omit_pos as usize;
     debug_assert!(omit_pos < alphabet_size);
 
-    let mut bit_width = [0u8; TABLE_ENTRIES];
+    let mut bit_width = [0u8; WIDE_TABLE_ENTRIES];
     let mut omit_width: i32 = 10;
     for (i, (bit_width, &count)) in bit_width
         .iter_mut()
@@ -864,11 +879,12 @@ pub(crate) fn encode_histogram<W: HistogramWriter>(
     // bit width. Only runs of five or more save space with the static code.
     const MIN_REPS: usize = 5;
     const RLE_SYMBOL: usize = ANS_LOG_TAB_SIZE as usize + 1;
-    let mut same = [0u8; TABLE_ENTRIES];
+    // A wide table can hold one run of all 256 counts.
+    let mut same = [0u16; WIDE_TABLE_ENTRIES];
     let mut last = 0usize;
     for i in 1..=alphabet_size {
         if i == alphabet_size || i == omit_pos || i == omit_pos + 1 || freqs[i] != freqs[last] {
-            same[last] = (i - last) as u8;
+            same[last] = (i - last) as u16;
             last = i;
         }
     }
@@ -1356,7 +1372,7 @@ mod tests {
     }
 
     fn assert_flat_reverse_map(freqs: &[u16]) {
-        let alias = init_alias_table(freqs);
+        let alias = init_alias_table::<TABLE_ENTRIES>(freqs);
         let mut reverse_map = vec![0u16; ANS_TAB_SIZE as usize];
         let info = build_symbol_info(freqs, &mut reverse_map);
         let mut legacy: Vec<Vec<u16>> = freqs
@@ -1404,6 +1420,48 @@ mod tests {
         let mut normalized = Vec::new();
         normalize_counts(&counts, &mut normalized);
         assert_flat_reverse_map(&normalized);
+    }
+
+    #[test]
+    fn wide_reverse_map_inverts_the_256_bucket_alias_lookup() {
+        // Symbols above 127 and a table with 16-slot buckets.
+        let counts: [u32; WIDE_TABLE_ENTRIES] =
+            core::array::from_fn(|symbol| ((symbol * 29 + symbol * symbol * 7 + 11) % 251) as u32);
+        let mut freqs = Vec::new();
+        normalize_counts(&counts, &mut freqs);
+        assert!(freqs[200] != 0);
+        for freqs in [freqs, {
+            let mut single = vec![0u16; WIDE_TABLE_ENTRIES];
+            single[201] = ANS_TAB_SIZE as u16;
+            single
+        }] {
+            let mut reverse_map = vec![0u16; ANS_TAB_SIZE as usize];
+            let info = build_symbol_info_wide(&freqs, &mut reverse_map);
+            let alias = init_alias_table::<WIDE_TABLE_ENTRIES>(&freqs);
+            let mut start = 0usize;
+            for (symbol, info) in info.iter().enumerate() {
+                for offset in 0..info.freq as usize {
+                    let found = alias_lookup(&alias, u32::from(reverse_map[start + offset]));
+                    assert_eq!((found.value, found.offset), (symbol, offset));
+                }
+                start += info.freq as usize;
+            }
+            assert_eq!(start, ANS_TAB_SIZE as usize);
+        }
+    }
+
+    #[test]
+    fn a_run_of_all_256_counts_is_written_as_counted() {
+        // 256 equal counts in the general form: one run longer than a byte.
+        let histogram = AnsHistogram {
+            freqs: vec![16; WIDE_TABLE_ENTRIES],
+            method: 12,
+            omit_pos: 0,
+            cost: 0.0,
+        };
+        let mut counter = HistogramBitCounter::default();
+        encode_histogram(&histogram, 8, &mut counter);
+        assert_eq!(counter.0, precise_ans_table_bits(&histogram.freqs, 0));
     }
 
     #[test]

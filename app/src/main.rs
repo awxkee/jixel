@@ -6,14 +6,17 @@ use std::path::Path;
 use std::thread::available_parallelism;
 
 fn main() {
-    let output = "encoded_lossy_b.jxl";
-    let image = image::open(Path::new("./assets/cerys_no_alpha.png")).unwrap();
+    let output = "encoded_lossless.jxl";
+    let image = image::open(Path::new(
+        "./assets/illustrations/jake-cat-illustration.png",
+    ))
+    .unwrap();
     let rgb_img = image.to_rgb8();
     let distance = 1.64;
     let width = image.width() as usize;
     let height = image.height() as usize;
     let cfg = EncodeConfig::default()
-        .with_lossless(false)
+        .with_lossless(true)
         .with_distance(distance)
         .with_speed(Speed::Medium)
         .with_progressive(false)

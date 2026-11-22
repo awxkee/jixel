@@ -5821,7 +5821,7 @@ mod encode_smoke_tests {
                 }
             })
             .collect();
-        let gray: Vec<u8> = rgb.chunks_exact(3).map(|px| px[0]).collect();
+        let gray: Vec<u8> = rgb.as_chunks::<3>().0.iter().map(|px| px[0]).collect();
         let lossy = EncodeConfig::default()
             .with_distance(2.0)
             .with_speed(Speed::Medium);

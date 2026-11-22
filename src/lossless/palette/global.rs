@@ -47,11 +47,31 @@ use crate::weighted_predictor::WpParams;
 /// Largest global palette the learned-tree path tries (libjxl's default).
 const GLOBAL_PALETTE_MAX_COLORS: usize = 4096;
 
+/// Largest one when the frame races its palette orders. Past
+/// [`GLOBAL_PALETTE_MAX_COLORS`] only the ramp order makes one index plane
+/// code below per-group palettes, and only on flat art.
+const RACED_PALETTE_MAX_COLORS: usize = 16384;
+
+/// Pixels in a hundred that repeat the one before them for a palette past
+/// [`GLOBAL_PALETTE_MAX_COLORS`] to be tried: flat art holds 86-94, photos
+/// and dithers of as many colors under 40.
+const LARGE_PALETTE_MIN_REPEATS: usize = 85;
+
+/// A frame of at most this many pixels tries its large palette whatever it
+/// repeats: the try costs it no time worth the gate.
+const LARGE_PALETTE_FREE_PIXELS: usize = 1 << 18;
+
 const _: () = assert!(GLOBAL_PALETTE_MAX_COLORS <= u16::MAX as usize + 1);
 
 /// The palette candidate is only deepened and written when its first-stage
 /// estimate is within this factor of the RGB candidate's.
 pub(in crate::lossless) const PALETTE_COARSE_MARGIN: f64 = 1.10;
+
+/// The same bar for a palette of more than 4096 colors, which is learned
+/// beside the RGB tree. Of 21 such frames the 13 whose palette frame came out
+/// smaller ranked at 0.45-0.92 of the RGB tree, and five of the eight others
+/// at 0.94-1.07: their full learns were a third of the large palettes' time.
+pub(in crate::lossless) const LARGE_PALETTE_COARSE_MARGIN: f64 = 0.93;
 
 /// The palette frame is only written when its final learned estimate is
 /// within this factor of the RGB frame's (the estimate is ~0.5% noisy).
@@ -70,6 +90,13 @@ pub(in crate::lossless) struct GlobalPalette {
 }
 
 impl GlobalPalette {
+    /// More colors than a frame that does not race its orders may hold.
+    /// Such a palette is one more candidate: the RGB tree and the per-group
+    /// palettes it would otherwise stand in for are still learned.
+    pub(in crate::lossless) fn is_large(&self) -> bool {
+        self.nb_colors > GLOBAL_PALETTE_MAX_COLORS
+    }
+
     /// Two colors: a bi-level image.
     pub(in crate::lossless) fn is_bilevel(&self) -> bool {
         self.nb_colors == 2
@@ -324,12 +351,12 @@ fn luma_key(c: &[i32; 4]) -> i64 {
 /// estimate may pick.
 fn palette_order_candidates(
     colors: &[[i32; 4]],
-    cooc: &[u32],
+    cooc: &Cooccurrence,
     chroma_orders: bool,
 ) -> (Vec<Vec<i32>>, usize) {
     let mut orders = estimated_order_candidates(colors, cooc);
     let estimated = orders.len();
-    if chroma_orders && colors.len() >= 3 {
+    if chroma_orders && (3..=GLOBAL_PALETTE_MAX_COLORS).contains(&colors.len()) {
         let ycc: Vec<[i32; 3]> = colors
             .iter()
             .map(|c| {
@@ -348,112 +375,434 @@ fn palette_order_candidates(
     (orders, estimated)
 }
 
-fn estimated_order_candidates(colors: &[[i32; 4]], cooc: &[u32]) -> Vec<Vec<i32>> {
+fn estimated_order_candidates(colors: &[[i32; 4]], cooc: &Cooccurrence) -> Vec<Vec<i32>> {
     let n = colors.len();
     let identity: Vec<i32> = (0..n as i32).collect();
     let mut orders = vec![identity];
     if n < 3 {
         return orders;
     }
-    let chain = cooccurrence_chain_path(n, cooc);
-    let tour = improve_chain_tour(n, cooc, chain.clone());
+    let chain = cooccurrence_chain_path(cooc);
+    // A large palette skips the tour: it takes 0.9-1.1 s at 6655-9117
+    // colors, and its order coded 10 % above the chain's there.
+    let tour = if n > GLOBAL_PALETTE_MAX_COLORS {
+        chain.clone()
+    } else {
+        improve_chain_tour(cooc, chain.clone())
+    };
     orders.push(order_of_path(&chain));
     if tour != chain {
         orders.push(order_of_path(&tour));
     }
-    // Single precision is ample for the axis (the color cloud spans 16
-    // bits; the projection only ranks colors, ties broken by index) and the
-    // chain distances are exact integers.
-    let comp = |c: &[i32; 4]| [c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32];
-    let mean = colors.iter().fold([0.0f32; 4], |mut m, c| {
-        for (m, v) in m.iter_mut().zip(comp(c)) {
-            *m += v / n as f32;
-        }
-        m
-    });
-    // Principal axis by power iteration on the 4x4 covariance.
-    let mut cov = [[0.0f32; 4]; 4];
-    for c in colors {
-        let d: [f32; 4] = std::array::from_fn(|i| comp(c)[i] - mean[i]);
-        for (i, row) in cov.iter_mut().enumerate() {
-            for (j, cell) in row.iter_mut().enumerate() {
-                *cell += d[i] * d[j];
+    // A large palette races the chain, the nearest-neighbor chain and the
+    // ramp order only: no principal-axis or chroma order won on one, and
+    // each costs a coarse learn.
+    if n <= GLOBAL_PALETTE_MAX_COLORS {
+        // Single precision is ample for the axis (the color cloud spans 16
+        // bits; the projection only ranks colors, ties broken by index) and the
+        // chain distances are exact integers.
+        let comp = |c: &[i32; 4]| [c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32];
+        let mean = colors.iter().fold([0.0f32; 4], |mut m, c| {
+            for (m, v) in m.iter_mut().zip(comp(c)) {
+                *m += v / n as f32;
+            }
+            m
+        });
+        // Principal axis by power iteration on the 4x4 covariance.
+        let mut cov = [[0.0f32; 4]; 4];
+        for c in colors {
+            let d: [f32; 4] = std::array::from_fn(|i| comp(c)[i] - mean[i]);
+            for (i, row) in cov.iter_mut().enumerate() {
+                for (j, cell) in row.iter_mut().enumerate() {
+                    *cell += d[i] * d[j];
+                }
             }
         }
-    }
-    let mut axis = [0.5f32, 0.5, 0.5, 0.1];
-    for _ in 0..32 {
-        let mut next = [0.0f32; 4];
-        for (i, row) in cov.iter().enumerate() {
-            next[i] = row.iter().zip(axis).map(|(c, a)| c * a).sum();
+        let mut axis = [0.5f32, 0.5, 0.5, 0.1];
+        for _ in 0..32 {
+            let mut next = [0.0f32; 4];
+            for (i, row) in cov.iter().enumerate() {
+                next[i] = row.iter().zip(axis).map(|(c, a)| c * a).sum();
+            }
+            let norm = next.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if norm < 1e-9 {
+                break;
+            }
+            axis = next.map(|v| v / norm);
         }
-        let norm = next.iter().map(|v| v * v).sum::<f32>().sqrt();
-        if norm < 1e-9 {
-            break;
+        let projection: Vec<f32> = colors
+            .iter()
+            .map(|c| comp(c).iter().zip(axis).map(|(v, x)| v * x).sum())
+            .collect();
+        let mut by_axis: Vec<usize> = (0..n).collect();
+        by_axis.shared_sort_by(|&a, &b| projection[a].total_cmp(&projection[b]).then(a.cmp(&b)));
+        let mut pca = vec![0i32; n];
+        for (index, &canonical) in by_axis.iter().enumerate() {
+            pca[canonical] = index as i32;
         }
-        axis = next.map(|v| v / norm);
+        orders.push(pca);
     }
-    let projection: Vec<f32> = colors
-        .iter()
-        .map(|c| comp(c).iter().zip(axis).map(|(v, x)| v * x).sum())
-        .collect();
-    let mut by_axis: Vec<usize> = (0..n).collect();
-    by_axis.shared_sort_by(|&a, &b| projection[a].total_cmp(&projection[b]).then(a.cmp(&b)));
-    let mut pca = vec![0i32; n];
-    for (index, &canonical) in by_axis.iter().enumerate() {
-        pca[canonical] = index as i32;
-    }
-    orders.push(pca);
 
-    // Greedy nearest-neighbor chain (O(n^2), n <= 1024) on exact squared
-    // distances.
-    let mut used = vec![false; n];
+    // Greedy nearest-neighbor chain (O(n^2)) on exact squared distances. The
+    // unvisited colors stay packed in canonical order: the distance pass is
+    // one branch-free sweep, and ties keep going to the darkest.
     let mut chain = vec![0i32; n];
-    let mut current = 0usize; // darkest color in canonical (luma) order
-    used[0] = true;
+    let mut left: Vec<[i32; 4]> = colors[1..].to_vec();
+    let mut left_ids: Vec<u32> = (1..n as u32).collect();
+    let mut dist = vec![0i64; n];
+    let mut cur = colors[0]; // darkest color in canonical (luma) order
     for index in 1..n {
-        let cur = colors[current];
-        let mut best = usize::MAX;
-        let mut best_d = i64::MAX;
-        for (k, (&u, color)) in used.iter().zip(colors).enumerate() {
-            if u {
-                continue;
+        let dist = &mut dist[..left.len()];
+        for (d, color) in dist.iter_mut().zip(&left) {
+            let mut sum = 0i64;
+            for c in 0..4 {
+                let delta = i64::from(color[c] - cur[c]);
+                sum += delta * delta;
             }
-            let d: i64 = color
-                .iter()
-                .zip(cur)
-                .map(|(&v, c)| {
-                    let d = (v - c) as i64;
-                    d * d
-                })
-                .sum();
-            if d < best_d {
-                best_d = d;
-                best = k;
-            }
+            *d = sum;
         }
-        used[best] = true;
-        chain[best] = index as i32;
-        current = best;
+        let nearest = dist.iter().copied().min().unwrap_or(0);
+        let at = dist.iter().position(|&d| d == nearest).unwrap_or(0);
+        cur = left.remove(at);
+        chain[left_ids.remove(at) as usize] = index as i32;
     }
     orders.push(chain);
     orders
 }
 
-/// Counts of horizontally and vertically adjacent distinct color pairs, as a
-/// symmetric dense `n * n` matrix over canonical indices (n <= 1024).
+/// Colors holding at least one pixel in this many are ramp anchors.
+const RAMP_ANCHOR_SHARE_DEN: usize = 200;
+
+/// Most anchors, the most frequent first.
+const RAMP_MAX_ANCHORS: usize = 48;
+
+/// Anchor pairs remembered per color.
+const RAMP_MAX_VOTES: usize = 16;
+
+/// An index order for anti-aliased flat art: every blend ramp between two
+/// flat colors as one monotone run of indices. The anchors are the frequent
+/// colors; every other color joins the anchor pair that most often brackets
+/// its pixels along rows and columns, at its projection on the segment
+/// between the two. Ramps follow each other through shared anchors, the
+/// heaviest first. Returns canonical colors in index order, `None` without
+/// two anchors.
+pub(super) fn ramp_path(colors: &[[i32; 4]], indices: &[u16], xsize: usize) -> Option<Vec<usize>> {
+    const NONE: u8 = u8::MAX;
+    let n = colors.len();
+    let npx = indices.len();
+    if xsize == 0 {
+        return None;
+    }
+    let mut count = vec![0u32; n];
+    for &i in indices {
+        count[i as usize] += 1;
+    }
+    let mut anchors: Vec<usize> = (0..n)
+        .filter(|&c| count[c] as usize * RAMP_ANCHOR_SHARE_DEN >= npx)
+        .collect();
+    anchors.shared_sort_by_key(|&c| (std::cmp::Reverse(count[c]), c));
+    anchors.truncate(RAMP_MAX_ANCHORS);
+    let k = anchors.len();
+    if k < 2 || k == n {
+        return None;
+    }
+    let mut anchor_of = vec![NONE; n];
+    for (a, &c) in anchors.iter().enumerate() {
+        anchor_of[c] = a as u8;
+    }
+    // `votes[color]`: (lo * k + hi, pixels bracketed by anchors lo and hi).
+    let mut votes: Vec<Vec<(u16, u32)>> = vec![Vec::new(); n];
+    let mut vote = |color: u16, a: u8, b: u8| {
+        let code = (a.min(b) as usize * k + a.max(b) as usize) as u16;
+        let list = &mut votes[color as usize];
+        if let Some(at) = list.iter().position(|(c, _)| *c == code) {
+            list[at].1 += 1;
+        } else if list.len() < RAMP_MAX_VOTES {
+            list.push((code, 1));
+        }
+    };
+    for row in indices.chunks_exact(xsize) {
+        let (mut last, mut start) = (NONE, 0usize);
+        for (x, &c) in row.iter().enumerate() {
+            let a = anchor_of[c as usize];
+            if a != NONE {
+                if last != NONE {
+                    for &between in &row[start..x] {
+                        vote(between, last, a);
+                    }
+                }
+                (last, start) = (a, x + 1);
+            }
+        }
+    }
+    let mut last = vec![NONE; xsize];
+    let mut start = vec![0usize; xsize];
+    for (y, row) in indices.chunks_exact(xsize).enumerate() {
+        for (x, ((&c, last), start)) in row.iter().zip(&mut last).zip(&mut start).enumerate() {
+            let a = anchor_of[c as usize];
+            if a != NONE {
+                if *last != NONE {
+                    // The column's pixels between its two anchors.
+                    let between = indices[*start * xsize + x..y * xsize + x]
+                        .iter()
+                        .step_by(xsize);
+                    for &color in between {
+                        vote(color, *last, a);
+                    }
+                }
+                (*last, *start) = (a, y + 1);
+            }
+        }
+    }
+    let point = |c: usize| colors[c].map(|v| v as f64);
+    // Squared distance of `c` to the segment between anchors `i` and `j`
+    // and its position along it.
+    let segment = |c: usize, i: usize, j: usize| -> (f64, f64) {
+        let (a, b, v) = (point(anchors[i]), point(anchors[j]), point(c));
+        let (mut dot, mut len2) = (0.0, 0.0);
+        for q in 0..4 {
+            dot += (v[q] - a[q]) * (b[q] - a[q]);
+            len2 += (b[q] - a[q]) * (b[q] - a[q]);
+        }
+        let t = if len2 > 0.0 {
+            (dot / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let d2 = (0..4)
+            .map(|q| (v[q] - (a[q] + t * (b[q] - a[q]))).powi(2))
+            .sum();
+        (d2, t)
+    };
+    // Per anchor pair, its colors with their positions.
+    let mut ramps: std::collections::BTreeMap<(usize, usize), Vec<(f64, usize)>> =
+        Default::default();
+    for c in 0..n {
+        if anchor_of[c] != NONE {
+            continue;
+        }
+        let mut best: Option<(u32, f64, usize, usize, f64)> = None;
+        for &(code, v) in &votes[c] {
+            let (mut i, mut j) = (code as usize / k, code as usize % k);
+            if i == j {
+                // Bracketed by one color: the other end is the nearest segment's.
+                let other = (0..k)
+                    .filter(|&x| x != i)
+                    .min_by(|&x, &y| segment(c, i, x).0.total_cmp(&segment(c, i, y).0))
+                    .expect("two anchors");
+                (i, j) = (i.min(other), i.max(other));
+            }
+            let (d2, t) = segment(c, i, j);
+            if best.is_none_or(|(bv, bd, ..)| v > bv || (v == bv && d2 < bd)) {
+                best = Some((v, d2, i, j, t));
+            }
+        }
+        let (i, j, t) = match best {
+            Some((_, _, i, j, t)) => (i, j, t),
+            None => {
+                let mut near = (f64::INFINITY, 0, 1, 0.0);
+                for i in 0..k {
+                    for j in i + 1..k {
+                        let (d2, t) = segment(c, i, j);
+                        if d2 < near.0 {
+                            near = (d2, i, j, t);
+                        }
+                    }
+                }
+                (near.1, near.2, near.3)
+            }
+        };
+        ramps.entry((i, j)).or_default().push((t, c));
+    }
+    type Ramp = ((usize, usize), u64, Vec<(f64, usize)>);
+    let mut remaining: Vec<Ramp> = ramps
+        .into_iter()
+        .map(|(pair, mut list)| {
+            list.shared_sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let weight = list.iter().map(|&(_, c)| count[c] as u64).sum();
+            (pair, weight, list)
+        })
+        .collect();
+    let mut path = Vec::with_capacity(n);
+    let mut placed = vec![false; k];
+    let mut current: Option<usize> = None;
+    while !remaining.is_empty() {
+        // The heaviest ramp at the current anchor, else the heaviest left.
+        let heaviest = |touching: Option<usize>| {
+            remaining
+                .iter()
+                .enumerate()
+                .filter(|(_, ((i, j), ..))| touching.is_none_or(|a| a == *i || a == *j))
+                .max_by_key(|(at, (_, weight, _))| (*weight, std::cmp::Reverse(*at)))
+                .map(|(at, _)| at)
+        };
+        let at = current
+            .and_then(|a| heaviest(Some(a)))
+            .or_else(|| heaviest(None))
+            .expect("a ramp remains");
+        let ((i, j), _, list) = remaining.remove(at);
+        let (from, to) = if current == Some(j) { (j, i) } else { (i, j) };
+        if !std::mem::replace(&mut placed[from], true) {
+            path.push(anchors[from]);
+        }
+        if from == i {
+            path.extend(list.iter().map(|&(_, c)| c));
+        } else {
+            path.extend(list.iter().rev().map(|&(_, c)| c));
+        }
+        if !std::mem::replace(&mut placed[to], true) {
+            path.push(anchors[to]);
+        }
+        current = Some(to);
+    }
+    path.extend((0..k).filter(|&a| !placed[a]).map(|a| anchors[a]));
+    debug_assert_eq!(path.len(), n);
+    Some(path)
+}
+
+/// Counts of horizontally and vertically adjacent distinct color pairs: a
+/// symmetric matrix over canonical indices, kept per color as the colors it
+/// touches, ascending, with their counts. A flat image's matrix is about 1 %
+/// dense, and a dense one of 16384 colors would hold a gigabyte.
+pub(super) struct Cooccurrence {
+    offsets: Vec<u32>,
+    neighbors: Vec<u32>,
+    counts: Vec<u32>,
+    /// The count of any pair in one step: the matrix itself for a small
+    /// palette, the pair table for a large one.
+    dense: Vec<u32>,
+    pairs: PairMap,
+}
+
+impl Cooccurrence {
+    pub(super) fn len(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    /// The colors `a` touches, ascending, and how often.
+    pub(super) fn row(&self, a: usize) -> (&[u32], &[u32]) {
+        let range = self.offsets[a] as usize..self.offsets[a + 1] as usize;
+        (&self.neighbors[range.clone()], &self.counts[range])
+    }
+
+    pub(super) fn get(&self, a: usize, b: usize) -> u32 {
+        if !self.dense.is_empty() {
+            return self.dense[a * self.len() + b];
+        }
+        let key = (a.min(b) as u32) << 16 | a.max(b) as u32;
+        self.pairs.get(&key).copied().unwrap_or(0)
+    }
+
+    pub(super) fn from_dense(n: usize, dense: Vec<u32>) -> Self {
+        let mut cooc = Self {
+            offsets: Vec::with_capacity(n + 1),
+            neighbors: Vec::new(),
+            counts: Vec::new(),
+            dense: Vec::new(),
+            pairs: PairMap::default(),
+        };
+        cooc.offsets.push(0);
+        for row in dense.chunks_exact(n.max(1)).take(n) {
+            for (b, &count) in row.iter().enumerate() {
+                if count != 0 {
+                    cooc.neighbors.push(b as u32);
+                    cooc.counts.push(count);
+                }
+            }
+            cooc.offsets.push(cooc.neighbors.len() as u32);
+        }
+        cooc.dense = dense;
+        cooc
+    }
+
+    /// From the counts of the pairs `lo << 16 | hi`, `lo < hi`.
+    fn from_pairs(n: usize, pairs: PairMap) -> Self {
+        let mut entries: Vec<(u32, u32, u32)> = Vec::with_capacity(2 * pairs.len());
+        for (&key, &count) in &pairs {
+            let (lo, hi) = (key >> 16, key & 0xFFFF);
+            entries.push((lo, hi, count));
+            entries.push((hi, lo, count));
+        }
+        entries.shared_sort_unstable_by(|a, b| a.cmp(b));
+        let mut offsets = vec![0u32; n + 1];
+        for &(a, ..) in &entries {
+            offsets[a as usize + 1] += 1;
+        }
+        for a in 0..n {
+            offsets[a + 1] += offsets[a];
+        }
+        Self {
+            offsets,
+            neighbors: entries.iter().map(|e| e.1).collect(),
+            counts: entries.iter().map(|e| e.2).collect(),
+            dense: Vec::new(),
+            pairs,
+        }
+    }
+}
+
+/// Palettes up to this size count their pairs in a dense matrix.
+const DENSE_COOCCURRENCE_MAX_COLORS: usize = 4096;
+
+#[derive(Default)]
+struct PairHasher(u64);
+
+impl std::hash::Hasher for PairHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("pair keys hash as one u32");
+    }
+
+    fn write_u32(&mut self, key: u32) {
+        self.0 = u64::from(key)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left(29);
+    }
+}
+
+type PairMap = std::collections::HashMap<u32, u32, std::hash::BuildHasherDefault<PairHasher>>;
+
 pub(super) fn index_cooccurrence(
     indices: &[u16],
     xsize: usize,
     ysize: usize,
     n: usize,
-) -> Vec<u32> {
-    let mut cooc = vec![0u32; n * n];
+) -> Cooccurrence {
+    cooccurrence(indices, xsize, ysize, n, n <= DENSE_COOCCURRENCE_MAX_COLORS)
+}
+
+pub(super) fn cooccurrence(
+    indices: &[u16],
+    xsize: usize,
+    ysize: usize,
+    n: usize,
+    dense: bool,
+) -> Cooccurrence {
+    let mut dense = vec![0u32; if dense { n * n } else { 0 }];
+    let mut pairs = PairMap::default();
+    // Runs of one pair (an edge between two flat colors) count without a
+    // lookup.
+    let mut run = (u32::MAX, 0u32);
     let mut bump = |a: u16, b: u16| {
-        if a != b {
-            cooc[a as usize * n + b as usize] += 1;
-            cooc[b as usize * n + a as usize] += 1;
+        if a == b {
+            return;
         }
+        if !dense.is_empty() {
+            dense[a as usize * n + b as usize] += 1;
+            dense[b as usize * n + a as usize] += 1;
+            return;
+        }
+        let key = u32::from(a.min(b)) << 16 | u32::from(a.max(b));
+        if key != run.0 {
+            if run.1 != 0 {
+                *pairs.entry(run.0).or_insert(0) += run.1;
+            }
+            run = (key, 0);
+        }
+        run.1 += 1;
     };
     for y in 0..ysize {
         let row = &indices[y * xsize..(y + 1) * xsize];
@@ -467,7 +816,13 @@ pub(super) fn index_cooccurrence(
             }
         }
     }
-    cooc
+    if !dense.is_empty() {
+        return Cooccurrence::from_dense(n, dense);
+    }
+    if run.1 != 0 {
+        *pairs.entry(run.0).or_insert(0) += run.1;
+    }
+    Cooccurrence::from_pairs(n, pairs)
 }
 
 /// `order[canonical] = index` of the colors in `path` order.
@@ -483,9 +838,10 @@ pub(super) fn order_of_path(path: &[usize]) -> Vec<i32> {
 /// the most-connected color, at each step attaching the unused color with the
 /// most co-occurrences to whichever chain end it touches more. Returns the
 /// canonical colors in chain order.
-pub(super) fn cooccurrence_chain_path(n: usize, cooc: &[u32]) -> Vec<usize> {
+pub(super) fn cooccurrence_chain_path(cooc: &Cooccurrence) -> Vec<usize> {
+    let n = cooc.len();
     let total: Vec<u64> = (0..n)
-        .map(|i| cooc[i * n..(i + 1) * n].iter().map(|&v| v as u64).sum())
+        .map(|i| cooc.row(i).1.iter().map(|&v| v as u64).sum())
         .collect();
     let most_connected = |used: &[bool]| {
         (0..n)
@@ -500,10 +856,12 @@ pub(super) fn cooccurrence_chain_path(n: usize, cooc: &[u32]) -> Vec<usize> {
     chain.push_back(start);
     let (mut left, mut right) = (start, start);
     let best_from = |end: usize, used: &[bool]| {
-        let row = &cooc[end * n..(end + 1) * n];
-        (0..n)
-            .filter(|&i| !used[i])
-            .map(|i| (row[i], i))
+        let (neighbors, counts) = cooc.row(end);
+        neighbors
+            .iter()
+            .zip(counts)
+            .map(|(&i, &v)| (v, i as usize))
+            .filter(|&(_, i)| !used[i])
             .max_by_key(|&(v, i)| (v, std::cmp::Reverse(i)))
             .unwrap_or((0, usize::MAX))
     };
@@ -531,9 +889,9 @@ pub(super) fn cooccurrence_chain_path(n: usize, cooc: &[u32]) -> Vec<usize> {
 
 /// Co-occurrences along a path: the sum over its adjacent pairs.
 #[cfg(test)]
-pub(super) fn path_cooccurrence(n: usize, cooc: &[u32], path: &[usize]) -> u64 {
+pub(super) fn path_cooccurrence(cooc: &Cooccurrence, path: &[usize]) -> u64 {
     path.array_windows::<2>()
-        .map(|&[a, b]| cooc[a * n + b] as u64)
+        .map(|&[a, b]| cooc.get(a, b) as u64)
         .sum()
 }
 
@@ -545,7 +903,8 @@ pub(super) fn path_cooccurrence(n: usize, cooc: &[u32], path: &[usize]) -> u64 {
 /// the colors at the ends of the segment moved and the path's own ends, and
 /// a round costs the graph's edges rather than the square of the palette.
 /// Segments of eight beat a dense search over every insertion point.
-pub(super) fn improve_chain_tour(n: usize, cooc: &[u32], mut path: Vec<usize>) -> Vec<usize> {
+pub(super) fn improve_chain_tour(cooc: &Cooccurrence, mut path: Vec<usize>) -> Vec<usize> {
+    let n = cooc.len();
     const TOUR_OR_OPT_SEGMENT: usize = 8;
     const TOUR_MAX_ROUNDS: usize = 16;
     if n < 3 {
@@ -554,11 +913,11 @@ pub(super) fn improve_chain_tour(n: usize, cooc: &[u32], mut path: Vec<usize>) -
     let mut offsets = vec![0usize; n + 1];
     let mut neighbors = Vec::new();
     for a in 0..n {
-        neighbors.extend((0..n).filter(|&b| cooc[a * n + b] != 0));
+        neighbors.extend(cooc.row(a).0.iter().map(|&b| b as usize));
         offsets[a + 1] = neighbors.len();
     }
     let neighbors = |c: usize| &neighbors[offsets[c]..offsets[c + 1]];
-    let w = |a: usize, b: usize| cooc[a * n + b] as i64;
+    let w = |a: usize, b: usize| cooc.get(a, b) as i64;
     let mut pos = vec![0usize; n];
     for (k, &c) in path.iter().enumerate() {
         pos[c] = k;
@@ -878,16 +1237,24 @@ pub(in crate::lossless) fn build_global_palette(
 }
 
 /// The order race's second order must lead the first by this factor in the
-/// coarse learn. Orders within it (photos of at most 256 colors, a second
-/// order differing in a few indices) gained 0.4 % of the race's bytes for
-/// 40 % of its second learns' time.
+/// coarse learn.
 const ORDER_RACE_COARSE_LEAD: f64 = 0.995;
+
+/// The coarse learn's bits of a large palette's ramp order count this much.
+const RAMP_COARSE_HANDICAP: f64 = 0.9;
 
 /// What the order race's coarse learns need of the frame.
 #[derive(Clone, Copy)]
 pub(in crate::lossless) struct OrderRace {
     pub(in crate::lossless) min_symbol: u32,
     pub(in crate::lossless) use_wp: bool,
+    /// Try a palette of up to [`RACED_PALETTE_MAX_COLORS`]. The frame then
+    /// learns it beside its other sources, not in their place.
+    pub(in crate::lossless) large: bool,
+    /// Race the ramp order on a palette of any size.
+    pub(in crate::lossless) ramp: bool,
+    /// Race the orders of a palette of at most 4096 colors too.
+    pub(in crate::lossless) small: bool,
 }
 
 /// The global palette under the order the cheap estimate ranks first and,
@@ -915,8 +1282,14 @@ pub(in crate::lossless) fn build_global_palettes(
         let (first_seen, indices) = {
             // One pass: first-seen ids per pixel, remapped to the final order below.
             let mut seen: ColorMap<i32> = ColorMap::default();
-            seen.reserve(GLOBAL_PALETTE_MAX_COLORS + 1);
-            let mut first_seen: Vec<[i32; 4]> = Vec::with_capacity(GLOBAL_PALETTE_MAX_COLORS + 1);
+            let cap = if race.is_some_and(|race| race.large) && !gray {
+                RACED_PALETTE_MAX_COLORS
+            } else {
+                GLOBAL_PALETTE_MAX_COLORS
+            };
+            let mut repeats = 0usize;
+            seen.reserve(cap + 1);
+            let mut first_seen: Vec<[i32; 4]> = Vec::with_capacity(cap + 1);
             let mut indices: Vec<u16> = Vec::with_capacity(npx);
             let mut previous = ([0; 4], -1);
             // YCoCg is reversible, so distinct input tuples identify exactly the same
@@ -928,10 +1301,12 @@ pub(in crate::lossless) fn build_global_palettes(
                         first_seen.push(color);
                         next
                     });
-                    if first_seen.len() > GLOBAL_PALETTE_MAX_COLORS {
+                    if first_seen.len() > cap {
                         return false;
                     }
                     previous = (color, id);
+                } else {
+                    repeats += 1;
                 }
                 indices.push(previous.1 as u16);
                 true
@@ -960,6 +1335,12 @@ pub(in crate::lossless) fn build_global_palettes(
                 npx + num_c * nb_colors < num_c * npx
             };
             if !narrower {
+                return None;
+            }
+            if nb_colors > GLOBAL_PALETTE_MAX_COLORS
+                && npx > LARGE_PALETTE_FREE_PIXELS
+                && repeats * 100 < LARGE_PALETTE_MIN_REPEATS * npx
+            {
                 return None;
             }
             if !gray {
@@ -1005,14 +1386,30 @@ pub(in crate::lossless) fn build_global_palettes(
         *v = canonical_of_id[*v as usize] as u16;
     }
     let nb_colors = colors.len();
-    let (orders, estimated) = {
+    let race = race.filter(|race| race.small || nb_colors > GLOBAL_PALETTE_MAX_COLORS);
+    let (orders, estimated, ramp) = {
         let cooc = index_cooccurrence(&indices, xsize, ysize, nb_colors);
-        palette_order_candidates(&colors, &cooc, race.is_some() && !gray)
+        let (mut orders, estimated) =
+            palette_order_candidates(&colors, &cooc, race.is_some() && !gray);
+        // The ramp order races for a large palette and in a vector-layer
+        // frame. On lossless palettes of at most 4096 colors it changed 2 of
+        // 48 flat images by 0.5 % for 8 % of the encode time.
+        let mut ramp = None;
+        if !gray
+            && (nb_colors > GLOBAL_PALETTE_MAX_COLORS || race.is_some_and(|race| race.ramp))
+            && let Some(path) = ramp_path(&colors, &indices, xsize)
+        {
+            ramp = Some(orders.len());
+            orders.push(order_of_path(&path));
+        }
+        (orders, estimated, ramp)
     };
+    let large = nb_colors > GLOBAL_PALETTE_MAX_COLORS;
     let mut best_order = 0usize;
     let mut best_cost = f32::INFINITY;
     for (k, order) in orders.iter().enumerate().take(estimated) {
-        if orders[..k].contains(order) {
+        // A large palette's order is the coarse learn's alone.
+        if large || orders[..k].contains(order) {
             continue;
         }
         let cost = estimate_index_plane_cost(&indices, xsize, ysize, order, pool, scratch);
@@ -1039,9 +1436,8 @@ pub(in crate::lossless) fn build_global_palettes(
             num_c,
         }
     };
-    let first = under(&orders[best_order]);
     let Some(race) = race else {
-        return Some((first, None));
+        return Some((under(&orders[best_order]), None));
     };
     let mut coarse = |palette: &GlobalPalette| {
         rank_coarse(
@@ -1058,6 +1454,27 @@ pub(in crate::lossless) fn build_global_palettes(
         )
         .map_or(f64::INFINITY, |stage| rank_bits(&stage))
     };
+    if large {
+        // One order, the coarse learn's best past the luma order (which led
+        // on none of 21 frames). The estimate's pick was luma on half of
+        // them, and the order racing it then coded smaller on 9 of 10; its
+        // full learn was a quarter of what the large palette cost.
+        let mut best: Option<(f64, GlobalPalette)> = None;
+        for (k, order) in orders.iter().enumerate().skip(1) {
+            let palette = under(order);
+            let handicap = if ramp == Some(k) {
+                RAMP_COARSE_HANDICAP
+            } else {
+                1.0
+            };
+            let bits = coarse(&palette) * handicap;
+            if best.as_ref().is_none_or(|(least, _)| bits < *least) {
+                best = Some((bits, palette));
+            }
+        }
+        return best.map(|(_, palette)| (palette, None));
+    }
+    let first = under(&orders[best_order]);
     let first_bits = coarse(&first);
     let mut second: Option<(f64, GlobalPalette)> = None;
     for (k, order) in orders.iter().enumerate() {
