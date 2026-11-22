@@ -152,6 +152,12 @@ pub(crate) struct EncodingContext {
     /// Receives the most atlas area (pixels) any glyph search's templates
     /// would save over exact patches.
     pub(crate) template_probe: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    /// The probe counts only frames whose glyphs sit on smooth ground (see
+    /// `EncodeConfig::templates_ground_only`).
+    pub(crate) template_ground_only: bool,
+    /// A glyph search of this encode found the frame to be smooth ground
+    /// under its ink (see `patches::glyphs`).
+    pub(crate) smooth_ground: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Native coherent extra-channel function fields.
     pub(crate) function_fields: bool,
     /// Function fields may use a second frame (function base + residual).
@@ -662,6 +668,8 @@ impl EncodingContext {
             glyph_templates: false,
             patch_lite: false,
             template_probe: None,
+            template_ground_only: false,
+            smooth_ground: Default::default(),
             function_fields: false,
             function_fields_layered: false,
             function_fields_exact: false,

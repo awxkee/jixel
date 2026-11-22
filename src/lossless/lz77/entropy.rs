@@ -84,6 +84,14 @@ where
     bits
 }
 
+/// First LZ77 symbol a refined code may move to: the largest that keeps
+/// every length symbol (at most 43 above it) inside the 128-symbol alphabet.
+/// Twenty more literal symbols let a cluster of large residuals keep three or
+/// four token bits beyond the exponent: an 800x600 game capture codes 2.1 %
+/// smaller than at 64, a 3.9K-colour illustration 0.6 %, the other 16 images
+/// of the check within 0.1 %.
+const LZ77_RAISED_MIN_SYMBOL: u32 = 84;
+
 /// Accumulate per raw context before clustering and return the extra bits.
 #[inline]
 fn lz_add_histograms<I>(
@@ -461,6 +469,7 @@ pub(in crate::lossless) fn estimate_coded_bits<T: LzTokenSource>(
     min_symbol: u32,
     pool: Option<&ThreadPool>,
 ) -> f64 {
+    let min_symbol = code.lz_min_symbol.max(min_symbol);
     let num_clusters = code.num_prefix_codes;
     let mut sym_cost: Vec<Vec<f32>> = Vec::with_capacity(num_clusters);
     for cluster in 0..num_clusters {
@@ -686,10 +695,13 @@ fn rebuild_lz_histograms<T: LzTokenSource>(
     pool: Option<&ThreadPool>,
     configs: &mut [HybridUintConfig],
     histograms: &mut [Histogram],
+    all: bool,
 ) {
+    // `all`: `min_symbol` is not the one the histograms were counted with,
+    // so every cluster's length symbols move.
     let rebuild: Vec<_> = configs
         .iter()
-        .map(|&config| config != HybridUintConfig::DEFAULT)
+        .map(|&config| all || config != HybridUintConfig::DEFAULT)
         .collect();
     if !rebuild.contains(&true) {
         return;
@@ -747,6 +759,26 @@ fn rebuild_lz_histograms<T: LzTokenSource>(
             histograms[cluster].counts[0] += count;
             histograms[cluster].total_count += count;
         }
+    }
+    // A cluster sent back to the default configuration still holds the
+    // histogram of the old `min_symbol`: count it again. The default is
+    // valid under any `min_symbol` the callers pass.
+    if all
+        && rebuild
+            .iter()
+            .zip(&valid)
+            .any(|(&wanted, &kept)| wanted && !kept)
+    {
+        rebuild_lz_histograms(
+            streams,
+            context_map,
+            min_symbol,
+            tail_counts,
+            pool,
+            configs,
+            histograms,
+            true,
+        );
     }
 }
 
@@ -851,6 +883,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
     }
     let histograms = &mut histograms[..num_clusters];
     let configs = &mut configs[..num_clusters];
+    let mut lz_min_symbol = min_symbol;
 
     if refined {
         let distance_cluster = context_map[distance_context as usize] as usize;
@@ -881,7 +914,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
             let strides = crate::entropy::HybridUintSamples::strides_for(&running);
             let offsets = &offsets;
             let strides_ref = &strides;
-            let per_stream_values: Vec<Vec<Vec<u32>>> =
+            let per_stream_values: Vec<(Vec<Vec<u32>>, Vec<u32>)> =
                 map_streams_indexed(streams, pool, |s, toks| {
                     let mut remaining: Vec<_> = offsets[s]
                         .iter()
@@ -892,12 +925,14 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
                         })
                         .collect();
                     let mut local: Vec<Vec<u32>> = vec![Vec::new(); num_clusters];
+                    let mut maxima = vec![0u32; num_clusters];
                     for tok in lz_tokens(toks) {
                         let (cluster, value) = if tok.is_lz77() {
                             (distance_cluster, tok.distance)
                         } else {
                             (context_map_ref[tok.context as usize] as usize, tok.value)
                         };
+                        maxima[cluster] = maxima[cluster].max(value);
                         if remaining[cluster] == 0 {
                             local[cluster].push(value);
                             remaining[cluster] = strides_ref[cluster] - 1;
@@ -905,12 +940,16 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
                             remaining[cluster] -= 1;
                         }
                     }
-                    local
+                    (local, maxima)
                 });
             let mut values: Vec<Vec<u32>> = vec![Vec::new(); num_clusters];
-            for local in per_stream_values {
+            let mut maxima = vec![0u32; num_clusters];
+            for (local, local_maxima) in per_stream_values {
                 for (dst, src) in values.iter_mut().zip(local) {
                     dst.extend(src);
+                }
+                for (dst, src) in maxima.iter_mut().zip(local_maxima) {
+                    *dst = (*dst).max(src);
                 }
             }
             let samples = crate::entropy::HybridUintSamples::from_parts(values, strides);
@@ -931,15 +970,42 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
                     None => samples.select(),
                 }
             });
+            // Any configuration whose literals stay below the first LZ77
+            // symbol, beyond the fixed list searched above; then the same
+            // with that symbol raised, kept when it codes smaller.
+            let (free, free_bits) = samples.select_free(
+                configs,
+                &maxima,
+                min_symbol,
+                pool,
+                &mut CoderScratch::lossless(),
+            );
+            if LZ77_RAISED_MIN_SYMBOL > min_symbol {
+                let (raised, raised_bits) = samples.select_free(
+                    configs,
+                    &maxima,
+                    LZ77_RAISED_MIN_SYMBOL,
+                    pool,
+                    &mut CoderScratch::lossless(),
+                );
+                if raised_bits < free_bits {
+                    configs.copy_from_slice(&raised);
+                    lz_min_symbol = LZ77_RAISED_MIN_SYMBOL;
+                }
+            }
+            if lz_min_symbol == min_symbol {
+                configs.copy_from_slice(&free);
+            }
         }
         rebuild_lz_histograms(
             streams,
             context_map_ref,
-            min_symbol,
+            lz_min_symbol,
             &tail_counts,
             pool,
             configs,
             histograms,
+            lz_min_symbol != min_symbol,
         );
     } else {
         configs.fill(crate::entropy::HybridUintConfig::DEFAULT);
@@ -953,6 +1019,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
         ans,
         huffman_pool,
         use_ans,
+        lz_min_symbol,
     )
 }
 
@@ -965,6 +1032,7 @@ fn finish_lz_entropy<'a>(
     ans: &'a mut crate::coder_scratch::LzAnsScratch,
     huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
     use_ans: bool,
+    lz_min_symbol: u32,
 ) -> EntropyCode<'a> {
     let num_contexts = context_map.len();
     let num_clusters = histograms.len();
@@ -1020,6 +1088,7 @@ fn finish_lz_entropy<'a>(
         ans_histograms: &ans.histograms,
         ans_symbols: &ans.symbols,
         ans_reverse_maps: &ans.reverse_maps,
+        lz_min_symbol,
     }
 }
 
@@ -1068,6 +1137,7 @@ mod tests {
                 pool,
                 &mut configs,
                 &mut histograms,
+                false,
             );
             assert_eq!(
                 configs,
@@ -1093,5 +1163,75 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn a_raised_min_symbol_recounts_every_cluster() {
+        // Three token bits beyond the exponent put 1200 at symbol 65: over
+        // the default first LZ77 symbol, under the raised one.
+        let wide = HybridUintConfig {
+            split_exponent: 4,
+            msb_in_token: 3,
+            lsb_in_token: 0,
+        };
+        assert_eq!(crate::entropy::uint_encode_with_config(1200, wide).0, 65);
+        let tokens = [
+            LzToken::pixel(0, 1200),
+            LzToken::lz77(0, 20, 150),
+            LzToken::pixel(1, 5),
+            LzToken::lz77(1, 3, 1),
+        ];
+        let streams = [tokens.as_slice()];
+        let mut defaults = vec![Histogram::new(); 3];
+        lz_add_histograms(tokens, &mut defaults, 64, 2);
+        let length_20 = lz77_length_encode(20).0;
+        let length_3 = lz77_length_encode(3).0;
+        assert_eq!(defaults[1].counts[(64 + length_3) as usize], 1);
+
+        // At the default symbol the wide cluster falls back and nothing moves.
+        let mut histograms = defaults.clone();
+        let mut configs = [wide, HybridUintConfig::DEFAULT, HybridUintConfig::DEFAULT];
+        rebuild_lz_histograms(
+            &streams,
+            &[0, 1, 2],
+            64,
+            &[],
+            None,
+            &mut configs,
+            &mut histograms,
+            false,
+        );
+        assert_eq!(configs[0], HybridUintConfig::DEFAULT);
+        assert_eq!(histograms[0].counts, defaults[0].counts);
+
+        // Raised: the wide literal is kept, and the lengths of both clusters,
+        // the default-configured one included, sit above the new symbol.
+        let mut histograms = defaults.clone();
+        let mut configs = [wide, HybridUintConfig::DEFAULT, HybridUintConfig::DEFAULT];
+        rebuild_lz_histograms(
+            &streams,
+            &[0, 1, 2],
+            LZ77_RAISED_MIN_SYMBOL,
+            &[],
+            None,
+            &mut configs,
+            &mut histograms,
+            true,
+        );
+        assert_eq!(configs[0], wide);
+        let mut first = Histogram::new();
+        first.add(65);
+        first.add(LZ77_RAISED_MIN_SYMBOL + length_20);
+        assert_eq!(histograms[0].counts, first.counts);
+        let mut second = Histogram::new();
+        second.add(5);
+        second.add(LZ77_RAISED_MIN_SYMBOL + length_3);
+        assert_eq!(histograms[1].counts, second.counts);
+        assert_eq!(histograms[2].counts, defaults[2].counts);
+    }
+
+    #[test]
+    fn every_length_symbol_fits_above_the_raised_min_symbol() {
+        let longest = lz77_length_encode(u32::MAX).0;
+        assert!(LZ77_RAISED_MIN_SYMBOL + longest < crate::entropy::ALPHABET_SIZE as u32);
     }
 }

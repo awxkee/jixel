@@ -427,6 +427,36 @@ impl HybridUintSamples {
     /// Search the remaining legal integer configurations on a bounded probe.
     /// Four proxy finalists and the incumbent receive the full table search;
     /// the caller then verifies the complete bundle on the original tokens.
+    /// [`select_free_config`] for every cluster, with the clusters' summed
+    /// cost. `maxima` are the clusters' largest values over all their tokens,
+    /// not only the sampled ones.
+    pub(crate) fn select_free(
+        &self,
+        incumbents: &[HybridUintConfig],
+        maxima: &[u32],
+        limit: u32,
+        pool: Option<&ThreadPool>,
+        scratch: &mut CoderScratch,
+    ) -> (Vec<HybridUintConfig>, f64) {
+        let one = |i: usize| {
+            select_free_config(
+                &self.values[i],
+                self.strides[i],
+                incumbents[i],
+                maxima[i],
+                limit,
+            )
+        };
+        let picked: Vec<(HybridUintConfig, f64)> = match pool {
+            Some(pool) if pool.num_threads() > 1 && self.values.len() >= 4 => {
+                pool.steal_map(scratch, self.values.len(), |i, _| one(i))
+            }
+            _ => (0..self.values.len()).map(one).collect(),
+        };
+        let bits = picked.iter().map(|&(_, bits)| bits).sum();
+        (picked.into_iter().map(|(config, _)| config).collect(), bits)
+    }
+
     fn select_expanded_with_pool(
         &self,
         incumbents: &[HybridUintConfig],
@@ -532,6 +562,98 @@ fn select_exhaustive_config(
         }
     }
     best
+}
+
+/// Exact-priced candidates of [`select_free_config`] beyond the incumbent.
+/// Ranked by the fast ANS cost, the first three hold the winner: pricing all
+/// of them changed five screenshots and illustrations by under 0.02 %.
+const FREE_CONFIG_FINALISTS: usize = 3;
+
+/// The cheapest `(split, msb, lsb)` configuration of one cluster among all
+/// whose symbols stay below `limit` (the stream's first LZ77 symbol), or
+/// `incumbent` when none codes smaller. The fixed candidate list stops at two
+/// token bits beyond the exponent; palette indices and other streams whose
+/// large values take a few exact levels want three or four, which moves their
+/// payload from raw bits into the histogram. Candidates are ranked by the
+/// fast ANS cost over the cluster's distinct sampled values (plain entropy
+/// mis-ranks near-deterministic clusters), the best few priced with the
+/// writer's tables.
+fn select_free_config(
+    values: &[u32],
+    stride: usize,
+    incumbent: HybridUintConfig,
+    max_value: u32,
+    limit: u32,
+) -> (HybridUintConfig, f64) {
+    if values.is_empty() {
+        return (incumbent, 0.0);
+    }
+    let limit = limit.min(ALPHABET_SIZE as u32);
+    // Distinct values with their counts: every candidate then costs one pass
+    // over these, not over the samples.
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let mut distinct: Vec<(u32, u32)> = Vec::new();
+    for &value in &sorted {
+        match distinct.last_mut() {
+            Some((last, count)) if *last == value => *count += 1,
+            _ => distinct.push((value, 1)),
+        }
+    }
+    let histogram_of = |config: HybridUintConfig| {
+        let mut counts = [0u32; ALPHABET_SIZE];
+        let mut extra = 0u64;
+        for &(value, count) in &distinct {
+            let (symbol, bits, _) = uint_encode_with_config(value, config);
+            counts[symbol as usize] += count;
+            extra += u64::from(bits) * u64::from(count);
+        }
+        (counts, extra)
+    };
+    let mut candidates: Vec<(f64, HybridUintConfig)> = Vec::new();
+    for split in 0..=ANS_LOG_ALPHA_SIZE as u8 {
+        for msb in 0..=split {
+            for lsb in 0..=split - msb {
+                let config = HybridUintConfig {
+                    split_exponent: split,
+                    msb_in_token: msb,
+                    lsb_in_token: lsb,
+                };
+                if config == incumbent {
+                    continue;
+                }
+                let bound = uint_encode_with_config(max_value, config).0 | ((1u32 << lsb) - 1);
+                if bound >= limit {
+                    continue;
+                }
+                let (counts, extra) = histogram_of(config);
+                let proxy = hybrid_ans_candidate_cost(&counts, extra, stride, config);
+                candidates.push((proxy, config));
+            }
+        }
+    }
+    // Stable proxy ties follow the split/msb/lsb enumeration order.
+    candidates.shared_sort_by(|a, b| a.0.total_cmp(&b.0));
+    let cost = |config: HybridUintConfig| {
+        let (counts, extra) = histogram_of(config);
+        let counts = counts.map(|c| c.saturating_mul(stride as u32));
+        let base = optimize_ans_histogram(&counts);
+        let table = refine_ans_histogram_precision(&counts, &base).unwrap_or(base);
+        super::ans::ans_data_bits(&counts, &table.freqs)
+            + super::ans::ans_table_bits(&table)
+            + extra as f64 * stride as f64
+            + hybrid_uint_config_bits(config, 3) as f64
+    };
+    let mut best = incumbent;
+    let mut best_cost = cost(incumbent);
+    for &(_, config) in candidates.iter().take(FREE_CONFIG_FINALISTS) {
+        let bits = cost(config);
+        if bits < best_cost {
+            best = config;
+            best_cost = bits;
+        }
+    }
+    (best, best_cost)
 }
 
 fn select_expanded_config(
@@ -1494,6 +1616,7 @@ impl AnsBundleRef<'_> {
             ans_histograms: self.histograms,
             ans_symbols: self.symbols,
             ans_reverse_maps: self.reverse_maps,
+            lz_min_symbol: 0,
         }
     }
 
@@ -3514,6 +3637,37 @@ mod mode_choice_tests {
 #[cfg(test)]
 mod ans_refinement_tests {
     use super::*;
+
+    #[test]
+    fn free_config_keeps_literals_under_the_limit_and_never_costs_more() {
+        // A cluster of a few exact large values next to many zeros: the
+        // default configuration sends ten payload bits per large value.
+        let mut values = vec![0u32; 4000];
+        for (i, value) in values.iter_mut().enumerate() {
+            if i % 5 == 0 {
+                *value = [600, 601, 730, 2900][i / 5 % 4];
+            }
+        }
+        let max = 2900;
+        let cost_of = |config: HybridUintConfig| select_free_config(&values, 1, config, max, 0).1;
+        let default_cost = cost_of(HybridUintConfig::DEFAULT);
+        for limit in [64, 84] {
+            let (config, cost) =
+                select_free_config(&values, 1, HybridUintConfig::DEFAULT, max, limit);
+            assert!(cost <= default_cost, "{limit}: {cost} > {default_cost}");
+            assert_ne!(config, HybridUintConfig::DEFAULT, "{limit}");
+            for &value in &values {
+                assert!(uint_encode_with_config(value, config).0 < limit, "{limit}");
+            }
+            // The returned cost is the configuration's own.
+            assert_eq!(cost, cost_of(config));
+        }
+        // No candidate fits under a limit the default itself exceeds.
+        assert_eq!(
+            select_free_config(&values, 1, HybridUintConfig::DEFAULT, max, 8).0,
+            HybridUintConfig::DEFAULT
+        );
+    }
 
     fn code_for(
         tokens: &[Token],

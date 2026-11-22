@@ -525,8 +525,10 @@ pub struct EncodeConfig {
     /// tinted rows), a second encode declares an opaque alpha channel and
     /// codes each such glyph once as a color-and-coverage template placed
     /// with alpha blending; the smaller file is kept. Images without such
-    /// text pay nothing; images with it pay a second encode. 8-bit RGB lossy
-    /// input with [`EncodeConfig::patches`] only. Defaults to false.
+    /// text pay nothing; images with it pay a second encode. Opaque integer
+    /// RGB lossy input with [`EncodeConfig::patches`] only. Defaults to
+    /// false; [`Speed::Medium`] and [`Speed::MediumSlow`] turn it on for
+    /// glyphs over gradients alone.
     pub glyph_templates: bool,
     /// Progressive DC for lossy VarDCT: the 1:8 DC image is coded as its own
     /// squeezed modular frame ahead of the main frame, so a decoder can show
@@ -565,6 +567,10 @@ pub struct EncodeConfig {
     /// The templated arm of the glyph-template race: glyph searches build
     /// templates (frames carry the declared opaque alpha).
     pub(crate) templates_active: bool,
+    /// `glyph_templates` came from a speed tier below [`Speed::Slow`]: the
+    /// race runs only for glyphs over smooth ground (labels on a ramp, text
+    /// on a wallpaper gradient), which no other arm of those tiers shares.
+    pub(crate) templates_ground_only: bool,
     /// `patches` came from the speed tier's lite default, not from
     /// `with_patches`: lossy frames only, without the Slow-tier races.
     pub(crate) patches_lite: bool,
@@ -719,6 +725,7 @@ impl Default for EncodeConfig {
             coding_transform: CodingTransform::Xyb,
             grain: Grain::Off,
             templates_active: false,
+            templates_ground_only: false,
             patches_lite: false,
             template_probe: None,
         }
@@ -1183,6 +1190,7 @@ impl EncodeConfig {
     /// [`EncodeConfig::glyph_templates`]).
     pub fn with_glyph_templates(mut self, glyph_templates: bool) -> Self {
         self.glyph_templates = glyph_templates;
+        self.templates_ground_only = false;
         self
     }
 
@@ -1273,11 +1281,18 @@ impl EncodeConfig {
         if speed.effort().patches_default {
             self.patches = true;
             self.glyph_templates = true;
+            self.templates_ground_only = false;
             self.patch_epf = true;
             self.patches_lite = false;
-        } else if speed.effort().patches_lite_default && !self.patches {
-            self.patches = true;
-            self.patches_lite = true;
+        } else if speed.effort().patches_lite_default {
+            if !self.patches {
+                self.patches = true;
+                self.patches_lite = true;
+            }
+            if !self.glyph_templates {
+                self.glyph_templates = true;
+                self.templates_ground_only = true;
+            }
         }
         if speed.effort().ink_layer_default {
             self.ink_layer = true;
@@ -1400,6 +1415,7 @@ pub(crate) fn lossy_context(
     ctx.patch_lite = config.patches_lite;
     ctx.glyph_templates = config.templates_active && config.patches;
     ctx.template_probe = config.template_probe.clone();
+    ctx.template_ground_only = config.templates_ground_only;
     // The representation is color-agnostic: the plane is judged against its
     // own ordinary coding, on views that need no color management.
     ctx.function_fields = config.function_fields
@@ -1589,12 +1605,28 @@ pub fn encode_image(
             encode_image(input, width, height, config)
         });
     }
+    race_glyph_templates(config, width, height, |config| {
+        if config.templates_active {
+            encode_lossy_u8_alpha::<3>(input, width, height, config)
+        } else {
+            encode_image_rgb(input, width, height, config)
+        }
+    })
+}
+
+/// The glyph-template race of an opaque RGB image. Templates need an alpha
+/// channel, which the image declares only when it pays: the plain encode
+/// reports the atlas area templates would save, and only a large enough
+/// share races a second encode with an opaque 8-bit alpha (`encode` is
+/// called with `templates_active` set for it); the smaller file is kept.
+fn race_glyph_templates(
+    config: &EncodeConfig,
+    width: usize,
+    height: usize,
+    encode: impl Fn(&EncodeConfig) -> Result<Vec<u8>, EncodeError>,
+) -> Result<Vec<u8>, EncodeError> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    // Glyph templates need an alpha channel, which an RGB image declares
-    // only when it pays: the plain encode reports the atlas area templates
-    // would save, and only a large enough share races a second encode with
-    // an opaque alpha.
     let race = config.glyph_templates
         && config.patches
         && !config.lossless
@@ -1602,13 +1634,13 @@ pub fn encode_image(
         && config.coding_transform == CodingTransform::Xyb
         && !config.progressive_dc;
     if !race {
-        return encode_image_rgb(input, width, height, config);
+        return encode(config);
     }
     let probe = Arc::new(AtomicUsize::new(0));
     let mut plain_config = config.clone();
     plain_config.glyph_templates = false;
     plain_config.template_probe = Some(Arc::clone(&probe));
-    let plain = encode_image_rgb(input, width, height, &plain_config)?;
+    let plain = encode(&plain_config)?;
     let saved = probe.load(Ordering::Relaxed) as f64;
     if saved < TEMPLATE_MIN_SAVED_SHARE * (width * height) as f64 {
         return Ok(plain);
@@ -1616,12 +1648,10 @@ pub fn encode_image(
     let mut templated_config = config.clone();
     templated_config.glyph_templates = false;
     templated_config.templates_active = true;
-    Ok(
-        match encode_lossy_u8_alpha::<3>(input, width, height, &templated_config) {
-            Ok(templated) if templated.len() < plain.len() => templated,
-            _ => plain,
-        },
-    )
+    Ok(match encode(&templated_config) {
+        Ok(templated) if templated.len() < plain.len() => templated,
+        _ => plain,
+    })
 }
 
 /// A lossy request for an opaque 8-bit image of at most two colors is coded
@@ -1666,6 +1696,23 @@ fn flip_bilevel<const CHANNELS: usize>(
         return None;
     }
     Some(ink.iter().map(|&ink| colors[usize::from(ink)]).collect())
+}
+
+/// A gray RGB image (every pixel has equal components) that is few-level
+/// line art, quantized for the lossless coder (see [`crate::few_level`]);
+/// `None` for anything else.
+fn few_level_rgb(
+    pixels: &[[u8; 3]],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Option<Vec<[u8; 3]>> {
+    if !pixels.iter().all(|&[r, g, b]| r == g && g == b) {
+        return None;
+    }
+    let gray: Vec<u8> = pixels.iter().map(|pixel| pixel[0]).collect();
+    let quantized = crate::few_level::quantize(&gray, width, height, config.distance)?;
+    Some(quantized.iter().map(|&value| [value; 3]).collect())
 }
 
 /// The ink mask of a two-color image with its `[paper, ink]` colors; the
@@ -1727,6 +1774,13 @@ fn encode_image_rgb(
         let flipped = flip_bilevel(input.as_chunks::<3>().0, width, height, config.distance);
         let pixels = flipped.as_deref().unwrap_or(input.as_chunks::<3>().0);
         return encode_image_rgb(pixels.as_flattened(), width, height, &exact);
+    }
+    if bilevel_codes_exactly(config)
+        && let Some(quantized) = few_level_rgb(input.as_chunks::<3>().0, width, height, config)
+    {
+        let mut exact = config.clone();
+        exact.lossless = true;
+        return encode_image_rgb(quantized.as_flattened(), width, height, &exact);
     }
     if config.lossless {
         return encode_with_config_loseless(
@@ -3670,7 +3724,9 @@ pub fn encode_image_16bit(
             encode_image_16bit(input, width, height, config)
         });
     }
-    encode_high_depth_rgba(input, width, height, false, config, BitsPerSample::Sixteen)
+    race_glyph_templates(config, width, height, |config| {
+        encode_high_depth_rgba(input, width, height, false, config, BitsPerSample::Sixteen)
+    })
 }
 
 pub fn encode_image_10bit(
@@ -3684,7 +3740,9 @@ pub fn encode_image_10bit(
             encode_image_10bit(input, width, height, config)
         });
     }
-    encode_high_depth_rgba(input, width, height, false, config, BitsPerSample::Ten)
+    race_glyph_templates(config, width, height, |config| {
+        encode_high_depth_rgba(input, width, height, false, config, BitsPerSample::Ten)
+    })
 }
 
 pub fn encode_image_12bit(
@@ -3698,7 +3756,9 @@ pub fn encode_image_12bit(
             encode_image_12bit(input, width, height, config)
         });
     }
-    encode_high_depth_rgba(input, width, height, false, config, BitsPerSample::Twelve)
+    race_glyph_templates(config, width, height, |config| {
+        encode_high_depth_rgba(input, width, height, false, config, BitsPerSample::Twelve)
+    })
 }
 
 /// Encode an 8-bit grayscale image. `input` is `width * height` luma bytes.
@@ -3771,6 +3831,14 @@ fn encode_gray_impl<const CHANNELS: usize>(
         let flipped = flip_bilevel(pixels, width, height, config.distance);
         let pixels = flipped.as_deref().unwrap_or(pixels);
         return encode_gray_impl::<CHANNELS>(pixels.as_flattened(), width, height, &exact);
+    }
+    if CHANNELS == 1
+        && bilevel_codes_exactly(config)
+        && let Some(quantized) = crate::few_level::quantize(input, width, height, config.distance)
+    {
+        let mut exact = config.clone();
+        exact.lossless = true;
+        return encode_gray_impl::<CHANNELS>(&quantized, width, height, &exact);
     }
     let alpha = || (CHANNELS == 2).then(|| pixels.iter().map(|px| px[1]).collect::<Vec<_>>());
     if config.lossless {
@@ -4184,7 +4252,7 @@ fn encode_high_depth_rgba(
         let mut ctx = ctx;
         ctx.set_coding(config.coding_transform, distance);
         apply_yellow_opsin(&mut ctx, &linear, distance);
-        let cfg = EncodeConfigImpl::with_distance(distance)
+        let mut cfg = EncodeConfigImpl::with_distance(distance)
             .with_progressive_from(config)
             .with_bits_per_sample(bps)
             .with_icc_profile(config.icc_profile.clone())
@@ -4196,6 +4264,11 @@ fn encode_high_depth_rgba(
             .with_color_encoding(config.color_encoding)
             .with_intensity_target(config.intensity_target)
             .with_num_threads(config.num_threads);
+        if config.templates_active {
+            // The templated arm of the glyph-template race: the opaque
+            // alpha the templates blend by is 8-bit at any color depth.
+            cfg = cfg.with_alpha(AlphaPlane::U8(vec![u8::MAX; width * height]));
+        }
         encode_samples_lossy(
             Samples::U16 {
                 data: input,

@@ -51,6 +51,9 @@ const TEMPLATE_MAX_ALPHA_DIFF: f32 = 0.05;
 /// Lattice tolerance (Y, X, B) of the stroke cores, where the template's
 /// two-color model is all the decoder shows.
 static TEMPLATE_CORE_TOLERANCE: [f32; 3] = [6.0, 24.0, 6.0];
+/// ... and on smooth ground, where one coverage cannot put a mix on the
+/// opsin curve of every background at once.
+static TEMPLATE_SOFT_CORE_TOLERANCE: [f32; 3] = [12.0, 36.0, 12.0];
 /// Lattice granularity (Y, X, B) of the foreground colors one template shares.
 static TEMPLATE_COLOR_STEP: [f32; 3] = [16.0, 64.0, 16.0];
 
@@ -89,6 +92,10 @@ struct Occurrence {
     fg: [f32; 3],
     fg_delta: [f32; 3],
     alpha: Vec<f32>,
+    /// On smooth ground: the coverage relative to the occurrence's own
+    /// strongest pixels, kept while `alpha` is fitted against the foreground
+    /// of one candidate group after another.
+    relative: Vec<f32>,
 }
 
 /// Glyph groups that share a blend-above template (see
@@ -146,6 +153,94 @@ impl TemplatePlan<'_> {
     }
 }
 
+/// Mean coverage difference between occurrences of one glyph on smooth
+/// ground: the opsin curve bends the same coverage a little differently
+/// over every background.
+const TEMPLATE_MAX_SOFT_ALPHA_DIFF: f32 = 0.09;
+/// Spread of the backgrounds (squared, in weighted lattice units per
+/// member) below which they say nothing about the foreground.
+const TEMPLATE_MIN_GROUND_SPREAD: f32 = 1e-4;
+/// A group on smooth ground stands when one template keeps this share of
+/// it; otherwise it is cut in two by ground, this many times at most.
+const TEMPLATE_SPAN_KEEP: (usize, usize) = (4, 5);
+const TEMPLATE_MAX_SPAN_DEPTH: u32 = 5;
+/// The strongest pixels of an antialiased glyph hold at least this much of
+/// its foreground.
+const TEMPLATE_MIN_PEAK_COVERAGE: f32 = 0.4;
+
+/// The foreground the occurrences of one glyph share, from how its
+/// strongest pixels move with the background. Those pixels are a mix
+/// `bg + s (fg - bg)` with one peak coverage `s`, so over several
+/// backgrounds their difference from the ground falls by `s` per unit of
+/// ground: the slope gives `s`, and the foreground follows. Every member
+/// then takes that foreground and its coverage toward it. Members on one
+/// ground keep their own estimate (`s` = 1).
+fn share_foreground(
+    lattice: &Lattice,
+    label: &[u32],
+    shapes: &[GlyphShape],
+    occurrences: &mut [Occurrence],
+    group: &[usize],
+) {
+    let weights = TEMPLATE_CHANNEL_WEIGHTS;
+    let inv = 1.0 / group.len() as f32;
+    let ground = |i: usize, c: usize| shapes[i].bg[c] as f32 / TEMPLATE_LATTICE[c];
+    // Back to every member's own estimate: an earlier, wider group may
+    // have shared another.
+    for &i in group {
+        let occurrence = &mut occurrences[i];
+        occurrence.fg = std::array::from_fn(|c| ground(i, c) + occurrence.fg_delta[c]);
+        occurrence.alpha.clone_from(&occurrence.relative);
+    }
+    let mut mean_bg = [0.0f32; 3];
+    let mut mean_delta = [0.0f32; 3];
+    for &i in group {
+        for c in 0..3 {
+            mean_bg[c] += ground(i, c) * inv;
+            mean_delta[c] += occurrences[i].fg_delta[c] * inv;
+        }
+    }
+    let (mut covariance, mut variance) = (0.0f32, 0.0f32);
+    for &i in group {
+        for c in 0..3 {
+            let b = ground(i, c) - mean_bg[c];
+            covariance += weights[c] * b * (occurrences[i].fg_delta[c] - mean_delta[c]);
+            variance += weights[c] * b * b;
+        }
+    }
+    if variance * inv < TEMPLATE_MIN_GROUND_SPREAD {
+        return;
+    }
+    let peak = (-covariance / variance).clamp(TEMPLATE_MIN_PEAK_COVERAGE, 1.0);
+    let fg: [f32; 3] = std::array::from_fn(|c| mean_bg[c] + mean_delta[c] / peak);
+    // Coverage against the shared foreground, pixel by pixel: the opsin
+    // curve bends a mix away from the straight line between its ends, and
+    // the coverage that lands each pixel on that line is what the decoder
+    // needs, not the one the renderer used.
+    for &i in group {
+        let s = &shapes[i];
+        let toward: [f32; 3] = std::array::from_fn(|c| fg[c] - ground(i, c));
+        let norm = (0..3)
+            .map(|c| weights[c] * toward[c] * toward[c])
+            .sum::<f32>()
+            .max(1e-12);
+        let occurrence = &mut occurrences[i];
+        occurrence.fg = fg;
+        for (dy, row) in occurrence.alpha.chunks_exact_mut(s.w).enumerate() {
+            let start = (s.y0 + dy) * lattice.width + s.x0;
+            for (dx, a) in row.iter_mut().enumerate() {
+                let idx = start + dx;
+                if label[idx] == s.label {
+                    let d = pixel_delta(&lattice.planes, idx, s.bg);
+                    let coverage =
+                        (0..3).map(|c| weights[c] * d[c] * toward[c]).sum::<f32>() / norm;
+                    *a = coverage.clamp(0.0, 1.0);
+                }
+            }
+        }
+    }
+}
+
 #[inline]
 fn pixel_delta(fine: &[Vec<i32>; 3], idx: usize, bg: [i32; 3]) -> [f32; 3] {
     std::array::from_fn(|c| (fine[c][idx] - bg[c]) as f32 / TEMPLATE_LATTICE[c])
@@ -194,6 +289,7 @@ fn estimate_foreground(
             fg,
             fg_delta: fd,
             alpha: Vec::new(),
+            relative: Vec::new(),
         },
     )
 }
@@ -214,16 +310,37 @@ fn plan_glyph_templates<'a>(
     let mut buckets: HashMap<(u64, [i32; 3]), Vec<usize>> = HashMap::new();
     for (i, s) in shapes.iter().enumerate() {
         let (mask_hash, occurrence) = estimate_foreground(lattice, label, s, &mut strength);
-        let key = std::array::from_fn(|c| {
-            (occurrence.fg[c] * TEMPLATE_LATTICE[c] / TEMPLATE_COLOR_STEP[c]).round() as i32
-        });
+        // On smooth ground neither the mask nor the foreground estimate of
+        // an antialiased glyph survives a change of background (faint edge
+        // pixels come and go, and the strongest pixels are a mix that leans
+        // on the ground): such shapes meet by size and polarity, and their
+        // coverage decides.
+        let (bucket, key) = if s.soft {
+            let polarity = if occurrence.fg_delta[0] >= 0.0 { 1 } else { -1 };
+            (
+                0x5bd1_e995_u64 ^ ((s.w as u64) << 32 | s.h as u64),
+                [polarity, i32::MAX, i32::MAX],
+            )
+        } else {
+            (
+                mask_hash,
+                std::array::from_fn(|c| {
+                    (occurrence.fg[c] * TEMPLATE_LATTICE[c] / TEMPLATE_COLOR_STEP[c]).round() as i32
+                }),
+            )
+        };
         occurrences.push(occurrence);
-        buckets.entry((mask_hash, key)).or_default().push(i);
+        buckets.entry((bucket, key)).or_default().push(i);
     }
     drop(strength);
     // A member fits when its coverage agrees with the template and its
     // cores, which the decoder shows as the template's mix, stay close.
     let fits = |s: &GlyphShape, coverage: &[f32], alpha: &[f32], fg: &[f32; 3]| -> bool {
+        let max_diff = if s.soft {
+            TEMPLATE_MAX_SOFT_ALPHA_DIFF
+        } else {
+            TEMPLATE_MAX_ALPHA_DIFF
+        };
         let GlyphShape {
             x0, y0, w, h, bg, ..
         } = *s;
@@ -234,7 +351,12 @@ fn plan_glyph_templates<'a>(
                 count += 1;
             }
         }
-        if count > 0 && diff > TEMPLATE_MAX_ALPHA_DIFF * count as f32 {
+        let core_tolerance = if s.soft {
+            &TEMPLATE_SOFT_CORE_TOLERANCE
+        } else {
+            &TEMPLATE_CORE_TOLERANCE
+        };
+        if count > 0 && diff > max_diff * count as f32 {
             return false;
         }
         for dy in 0..h {
@@ -246,7 +368,7 @@ fn plan_glyph_templates<'a>(
                 let idx = (y0 + dy) * width + x0 + dx;
                 for c in 0..3 {
                     let mix = bg[c] as f32 * (1.0 - a) + fg[c] * TEMPLATE_LATTICE[c] * a;
-                    if (fine[c][idx] as f32 - mix).abs() > TEMPLATE_CORE_TOLERANCE[c] {
+                    if (fine[c][idx] as f32 - mix).abs() > core_tolerance[c] {
                         return false;
                     }
                 }
@@ -256,7 +378,7 @@ fn plan_glyph_templates<'a>(
     };
     // Shapes with one support and color may still differ inside (coverage):
     // split each bucket into clusters whose coverage agrees with their seed.
-    let agrees = |a: &[f32], b: &[f32]| -> bool {
+    let agrees = |a: &[f32], b: &[f32], max_diff: f32| -> bool {
         let (mut diff, mut count) = (0.0f32, 0usize);
         for (x, y) in a.iter().zip(b) {
             if *x > 0.0 || *y > 0.0 {
@@ -264,7 +386,7 @@ fn plan_glyph_templates<'a>(
                 count += 1;
             }
         }
-        diff <= TEMPLATE_MAX_ALPHA_DIFF * count.max(1) as f32
+        diff <= max_diff * count.max(1) as f32
     };
     let has_multiple_backgrounds = |group: &[usize]| {
         group
@@ -274,6 +396,7 @@ fn plan_glyph_templates<'a>(
     let mut clusters: Vec<Vec<usize>> = Vec::new();
     let mut groups = Vec::new();
     let mut template_alpha = Vec::new();
+    let mut spans: Vec<(Vec<usize>, u32)> = Vec::new();
     for members in buckets
         .into_values()
         .filter(|g| has_multiple_backgrounds(g))
@@ -298,9 +421,14 @@ fn plan_glyph_templates<'a>(
                     }
                 }
             }
+            let max_diff = if s.soft {
+                TEMPLATE_MAX_SOFT_ALPHA_DIFF
+            } else {
+                TEMPLATE_MAX_ALPHA_DIFF
+            };
             match clusters
                 .iter_mut()
-                .find(|c| agrees(&occurrences[c[0]].alpha, &alpha))
+                .find(|c| agrees(&occurrences[c[0]].alpha, &alpha, max_diff))
             {
                 Some(cluster) => cluster.push(i),
                 None => clusters.push(vec![i]),
@@ -308,6 +436,47 @@ fn plan_glyph_templates<'a>(
             occurrences[i].alpha = alpha;
         }
         for mut group in clusters.drain(..) {
+            if shapes[group[0]].soft {
+                for &i in &group {
+                    let occurrence = &mut occurrences[i];
+                    occurrence.relative = std::mem::take(&mut occurrence.alpha);
+                }
+                // Ordered by ground, so that a group one template cannot
+                // hold is cut where the ground changes.
+                group.shared_sort_by_key(|&i| (shapes[i].bg, shapes[i].y0, shapes[i].x0));
+                spans.push((group, 0));
+                while let Some((span, depth)) = spans.pop() {
+                    if !has_multiple_backgrounds(&span) {
+                        continue;
+                    }
+                    share_foreground(lattice, label, shapes, &mut occurrences, &span);
+                    let mut kept = span.clone();
+                    for _ in 0..2 {
+                        if !has_multiple_backgrounds(&kept) {
+                            break;
+                        }
+                        let fg = template_of(ctx, shapes, &occurrences, &kept, &mut template_alpha);
+                        kept.retain(|&i| {
+                            fits(&shapes[i], &occurrences[i].alpha, &template_alpha, &fg)
+                        });
+                    }
+                    let enough =
+                        kept.len() * TEMPLATE_SPAN_KEEP.1 >= span.len() * TEMPLATE_SPAN_KEEP.0;
+                    if (enough || depth == TEMPLATE_MAX_SPAN_DEPTH || span.len() < 4)
+                        && has_multiple_backgrounds(&kept)
+                    {
+                        for &i in &kept {
+                            occurrences[i].relative = Vec::new();
+                        }
+                        groups.push(kept);
+                    } else if depth < TEMPLATE_MAX_SPAN_DEPTH && span.len() >= 4 {
+                        let (low, high) = span.split_at(span.len() / 2);
+                        spans.push((high.to_vec(), depth + 1));
+                        spans.push((low.to_vec(), depth + 1));
+                    }
+                }
+                continue;
+            }
             for _ in 0..2 {
                 if !has_multiple_backgrounds(&group) {
                     break;
@@ -329,6 +498,17 @@ fn plan_glyph_templates<'a>(
                 }
             }
         }
+    }
+    // Soft members no group kept.
+    let mut grouped = vec![false; shapes.len()];
+    for &i in groups.iter().flatten() {
+        grouped[i] = true;
+    }
+    for (occurrence, &kept) in occurrences.iter_mut().zip(&grouped) {
+        if !kept {
+            occurrence.alpha = Vec::new();
+        }
+        occurrence.relative = Vec::new();
     }
     (!groups.is_empty()).then_some(TemplatePlan {
         shapes,
@@ -474,6 +654,11 @@ pub(super) fn take_glyph_templates(
     shapes: &mut Vec<GlyphShape>,
 ) -> Option<GlyphTemplates> {
     if ctx.template_probe.is_none() && !params.templates {
+        return None;
+    }
+    // The tiers that race templates for glyphs over gradients alone ask
+    // nothing of a frame without smooth ground.
+    if !params.templates && ctx.template_ground_only && !shapes.iter().any(|s| s.soft) {
         return None;
     }
     let plan = plan_glyph_templates(ctx, lattice, label, shapes);

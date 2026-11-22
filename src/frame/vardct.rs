@@ -103,13 +103,6 @@ pub(super) fn encode_frame_vardct(
 
     // Compare bounded residual samples plus the actual atlas, dictionary and
     // spline costs. Only the selected plan receives a full-frame encode.
-    // The lite tier (see `EncodingContext::patch_lite`) skips the lattice
-    // search: it is the one patch stage a photo pays for.
-    let lattice = if ctx.patch_lite {
-        None
-    } else {
-        crate::lattice_patches::find(&xyb)
-    };
     let retain_epf_luma = ctx.patch_epf
         && super::vardct_encoder::epf_fit_enabled(ctx, distance)
         && !ctx.progressive_dc
@@ -125,6 +118,18 @@ pub(super) fn encode_frame_vardct(
         distance <= GLYPH_SINGLETON_FREE_MAX_DISTANCE,
         retain_epf_luma,
     );
+    // The lite tier (see `EncodingContext::patch_lite`) skips the lattice
+    // search: it is the one patch stage a photo pays for. So does a frame
+    // the glyph search took for smooth ground: the steps of a ramp repeat
+    // like a tiling, and the arm priced them with a whole-frame encode that
+    // never won (12 encodes of ramps and wallpapers under labels, same
+    // bytes at half the time without it).
+    let on_ground = ctx.smooth_ground.load(std::sync::atomic::Ordering::Relaxed);
+    let lattice = if ctx.patch_lite || on_ground {
+        None
+    } else {
+        crate::lattice_patches::find(&xyb)
+    };
     let mut best = prepare_vardct_variant(
         ctx,
         scratch,

@@ -362,6 +362,7 @@ pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainM
         grain: crate::Grain::Off,
         coding_transform: crate::CodingTransform::Xyb,
         templates_active: false,
+        templates_ground_only: false,
         template_probe: None,
     };
 
