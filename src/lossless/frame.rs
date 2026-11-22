@@ -33,7 +33,8 @@
 //!    `region_frames`) may code as a base saved to reference slot 0 plus one
 //!    cropped kReplace frame per rectangle. When the first-stage estimates
 //!    favor the split, both it and the whole frame are encoded and the
-//!    smaller is kept.
+//!    smaller is kept. Otherwise a second plan that also takes in flat
+//!    illustrations is ranked by complete `Fast` encodes instead.
 //! 2. Displayed frame: the image itself or, with patches, a reference-only
 //!    atlas plus the patched image; both compete on complete size.
 //!
@@ -67,6 +68,18 @@ const REGION_GLYPH_SAVING: f64 = 0.1;
 /// share of the whole frame's: estimated gains of 1.8% and more won 2-20%,
 /// one of 0.6% lost 3.7%.
 const REGION_SPLIT_MARGIN: f64 = 0.99;
+
+/// The second region plan (with flat illustrations) is ranked by complete
+/// encodes at this speed: the first-stage estimate cannot price small crops
+/// (no tree beats the flat coder) and missed every illustration split that
+/// won (−1.7..−7.3 % on 5 of 64 screenshots), while `Fast` ranked them all
+/// right at 0.02-0.8 s. It is only trusted to say yes: its no lost known
+/// wins of the first plan, which is why that plan keeps the estimate.
+const REGION_PROXY_SPEED: crate::Speed = crate::Speed::Fast;
+
+/// The proxy's split must code under this share of its whole frame: a
+/// 0.35 % proxy margin bought a 0.37 % win at twice the encode time.
+const REGION_PROXY_MARGIN: f64 = 0.995;
 
 /// A glyph plan's regular frame is encoded only when its first-stage
 /// estimate is within this factor of the patched frame's (base estimate plus
@@ -229,9 +242,11 @@ impl FrameCoder<'_, '_> {
         self.encode_displayed(linear, alpha, false, whole_glyphs, writer);
     }
 
-    /// The region split of a screenshot whose first-stage estimate beats the
-    /// whole frame's, else `None`. Finds the whole frame's glyph plan into
-    /// `whole_glyphs` along the way.
+    /// The region split worth a complete race against the whole frame, else
+    /// `None`: the rare-color plan when its first-stage estimate beats the
+    /// whole frame's, else the plan with flat illustrations when the
+    /// estimate or complete `Fast` encodes favor it. Finds the whole frame's
+    /// glyph plan into `whole_glyphs` along the way.
     fn plan_region_split(
         &mut self,
         linear: &Image3Si,
@@ -247,7 +262,70 @@ impl FrameCoder<'_, '_> {
         {
             return None;
         }
-        let mut regions = crate::region_frames::plan(linear, alpha, self.pool)?;
+        let mut whole = None;
+        let mut rejected = None;
+        if let Some(regions) = crate::region_frames::plan(linear, alpha, self.pool)
+            && let Some((split, favoured)) =
+                self.region_candidate(linear, alpha, regions, whole_glyphs, &mut whole)
+        {
+            if favoured {
+                return Some(split);
+            }
+            rejected = Some(split);
+        }
+        let regions = crate::region_frames::plan_local(linear, alpha, self.pool)?;
+        let split = match rejected {
+            // The same rectangles, none of them text-like: the estimate
+            // already said no.
+            Some(split) if split.regions == regions => split,
+            _ => {
+                let (split, favoured) =
+                    self.region_candidate(linear, alpha, regions, whole_glyphs, &mut whole)?;
+                if favoured {
+                    return Some(split);
+                }
+                split
+            }
+        };
+        self.proxy_favors(&split, linear, alpha).then_some(split)
+    }
+
+    /// Complete encodes of the split and the whole frame at
+    /// [`REGION_PROXY_SPEED`] favor the split.
+    fn proxy_favors(
+        &mut self,
+        split: &RegionSplit,
+        linear: &Image3Si,
+        alpha: Option<&AlphaPlane>,
+    ) -> bool {
+        let mut proxy = FrameCoder {
+            settings: LosslessSettings {
+                speed: REGION_PROXY_SPEED,
+                ..self.settings
+            },
+            patches: self.patches,
+            pool: self.pool,
+            scratch: &mut *self.scratch,
+        };
+        let mut split_writer = BitWriter::new();
+        proxy.encode_region_split(split, &mut split_writer);
+        let mut whole_writer = BitWriter::new();
+        proxy.encode_displayed(linear, alpha, false, None, &mut whole_writer);
+        (split_writer.bits_written() as f64)
+            < whole_writer.bits_written() as f64 * REGION_PROXY_MARGIN
+    }
+
+    /// The split of `regions` once text-like rectangles stay in the base,
+    /// and whether its first-stage estimate beats the whole frame's (cached
+    /// in `whole`); `None` when no rectangle is left.
+    fn region_candidate(
+        &mut self,
+        linear: &Image3Si,
+        alpha: Option<&AlphaPlane>,
+        mut regions: Vec<Region>,
+        whole_glyphs: &mut Option<Option<LosslessPatches>>,
+        whole: &mut Option<Option<f64>>,
+    ) -> Option<(RegionSplit, bool)> {
         let mut crops: Vec<_> = regions
             .iter()
             .map(|r| crate::region_frames::crop(linear, alpha, r))
@@ -262,7 +340,7 @@ impl FrameCoder<'_, '_> {
         // stays in the base when the patches save a share of its estimate.
         if self.patches
             && let Some(glyphs) =
-                whole_glyphs.insert(find_lossless_glyph_patches(linear, self.pool))
+                whole_glyphs.get_or_insert_with(|| find_lossless_glyph_patches(linear, self.pool))
         {
             let keep: Vec<bool> = regions
                 .iter()
@@ -284,8 +362,14 @@ impl FrameCoder<'_, '_> {
         }
 
         // The split's estimate: the base, every crop and their headers.
+        if regions.is_empty() {
+            return None;
+        }
         let (base, base_alpha) = crate::region_frames::cut(linear, alpha, &regions);
-        let whole = self.coarse_bits(linear, alpha);
+        let whole = match *whole {
+            Some(bits) => bits,
+            None => *whole.insert(self.coarse_bits(linear, alpha)),
+        };
         let base_bits = self.coarse_bits(&base, base_alpha.as_ref());
         let split = own
             .iter()
@@ -297,12 +381,15 @@ impl FrameCoder<'_, '_> {
             (whole, split),
             (Some(whole), Some(split)) if split < whole * REGION_SPLIT_MARGIN
         );
-        (!regions.is_empty() && favoured).then_some(RegionSplit {
-            regions,
-            crops,
-            base,
-            base_alpha,
-        })
+        Some((
+            RegionSplit {
+                regions,
+                crops,
+                base,
+                base_alpha,
+            },
+            favoured,
+        ))
     }
 
     /// The base saved to slot 0, then each crop replacing its rectangle.
@@ -403,16 +490,17 @@ impl FrameCoder<'_, '_> {
 
         // Step 4 (glyph plans): they win whenever the plan is any good, so
         // the regular frame (a complete second encode) is written only when
-        // the first-stage estimates leave it a chance; the dense local-tree
-        // learn is spent on the patched frame only.
+        // the first-stage estimates leave it a chance, or when the image is
+        // a bi-level screen, whose regular frame the estimates cannot price;
+        // the dense local-tree learn is spent on the patched frame only.
         if is_glyph_plan
-            && self.regular_competes(
+            && (self.regular_competes(
                 linear,
                 alpha,
                 &plan,
                 atlas_bits,
                 patched_writer.bits_written(),
-            )
+            ) || screen_needs_regular(linear, alpha))
         {
             self.core(
                 linear,
@@ -571,4 +659,15 @@ fn coarse_frame_bits(
         scratch,
     )?;
     Some(stage.candidate.est_real.min(stage.candidate.flat_real))
+}
+
+/// A bi-level image with a repeated screen. Its regular frame codes the
+/// screen by LZ77 under Zero-predictor leaves, which the first-stage
+/// estimates (literals only) do not see, while the patched base has lost the
+/// repeats to the atlas: a scanned manga page came out 12.5 % smaller as a
+/// regular frame than as the patched pair those estimates preferred.
+fn screen_needs_regular(linear: &Image3Si, alpha: Option<&AlphaPlane>) -> bool {
+    alpha.is_none()
+        && super::palette::bilevel_screen_share(linear)
+            .is_some_and(|share| share >= super::palette::SCREEN_MIN_SHARE)
 }

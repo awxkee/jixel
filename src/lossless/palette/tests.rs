@@ -31,8 +31,9 @@
 
 use super::super::rct::inverse_ycocg;
 use super::global::{
-    PackedPalette, build_global_palette, cooccurrence_chain_path, estimate_index_plane_cost,
-    improve_chain_tour, index_cost_rows, path_cooccurrence,
+    PackedPalette, SCREEN_MIN_SHARE, bilevel_screen_share, build_global_palette,
+    cooccurrence_chain_path, estimate_index_plane_cost, improve_chain_tour, index_cost_rows,
+    path_cooccurrence, screen_share,
 };
 use super::visit_palette_colors;
 use crate::coder_scratch::CoderScratch;
@@ -345,4 +346,37 @@ fn packed_palette_inverts_through_the_decoder_squeeze() {
     let packed = PackedPalette::new(&stripes_palette, w, h).unwrap();
     assert_eq!(packed.packed_colors, 1);
     assert!(packed.indices.iter().all(|&index| index == 0));
+}
+
+#[test]
+fn screen_share_tells_a_dot_screen_from_strokes() {
+    let (w, h) = (256, 96);
+    // A 45-degree dot screen of pitch 8: rows repeat eight rows up.
+    let dots = |x: usize, y: usize| (x + y) % 8 < 3 && (x + 8 - y % 8) % 8 < 3;
+    assert!(screen_share(dots, w, h) > 0.9);
+    // Vertical rules and a diagonal stroke repeat from the row above or not
+    // at all.
+    let rules = |x: usize, _: usize| x % 23 < 2;
+    assert_eq!(screen_share(rules, w, h), 0.0);
+    let stroke = |x: usize, y: usize| x.abs_diff(2 * y) < 3;
+    assert!(screen_share(stroke, w, h) < SCREEN_MIN_SHARE);
+    // Blank and narrow images have no busy span.
+    assert_eq!(screen_share(|_, _| false, w, h), 0.0);
+    assert_eq!(screen_share(dots, 63, h), 0.0);
+
+    // Two colors qualify whatever they are; a third does not.
+    let mut linear = Image3Si::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let value = if dots(x, y) { [7, -3, 2] } else { [200, 0, 0] };
+            for (c, v) in value.into_iter().enumerate() {
+                linear.plane_row_mut(c, y)[x] = v;
+            }
+        }
+    }
+    assert!(bilevel_screen_share(&linear).unwrap() > 0.9);
+    linear.plane_row_mut(1, 5)[9] = 77;
+    assert!(bilevel_screen_share(&linear).is_none());
+    let flat = Image3Si::new(w, h);
+    assert!(bilevel_screen_share(&flat).is_none());
 }

@@ -249,6 +249,17 @@ pub(super) fn ma_learn_params(
     }
 }
 
+/// `MaSource::value_tree`: Zero-predictor leaves without offsets. Applied
+/// after `with_ma_prune`, whose growth settings stay.
+pub(super) fn with_value_tree(mut params: MaLearnParams, value_tree: bool) -> MaLearnParams {
+    if value_tree {
+        params.allowed_preds = 1 << crate::ma_tree::PRED_ZERO;
+        params.modal_offsets = false;
+        params.allow_wp = false;
+    }
+    params
+}
+
 /// A final learn of a palette index source (`modal_offsets`) grows then
 /// prunes (`MaLearnParams::prune_leaf_bits`); RCT sources keep best-first
 /// growth.
@@ -275,6 +286,7 @@ fn learn_ma_coarse(
     max_leaves: usize,
     max_candidates: usize,
     leaf_offsets: bool,
+    value_tree: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Option<CoarseLearn> {
@@ -283,16 +295,19 @@ fn learn_ma_coarse(
     }
     if samples.len() <= MA_COARSE_TARGET_SAMPLES {
         let best_first = || {
-            ma_learn_params(
-                min_symbol,
-                max_leaves,
-                max_candidates,
-                stride as f64,
-                use_wp,
-                !leaf_offsets,
+            with_value_tree(
+                ma_learn_params(
+                    min_symbol,
+                    max_leaves,
+                    max_candidates,
+                    stride as f64,
+                    use_wp,
+                    !leaf_offsets,
+                ),
+                value_tree,
             )
         };
-        let params = with_ma_prune(best_first(), stride as f64);
+        let params = with_value_tree(with_ma_prune(best_first(), stride as f64), value_tree);
         let pruned = params.prune_leaf_bits > 0.0;
         let leaf_price = ma_leaf_price(&params, stride as f64);
         let tree = learn_ma_tree(&samples, params, pool, scratch);
@@ -321,6 +336,7 @@ fn learn_ma_coarse(
             stride,
             max_candidates,
             leaf_offsets,
+            value_tree,
             candidate,
             deepen: false,
         });
@@ -330,13 +346,16 @@ fn learn_ma_coarse(
     let coarse_tree = learn_ma_tree_indexed(
         &samples,
         coarse_indices,
-        ma_learn_params(
-            min_symbol,
-            MA_COARSE_MAX_LEAVES,
-            max_candidates,
-            coarse_scale,
-            use_wp,
-            !leaf_offsets,
+        with_value_tree(
+            ma_learn_params(
+                min_symbol,
+                MA_COARSE_MAX_LEAVES,
+                max_candidates,
+                coarse_scale,
+                use_wp,
+                !leaf_offsets,
+            ),
+            value_tree,
         ),
         pool,
         scratch,
@@ -350,6 +369,7 @@ fn learn_ma_coarse(
         stride,
         max_candidates,
         leaf_offsets,
+        value_tree,
         candidate,
         deepen,
     })
@@ -369,16 +389,19 @@ pub(super) fn finish_ma_learn(
     if !coarse.deepen {
         return coarse.candidate;
     }
-    let mut params = with_ma_prune(
-        ma_learn_params_final(
-            min_symbol,
-            max_leaves,
-            coarse.max_candidates,
+    let mut params = with_value_tree(
+        with_ma_prune(
+            ma_learn_params_final(
+                min_symbol,
+                max_leaves,
+                coarse.max_candidates,
+                coarse.stride as f64,
+                use_wp,
+                !coarse.leaf_offsets,
+            ),
             coarse.stride as f64,
-            use_wp,
-            !coarse.leaf_offsets,
         ),
-        coarse.stride as f64,
+        coarse.value_tree,
     );
     if !speed.effort().tree_deep_final && coarse.stride > 1 {
         params.max_leaves = params.max_leaves.min(MA_LITE_MAX_LEAVES);
@@ -688,6 +711,7 @@ pub(super) fn learn_ma_candidate(
         max_leaves,
         max_candidates,
         leaf_offsets,
+        source.value_tree,
         pool,
         scratch,
     )

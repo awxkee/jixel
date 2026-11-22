@@ -153,6 +153,8 @@ pub(super) struct CoarseLearn {
     pub(super) max_candidates: usize,
     /// Leaf predictor offsets apply (RCT sources; palette indices lose).
     pub(super) leaf_offsets: bool,
+    /// `MaSource::value_tree`.
+    pub(super) value_tree: bool,
     pub(super) candidate: LearnedCandidate,
     /// The coarse tree saturated its leaf budget with a clear win, so the
     /// full-probe second stage is worth its cost.
@@ -341,6 +343,11 @@ pub(super) struct MaSource<'a> {
     /// channel covers `dim >> shift` columns or rows of a group).
     pub(super) hshift: u32,
     pub(super) vshift: u32,
+    /// Every leaf uses the Zero predictor without an offset, so the coded
+    /// residual is the sample itself. LZ77 copies residuals: under per-leaf
+    /// predictors those of a repeated pattern differ from one occurrence to
+    /// the next, and a screentone a period back is never matched.
+    pub(super) value_tree: bool,
     /// Per-AC-group channel overrides: a group whose entry is `Some` codes
     /// those channels (a group-local Palette transform declared in its own
     /// GroupHeader) instead of crops of `channels`. Empty means none.
@@ -658,6 +665,7 @@ pub(super) fn rgb_ma_source<'a>(
         transform: MaTransform::Rct(rct_type),
         hshift: 0,
         vshift: 0,
+        value_tree: false,
         group_channels: Vec::new(),
     }
 }

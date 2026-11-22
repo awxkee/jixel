@@ -32,6 +32,10 @@
 //! frame with its own tree, palette and RCT, and the base frame shows the
 //! rectangle filled with its border color, so the base keeps the palette and
 //! tree of the surrounding UI.
+//!
+//! [`plan`] marks tiles by rare colors (gradients, photos); [`plan_local`]
+//! also by local colors, which catches flat illustrations (icons, avatars,
+//! logos) whose antialiased colors repeat but only within the shape.
 
 use crate::encode_image::AlphaPlane;
 use crate::image::Image3Si;
@@ -50,6 +54,10 @@ const RICH_RARE_SHARE: f32 = 0.3;
 /// Distinct colors per tile pixel that make a tile rich (antialiased text
 /// sits at 0.1-0.2).
 const RICH_DISTINCT_SHARE: f32 = 0.25;
+/// A color whose occurrences all fall inside a box narrower and shorter
+/// than this is local to one shape: the fill and outline shades of an icon
+/// or avatar, unlike the text and UI colors spread across the screen.
+const LOCAL_SPAN: u32 = 128;
 /// Smallest rectangle worth its own frame.
 const MIN_REGION_PIXELS: usize = 4096;
 const MAX_REGIONS: usize = 8;
@@ -120,6 +128,33 @@ pub(crate) fn plan(
     alpha: Option<&AlphaPlane>,
     pool: &ThreadPool,
 ) -> Option<Vec<Region>> {
+    plan_tiles(linear, alpha, false, pool)
+}
+
+/// [`plan`] with local colors (see [`LOCAL_SPAN`]) counted as rare: flat
+/// illustrations become regions too.
+pub(crate) fn plan_local(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    pool: &ThreadPool,
+) -> Option<Vec<Region>> {
+    plan_tiles(linear, alpha, true, pool)
+}
+
+/// Per-color occurrence count and bounding box (`x0, y0, x1, y1`,
+/// inclusive).
+#[derive(Clone, Copy)]
+struct ColorStat {
+    count: u32,
+    bounds: [u32; 4],
+}
+
+fn plan_tiles(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    local: bool,
+    pool: &ThreadPool,
+) -> Option<Vec<Region>> {
     let alpha = match alpha {
         None => None,
         Some(AlphaPlane::U8(a)) => Some(a.as_slice()),
@@ -130,19 +165,46 @@ pub(crate) fn plan(
         return None;
     }
     let keys = pixel_keys(linear, alpha, pool);
-    let mut counts: ContentHashMap<u32> =
+    let mut counts: ContentHashMap<ColorStat> =
         ContentHashMap::with_capacity_and_hasher(4096, Default::default());
-    for &k in &keys {
-        *counts.entry(k).or_insert(0) += 1;
+    if local {
+        for (y, row) in keys.chunks_exact(w).enumerate() {
+            let y = y as u32;
+            for (x, &k) in row.iter().enumerate() {
+                let x = x as u32;
+                let stat = counts.entry(k).or_insert(ColorStat {
+                    count: 0,
+                    bounds: [x, y, x, y],
+                });
+                stat.count += 1;
+                let b = &mut stat.bounds;
+                *b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+            }
+        }
+    } else {
+        for &k in &keys {
+            counts
+                .entry(k)
+                .or_insert(ColorStat {
+                    count: 0,
+                    bounds: [0; 4],
+                })
+                .count += 1;
+        }
     }
+    let marked = |stat: &ColorStat| {
+        let b = stat.bounds;
+        stat.count < RARE_COUNT || (local && b[2] - b[0] < LOCAL_SPAN && b[3] - b[1] < LOCAL_SPAN)
+    };
     // The counts are complete: the per-pixel lookups and the tile rows are
-    // independent and run on the pool.
+    // independent and run on the pool. With `local`, local pixels count as
+    // rare from here on.
     const RARE_CHUNK: usize = 1 << 16;
     let mut rare = vec![false; keys.len()];
     let mut rare_chunks: Vec<&mut [bool]> = rare.chunks_mut(RARE_CHUNK).collect();
     pool.for_each_mut(&mut rare_chunks, |chunk, out| {
         for (pixel, key) in out.iter_mut().zip(&keys[chunk * RARE_CHUNK..]) {
-            *pixel = counts[key] < RARE_COUNT;
+            *pixel = marked(&counts[key]);
         }
     });
     drop(rare_chunks);
@@ -475,6 +537,44 @@ mod tests {
         let (c, _) = crop(&img, None, &r);
         assert_eq!((c.xsize(), c.ysize()), (120, 90));
         assert_eq!(c.plane_row(2, 7)[11], img.plane_row(2, 57)[81]);
+    }
+
+    /// A flat icon on the UI of [`screenshot`]: a filled disc with an
+    /// antialiased outline of four shades, every one used well over
+    /// `RARE_COUNT` times but only inside the icon.
+    fn icon_screenshot() -> Image3Si {
+        let mut img = screenshot(300, 200, (0, 0, 0, 0));
+        let (cx, cy) = (100i32, 95i32);
+        for y in 0..200 {
+            for x in 0..300 {
+                let d = (((x as i32 - cx).pow(2) + (y as i32 - cy).pow(2)) as f32).sqrt();
+                let p = match d as i32 {
+                    0..=31 => [90, 60, -70],
+                    32..=35 => {
+                        let shade = (d as i32 - 32) * 15;
+                        [shade, -shade / 3, 2 * shade]
+                    }
+                    _ => continue,
+                };
+                for c in 0..3 {
+                    img.plane_row_mut(c, y)[x] = p[c];
+                }
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn local_plan_finds_a_flat_icon_the_rare_plan_misses() {
+        let img = icon_screenshot();
+        let pool = ThreadPool::new(2);
+        assert_eq!(plan(&img, None, &pool), None);
+        let regions = plan_local(&img, None, &pool).expect("the icon");
+        assert_eq!(regions.len(), 1);
+        let r = regions[0];
+        assert!(r.x0 <= 65 && r.y0 <= 60, "{r:?}");
+        assert!(r.x0 + r.width >= 136 && r.y0 + r.height >= 131, "{r:?}");
+        assert!(r.width * r.height < 300 * 200 / 4, "{r:?}");
     }
 
     #[test]

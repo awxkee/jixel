@@ -70,6 +70,16 @@ pub(in crate::lossless) struct GlobalPalette {
 }
 
 impl GlobalPalette {
+    /// Two colors: a bi-level image.
+    pub(in crate::lossless) fn is_bilevel(&self) -> bool {
+        self.nb_colors == 2
+    }
+
+    /// [`screen_share`] of a bi-level palette's index image.
+    pub(in crate::lossless) fn screen_share(&self, xsize: usize, ysize: usize) -> f64 {
+        screen_share(|x, y| self.indices[y * xsize + x] != 0, xsize, ysize)
+    }
+
     pub(in crate::lossless) fn source(&self, xsize: usize, ysize: usize) -> MaSource<'_> {
         let nb_colors = self.nb_colors;
         MaSource {
@@ -95,9 +105,83 @@ impl GlobalPalette {
             },
             hshift: 0,
             vshift: 0,
+            value_tree: false,
             group_channels: Vec::new(),
         }
     }
+}
+
+/// A bi-level frame runs its Zero-predictor arms when at least this share
+/// of its busy 64-pixel spans is a repeated screen ([`screen_share`]).
+pub(in crate::lossless) const SCREEN_MIN_SHARE: f64 = 0.2;
+
+/// Rows above that a repeated span is looked for in.
+const SCREEN_REACH: usize = 16;
+
+/// Share of the busy 64-pixel spans of a bi-level image (neither all set
+/// nor all clear) that differ from the span right above and equal one 2 to
+/// [`SCREEN_REACH`] rows up: a dot screen repeating down the page. Strokes
+/// and rules repeat from the row above, which a tree predicts; a screen's
+/// rows repeat a period back, which only LZ77 reaches.
+pub(in crate::lossless) fn screen_share(
+    bit: impl Fn(usize, usize) -> bool,
+    xsize: usize,
+    ysize: usize,
+) -> f64 {
+    let spans = xsize / 64;
+    if spans == 0 || ysize <= SCREEN_REACH {
+        return 0.0;
+    }
+    let mut words = vec![0u64; spans * ysize];
+    for (y, row) in words.chunks_exact_mut(spans).enumerate() {
+        for (span, word) in row.iter_mut().enumerate() {
+            *word = (0..64).fold(0u64, |acc, i| acc << 1 | u64::from(bit(span * 64 + i, y)));
+        }
+    }
+    let (mut busy, mut screen) = (0usize, 0usize);
+    for y in SCREEN_REACH..ysize {
+        for span in 0..spans {
+            let word = words[y * spans + span];
+            if word == 0 || word == u64::MAX {
+                continue;
+            }
+            busy += 1;
+            if word != words[(y - 1) * spans + span]
+                && (2..=SCREEN_REACH).any(|d| word == words[(y - d) * spans + span])
+            {
+                screen += 1;
+            }
+        }
+    }
+    if busy == 0 {
+        0.0
+    } else {
+        screen as f64 / busy as f64
+    }
+}
+
+/// [`screen_share`] of an image of exactly two colors, `None` for any other.
+pub(in crate::lossless) fn bilevel_screen_share(linear: &Image3Si) -> Option<f64> {
+    let (xsize, ysize) = (linear.xsize(), linear.ysize());
+    if xsize == 0 || ysize == 0 {
+        return None;
+    }
+    let planes = [0, 1, 2].map(|c| linear.plane_data(c));
+    let color_at = |i: usize| planes.map(|p| p[i]);
+    let first = color_at(0);
+    let mut second = None;
+    for i in 0..xsize * ysize {
+        let color = color_at(i);
+        if color != first && *second.get_or_insert(color) != color {
+            return None;
+        }
+    }
+    second?;
+    Some(screen_share(
+        |x, y| color_at(y * xsize + x) != first,
+        xsize,
+        ysize,
+    ))
 }
 
 /// A two-color global palette with its index image packed two pixels to a
@@ -213,6 +297,7 @@ impl<'a> PackedPalette<'a> {
             },
             hshift,
             vshift,
+            value_tree: false,
             group_channels: Vec::new(),
         }
     }
