@@ -42,7 +42,7 @@ mod write;
 
 pub(crate) use ans::{
     ANS_LOG_TAB_SIZE, ANS_SIGNATURE, ANS_TAB_SIZE, AnsCoder, AnsEncSymbolInfo, AnsHistogram,
-    write_ans_tokens,
+    WIDE_TABLE_ENTRIES, write_ans_tokens,
 };
 pub(crate) use cluster::{
     ANS_CLUSTERS_LIMIT, CLUSTERS_LIMIT, FixedClusterScratch, cluster_histograms,
@@ -61,8 +61,9 @@ pub(crate) use token_stream::{AcTokens, TokenSlice};
 #[cfg(any(feature = "splines", test))]
 pub(crate) use write::optimize_entropy_code_ac;
 pub(crate) use write::{
-    AnsRefinement, HybridUintSamples, build_ans_code_parts, build_entropy_code_no_cluster,
-    build_huffman_codes, build_huffman_codes_into, optimize_entropy_code,
+    ANS_LOG_ALPHA_SIZE, AnsRefinement, HybridUintSamples, WIDE_LOG_ALPHA_SIZE,
+    build_ans_code_parts, build_entropy_code_no_cluster, build_huffman_codes,
+    build_huffman_codes_into, build_wide_ans_code_parts, optimize_entropy_code,
     optimize_entropy_code_ac_streams, optimize_entropy_code_ac_streams_fast,
     optimize_entropy_code_jpeg_ac_streams, raced_token_stream, recount_entropy_code,
     refine_ans_entropy_exhaustive, refine_entropy_bundle, write_brotli_prefix_code,

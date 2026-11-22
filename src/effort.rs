@@ -237,6 +237,9 @@ effort_gates! {
     /// coarse learn's best other order: complete estimates under the first
     /// layout, then complete frames when those are close.
     palette_order_race,
+    /// A frame of 4097 to 16384 colors learns a global palette beside its
+    /// other sources (`OrderRace::large`).
+    palette_large,
     tree_group_palette,
     tree_ctx_v1,
     /// Gradient and photo-like rectangles of a screenshot as cropped frames
@@ -367,6 +370,7 @@ static MEDIUM: Effort = Effort {
     learned_tree: true,
     tree_rank: true,
     tree_global_palette: true,
+    palette_large: true,
     tree_group_palette: true,
     ..FAST
 };

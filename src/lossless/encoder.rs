@@ -48,7 +48,6 @@ mod flat;
 mod trees;
 
 use super::context::{try_encode_context_tree_multi_group, try_encode_context_tree_single_group};
-use super::frame::keep_smaller_writer;
 use super::palette::{try_encode_local_palette_multi_group, try_encode_palette_single_group};
 use super::predictor::{
     GradPackInteriorFn, choose_predictors_with_wp, choose_wp_params, fixed_predictor,
@@ -589,15 +588,37 @@ impl<'a> ColorTransform<'a> {
     }
 }
 
-/// The smallest complete frame among the candidates written so far.
-#[derive(Default)]
+/// The smallest complete frame among the candidates written so far. A
+/// candidate may carry a credit below one: its size counts as that much
+/// smaller against the others, for a frame that decodes faster than they do.
 struct SmallestFrame {
     writer: Option<BitWriter>,
+    credit: f64,
+}
+
+impl Default for SmallestFrame {
+    fn default() -> Self {
+        Self {
+            writer: None,
+            credit: 1.0,
+        }
+    }
 }
 
 impl SmallestFrame {
     fn offer(&mut self, candidate: BitWriter) {
-        keep_smaller_writer(&mut self.writer, candidate);
+        self.offer_credited(candidate, 1.0);
+    }
+
+    /// `offer` with the candidate's size scaled by `credit` in every
+    /// comparison, this one and the later ones it is held through.
+    fn offer_credited(&mut self, candidate: BitWriter, credit: f64) {
+        if self.writer.as_ref().is_none_or(|held| {
+            candidate.bits_written() as f64 * credit < held.bits_written() as f64 * self.credit
+        }) {
+            self.writer = Some(candidate);
+            self.credit = credit;
+        }
     }
 
     fn bits(&self) -> Option<usize> {

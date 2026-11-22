@@ -383,7 +383,7 @@ mod tests {
     fn plan_detail_can_take_the_whole_image() {
         let (w, h) = (128, 128);
         let mut rgb = vec![250u8; w * h * 3];
-        for (i, px) in rgb.chunks_exact_mut(3).enumerate() {
+        for (i, px) in rgb.as_chunks_mut::<3>().0.iter_mut().enumerate() {
             let (x, y) = (i % w, i / w);
             if y % 7 < 4 && (x + y / 7) % 5 < 2 {
                 px.fill(20);

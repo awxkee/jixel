@@ -36,8 +36,9 @@ use super::{
 use crate::adaptive_quant::dirty_log2f;
 use crate::coder_scratch::{CoderScratch, LZ77_MAX_CONTEXTS, LzEntropyScratch};
 use crate::entropy::{
-    EntropyCode, Histogram, HybridUintConfig, PrefixCode, Token, build_huffman_codes_into,
-    cluster_histograms_fixed, f_log2, uint_encode, uint_encode_with_config,
+    EntropyCode, Histogram, HybridUintConfig, PrefixCode, Token, WIDE_TABLE_ENTRIES,
+    build_huffman_codes_into, cluster_histograms_fixed, f_log2, uint_encode,
+    uint_encode_with_config,
 };
 use crate::thread_pool::ThreadPool;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -91,6 +92,86 @@ where
 /// smaller than at 64, a 3.9K-colour illustration 0.6 %, the other 16 images
 /// of the check within 0.1 %.
 const LZ77_RAISED_MIN_SYMBOL: u32 = 84;
+
+/// First LZ77 symbol of a wide (256-symbol) code: 192 literal symbols, and
+/// room for every length symbol above them.
+const LZ77_WIDE_MIN_SYMBOL: u32 = 192;
+
+/// A wide code must lead the narrow one's sampled estimate by this factor.
+/// Without it, and tried on every code, a cat illustration and a 7.7 MP
+/// screenshot coded 0.05 % and 0.02 % larger; with it none of eight images
+/// grows and the three that gain (0.24 %, 0.33 %, 1.15 %) keep all of it.
+const LZ77_WIDE_MARGIN: f64 = 0.998;
+
+/// The clusters' 256-symbol counts under `configs`, for a wide code whose
+/// first LZ77 symbol is `min_symbol`. A cluster holding a literal at or above
+/// that symbol returns to the default configuration (valid under any
+/// `min_symbol` the callers pass) and everything is counted again.
+fn count_wide_histograms<T: LzTokenSource>(
+    streams: &[&[T]],
+    context_map: &[u8],
+    min_symbol: u32,
+    tail_counts: &[(u32, u32)],
+    pool: Option<&ThreadPool>,
+    configs: &mut [HybridUintConfig],
+) -> Vec<[u32; WIDE_TABLE_ENTRIES]> {
+    let distance_cluster = context_map[context_map.len() - 1] as usize;
+    loop {
+        let configs_ref: &[HybridUintConfig] = configs;
+        let (mut counts, valid) = parallel_streams(
+            streams,
+            pool,
+            || {
+                (
+                    vec![[0u32; WIDE_TABLE_ENTRIES]; configs_ref.len()],
+                    vec![true; configs_ref.len()],
+                )
+            },
+            |(acc, valid), toks| {
+                for tok in lz_tokens(toks) {
+                    let cluster = context_map[tok.context as usize] as usize;
+                    if tok.is_lz77() {
+                        let (length, _, _) = lz77_length_encode(tok.value);
+                        acc[cluster][(min_symbol + length) as usize] += 1;
+                        let (symbol, _, _) =
+                            uint_encode_with_config(tok.distance, configs_ref[distance_cluster]);
+                        acc[distance_cluster][symbol as usize] += 1;
+                    } else {
+                        let (symbol, _, _) =
+                            uint_encode_with_config(tok.value, configs_ref[cluster]);
+                        if symbol < min_symbol {
+                            acc[cluster][symbol as usize] += 1;
+                        } else {
+                            valid[cluster] = false;
+                        }
+                    }
+                }
+            },
+            |(acc, valid), (part, part_valid)| {
+                for (a, b) in acc.iter_mut().zip(&part) {
+                    for (x, y) in a.iter_mut().zip(b) {
+                        *x += y;
+                    }
+                }
+                for (a, b) in valid.iter_mut().zip(part_valid) {
+                    *a &= b;
+                }
+            },
+        );
+        if valid.iter().all(|&kept| kept) {
+            for &(context, count) in tail_counts {
+                counts[context_map[context as usize] as usize][0] += count;
+            }
+            return counts;
+        }
+        for (config, kept) in configs.iter_mut().zip(valid) {
+            if !kept {
+                debug_assert_ne!(*config, HybridUintConfig::DEFAULT);
+                *config = HybridUintConfig::DEFAULT;
+            }
+        }
+    }
+}
 
 /// Accumulate per raw context before clustering and return the extra bits.
 #[inline]
@@ -884,6 +965,8 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
     let histograms = &mut histograms[..num_clusters];
     let configs = &mut configs[..num_clusters];
     let mut lz_min_symbol = min_symbol;
+    // The clusters' 256-symbol counts when the code is a wide one.
+    let mut wide_counts: Option<Vec<[u32; WIDE_TABLE_ENTRIES]>> = None;
 
     if refined {
         let distance_cluster = context_map[distance_context as usize] as usize;
@@ -973,46 +1056,66 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
             // Any configuration whose literals stay below the first LZ77
             // symbol, beyond the fixed list searched above; then the same
             // with that symbol raised, kept when it codes smaller.
-            let (free, free_bits) = samples.select_free(
-                configs,
-                &maxima,
-                min_symbol,
-                pool,
-                &mut CoderScratch::lossless(),
-            );
-            if LZ77_RAISED_MIN_SYMBOL > min_symbol {
-                let (raised, raised_bits) = samples.select_free(
+            // Last, a wide code: 256 symbols with the first LZ77 symbol at
+            // 192, for one more header bit per cluster.
+            let search = |limit: u32, wide: bool| {
+                samples.select_free(
                     configs,
                     &maxima,
-                    LZ77_RAISED_MIN_SYMBOL,
+                    limit,
+                    wide,
                     pool,
                     &mut CoderScratch::lossless(),
-                );
-                if raised_bits < free_bits {
-                    configs.copy_from_slice(&raised);
+                )
+            };
+            let (mut best, mut best_bits) = search(min_symbol, false);
+            if LZ77_RAISED_MIN_SYMBOL > min_symbol {
+                let (raised, raised_bits) = search(LZ77_RAISED_MIN_SYMBOL, false);
+                if raised_bits < best_bits {
+                    (best, best_bits) = (raised, raised_bits);
                     lz_min_symbol = LZ77_RAISED_MIN_SYMBOL;
                 }
             }
-            if lz_min_symbol == min_symbol {
-                configs.copy_from_slice(&free);
+            // Only a code the raised symbol already helped is short of
+            // literal symbols.
+            if LZ77_WIDE_MIN_SYMBOL > min_symbol && lz_min_symbol != min_symbol {
+                let (wide, wide_bits) = search(LZ77_WIDE_MIN_SYMBOL, true);
+                if wide_bits < best_bits * LZ77_WIDE_MARGIN {
+                    best = wide;
+                    lz_min_symbol = LZ77_WIDE_MIN_SYMBOL;
+                    wide_counts = Some(Vec::new());
+                }
             }
+            configs.copy_from_slice(&best);
         }
-        rebuild_lz_histograms(
-            streams,
-            context_map_ref,
-            lz_min_symbol,
-            &tail_counts,
-            pool,
-            configs,
-            histograms,
-            lz_min_symbol != min_symbol,
-        );
+        if wide_counts.is_some() {
+            wide_counts = Some(count_wide_histograms(
+                streams,
+                context_map_ref,
+                lz_min_symbol,
+                &tail_counts,
+                pool,
+                configs,
+            ));
+        } else {
+            rebuild_lz_histograms(
+                streams,
+                context_map_ref,
+                lz_min_symbol,
+                &tail_counts,
+                pool,
+                configs,
+                histograms,
+                lz_min_symbol != min_symbol,
+            );
+        }
     } else {
         configs.fill(crate::entropy::HybridUintConfig::DEFAULT);
     }
 
     finish_lz_entropy(
         histograms,
+        wide_counts.as_deref(),
         prefix_codes,
         &context_map[..num_contexts],
         configs,
@@ -1026,6 +1129,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
 // Code construction no longer depends on the input token representation.
 fn finish_lz_entropy<'a>(
     histograms: &[Histogram],
+    wide_counts: Option<&[[u32; WIDE_TABLE_ENTRIES]]>,
     prefix_codes: &'a mut Vec<PrefixCode>,
     context_map: &'a [u8],
     configs: &'a [crate::entropy::HybridUintConfig],
@@ -1038,7 +1142,13 @@ fn finish_lz_entropy<'a>(
     let num_clusters = histograms.len();
     grow_entropy_scratch(prefix_codes, num_clusters, PrefixCode::zero());
     let prefix_codes = &mut prefix_codes[..num_clusters];
-    build_huffman_codes_into(histograms, prefix_codes, huffman_pool);
+    if wide_counts.is_some() {
+        // A wide code is ANS-only; `histograms` no longer describe it.
+        debug_assert!(use_ans);
+        prefix_codes.fill(PrefixCode::zero());
+    } else {
+        build_huffman_codes_into(histograms, prefix_codes, huffman_pool);
+    }
 
     // Apply the single-symbol patch (mirrors build_pixel_code) per cluster so
     // that contexts with one unique symbol still emit a parseable code.
@@ -1067,7 +1177,10 @@ fn finish_lz_entropy<'a>(
         }
     }
     if use_ans {
-        let (hists, symbols, reverse_maps) = crate::entropy::build_ans_code_parts(histograms, true);
+        let (hists, symbols, reverse_maps) = match wide_counts {
+            Some(counts) => crate::entropy::build_wide_ans_code_parts(counts),
+            None => crate::entropy::build_ans_code_parts(histograms, true),
+        };
         ans.histograms = hists;
         ans.symbols = symbols;
         ans.reverse_maps = reverse_maps;
@@ -1089,6 +1202,11 @@ fn finish_lz_entropy<'a>(
         ans_symbols: &ans.symbols,
         ans_reverse_maps: &ans.reverse_maps,
         lz_min_symbol,
+        ans_log_alpha: if wide_counts.is_some() {
+            crate::entropy::WIDE_LOG_ALPHA_SIZE
+        } else {
+            crate::entropy::ANS_LOG_ALPHA_SIZE
+        },
     }
 }
 
@@ -1227,6 +1345,65 @@ mod tests {
         second.add(LZ77_RAISED_MIN_SYMBOL + length_3);
         assert_eq!(histograms[1].counts, second.counts);
         assert_eq!(histograms[2].counts, defaults[2].counts);
+    }
+
+    #[test]
+    fn wide_counts_hold_symbols_past_127_and_fall_back_together() {
+        // Four token bits beyond the exponent: 3000 is symbol 135.
+        let wide = HybridUintConfig {
+            split_exponent: 4,
+            msb_in_token: 4,
+            lsb_in_token: 0,
+        };
+        assert_eq!(crate::entropy::uint_encode_with_config(3000, wide).0, 135);
+        // Eight token bits put a 21-bit value past the first LZ77 symbol.
+        let overflowing = HybridUintConfig {
+            split_exponent: 8,
+            msb_in_token: 8,
+            lsb_in_token: 0,
+        };
+        let big = 1 << 20;
+        assert!(
+            crate::entropy::uint_encode_with_config(big, overflowing).0 >= LZ77_WIDE_MIN_SYMBOL
+        );
+        let tokens = [
+            LzToken::pixel(0, 3000),
+            LzToken::lz77(0, 20, 150),
+            LzToken::pixel(1, big),
+            LzToken::pixel(1, 5),
+        ];
+        let streams = [tokens.as_slice()];
+        let pool = ThreadPool::new_lossless(2);
+        for pool in [None, Some(&pool)] {
+            let mut configs = [wide, overflowing, HybridUintConfig::DEFAULT];
+            let counts = count_wide_histograms(
+                &streams,
+                &[0, 1, 2],
+                LZ77_WIDE_MIN_SYMBOL,
+                &[(1, 7)],
+                pool,
+                &mut configs,
+            );
+            assert_eq!(
+                configs,
+                [wide, HybridUintConfig::DEFAULT, HybridUintConfig::DEFAULT]
+            );
+            let mut first = [0u32; WIDE_TABLE_ENTRIES];
+            first[135] = 1;
+            first[(LZ77_WIDE_MIN_SYMBOL + lz77_length_encode(20).0) as usize] = 1;
+            assert_eq!(counts[0], first);
+            // The second cluster is counted under the default, tail included.
+            let mut second = [0u32; WIDE_TABLE_ENTRIES];
+            second[0] = 7;
+            second[5] += 1;
+            second[uint_encode(big).0 as usize] += 1;
+            assert_eq!(counts[1], second);
+            let mut distance = [0u32; WIDE_TABLE_ENTRIES];
+            distance[uint_encode(150).0 as usize] = 1;
+            assert_eq!(counts[2], distance);
+        }
+        let longest = lz77_length_encode(u32::MAX).0;
+        assert!(LZ77_WIDE_MIN_SYMBOL + longest < WIDE_TABLE_ENTRIES as u32);
     }
 
     #[test]

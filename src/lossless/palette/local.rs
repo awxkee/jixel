@@ -475,8 +475,8 @@ pub(in crate::lossless) fn local_palette_order_candidates(
         return Vec::new();
     }
     let cooc = index_cooccurrence(&group.indices, group.w, group.h, n);
-    let chain = cooccurrence_chain_path(n, &cooc);
-    let tour = improve_chain_tour(n, &cooc, chain.clone());
+    let chain = cooccurrence_chain_path(&cooc);
+    let tour = improve_chain_tour(&cooc, chain.clone());
     let mut orders = vec![order_of_path(&chain)];
     if tour != chain {
         orders.push(order_of_path(&tour));

@@ -153,7 +153,7 @@ mod tests {
                     .collect();
 
                 let (mut expected, mut actual) = (items.clone(), items.clone());
-                expected.sort_by(|a, b| b.0.cmp(&a.0));
+                expected.sort_by_key(|a| std::cmp::Reverse(a.0));
                 actual.shared_sort_by(|a, b| b.0.cmp(&a.0));
                 assert_eq!(actual, expected, "sort_by len {len}");
 

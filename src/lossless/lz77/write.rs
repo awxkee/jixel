@@ -230,7 +230,8 @@ pub(in crate::lossless) fn write_lz_token(
 /// Write the LZ77 sub-bundle (matches `LZ77Params::VisitFields` and `DecodeUintConfig`):
 ///   1 bit:  enabled = 1
 ///   U32 min_symbol:  U32(Val(224), Val(512), Val(4096), BitsOffset(15, 8))
-///                    For LZ77_MIN_SYMBOL = 64: selector 3 → "11" + 15 bits (64 - 8) = 56
+///                    Every value in use (64, or a code's raised 84 or 192) takes
+///                    selector 3 → "11" + 15 bits of `min_symbol - 8`
 ///   U32 min_length:  U32(Val(3), Val(4), BitsOffset(2, 5), BitsOffset(8, 9))
 ///                    For LZ77_MIN_LENGTH = 3: selector 0 → "00"
 ///   length_uint_config: DecodeUintConfig(log_alpha_size = 8).
@@ -239,7 +240,8 @@ pub(in crate::lossless) fn write_lz_token(
 ///                       lsb_in_token = 0 (in CeilLog2(4-0+1) = 3 bits = "000").
 fn write_lz77_header(min_symbol: u32, w: &mut BitWriter) {
     w.write(1, 1); // enabled
-    // min_symbol: selector 3 (Bits(15) + 8), value 64 → payload = 56
+    // min_symbol: selector 3 (Bits(15) + 8)
+    debug_assert!((8..8 + (1 << 15)).contains(&min_symbol));
     w.write(2, 0b11);
     w.write(15, (min_symbol - 8) as u64);
     // min_length: selector 0 (Val(3))

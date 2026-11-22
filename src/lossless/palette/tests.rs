@@ -31,9 +31,9 @@
 
 use super::super::rct::inverse_ycocg;
 use super::global::{
-    PackedPalette, SCREEN_MIN_SHARE, bilevel_screen_share, build_global_palette,
-    cooccurrence_chain_path, estimate_index_plane_cost, improve_chain_tour, index_cost_rows,
-    path_cooccurrence, screen_share,
+    Cooccurrence, PackedPalette, SCREEN_MIN_SHARE, bilevel_screen_share, build_global_palette,
+    cooccurrence, cooccurrence_chain_path, estimate_index_plane_cost, improve_chain_tour,
+    index_cost_rows, path_cooccurrence, ramp_path, screen_share,
 };
 use super::visit_palette_colors;
 use crate::coder_scratch::CoderScratch;
@@ -149,14 +149,15 @@ fn chain_tour_never_lowers_the_path_cooccurrence() {
                     cooc[b * n + a] = weight;
                 }
             }
-            let chain = cooccurrence_chain_path(n, &cooc);
-            let tour = improve_chain_tour(n, &cooc, chain.clone());
+            let cooc = Cooccurrence::from_dense(n, cooc);
+            let chain = cooccurrence_chain_path(&cooc);
+            let tour = improve_chain_tour(&cooc, chain.clone());
             let mut sorted = tour.clone();
             sorted.sort_unstable();
             assert_eq!(sorted, (0..n).collect::<Vec<_>>());
             let (before, after) = (
-                path_cooccurrence(n, &cooc, &chain),
-                path_cooccurrence(n, &cooc, &tour),
+                path_cooccurrence(&cooc, &chain),
+                path_cooccurrence(&cooc, &tour),
             );
             assert!(after >= before, "{after} < {before} at n={n}");
             strictly_better += usize::from(after > before);
@@ -379,4 +380,47 @@ fn screen_share_tells_a_dot_screen_from_strokes() {
     assert!(bilevel_screen_share(&linear).is_none());
     let flat = Image3Si::new(w, h);
     assert!(bilevel_screen_share(&flat).is_none());
+}
+
+/// Two flat colors with a fourteen-step blend between them.
+#[test]
+fn ramp_order_keeps_a_blend_contiguous_and_pair_counts_match_the_dense_matrix() {
+    let (w, h) = (64usize, 48usize);
+    // Canonical colors: 0 and 15 flat, 1..=14 their blend.
+    let colors: Vec<[i32; 4]> = (0..16).map(|i| [i * 16, i * 12, 10, 255]).collect();
+    let mut indices = vec![0u16; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            // The blend crosses the edge on three rows only: rarer than an
+            // anchor.
+            indices[y * w + x] = match x {
+                0..=20 => 0,
+                21..=34 if y < 3 => (x - 20) as u16,
+                21..=27 => 0,
+                _ => 15,
+            };
+        }
+    }
+    let n = colors.len();
+    let path = ramp_path(&colors, &indices, w).expect("two anchors");
+    let mut sorted = path.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, (0..n).collect::<Vec<_>>());
+    let at = |c: usize| path.iter().position(|&p| p == c).unwrap() as i64;
+    let step = at(1) - at(0);
+    assert_eq!(step.abs(), 1);
+    for c in 1..16 {
+        assert_eq!(at(c) - at(c - 1), step, "blend color {c}");
+    }
+
+    let (dense, sparse) = (
+        cooccurrence(&indices, w, h, n, true),
+        cooccurrence(&indices, w, h, n, false),
+    );
+    for a in 0..n {
+        assert_eq!(dense.row(a), sparse.row(a));
+        for b in 0..n {
+            assert_eq!(dense.get(a, b), sparse.get(a, b));
+        }
+    }
 }
