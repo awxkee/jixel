@@ -122,8 +122,8 @@ pub(super) fn write_local_tree_sections(
     let max_candidates = source.max_candidates();
     let leaf_offsets = matches!(source.transform, MaTransform::Rct(_));
     let group_rect = |group_index: usize| {
-        let x0 = (group_index % xsize_groups) * gdim;
-        let y0 = (group_index / xsize_groups) * gdim;
+        let x0 = (group_index % xsize_groups) * source.group_columns(gdim);
+        let y0 = (group_index / xsize_groups) * source.group_rows(gdim);
         (x0, y0)
     };
 
@@ -144,7 +144,8 @@ pub(super) fn write_local_tree_sections(
             let group_values: usize = sampled()
                 .map(|p| {
                     let ch = &source.channels[p.channel];
-                    gdim.min(ch.w - x0) * gdim.min(ch.h - y0)
+                    source.group_columns(gdim).min(ch.w - x0)
+                        * source.group_rows(gdim).min(ch.h - y0)
                 })
                 .sum();
             let mut stride = group_values.div_ceil(target).max(1);
@@ -154,14 +155,18 @@ pub(super) fn write_local_tree_sections(
             let capacity = sampled()
                 .map(|p| {
                     let ch = &source.channels[p.channel];
-                    ma_channel_sample_count(gdim.min(ch.w - x0), gdim.min(ch.h - y0), stride)
+                    ma_channel_sample_count(
+                        source.group_columns(gdim).min(ch.w - x0),
+                        source.group_rows(gdim).min(ch.h - y0),
+                        stride,
+                    )
                 })
                 .sum();
             let mut samples = MaSamples::with_capacity(capacity);
             for p in sampled() {
                 let ch = &source.channels[p.channel];
-                let gw = gdim.min(ch.w - x0);
-                let gh = gdim.min(ch.h - y0);
+                let gw = source.group_columns(gdim).min(ch.w - x0);
+                let gh = source.group_rows(gdim).min(ch.h - y0);
                 let refs = source.ref_planes(placement, p, x0, y0);
                 with_ma_pixels!(ch, |pixels| sample_channel_ma(
                     |y| &pixels[(y0 + y) * ch.w + x0..][..gw],
@@ -236,7 +241,8 @@ pub(super) fn write_local_tree_sections(
                 .iter()
                 .map(|p| {
                     let ch = &source.channels[p.channel];
-                    gdim.min(ch.w - x0) * gdim.min(ch.h - y0)
+                    source.group_columns(gdim).min(ch.w - x0)
+                        * source.group_rows(gdim).min(ch.h - y0)
                 })
                 .sum();
             let mut toks = RawTokens::with_capacity(num_values);
@@ -244,8 +250,10 @@ pub(super) fn write_local_tree_sections(
             for p in placement {
                 let ch = &source.channels[p.channel];
                 if ch.constant.is_some() {
-                    tail = cands_ref[group_index]
-                        .constant_tail(gdim.min(ch.w - x0), gdim.min(ch.h - y0));
+                    tail = cands_ref[group_index].constant_tail(
+                        source.group_columns(gdim).min(ch.w - x0),
+                        source.group_rows(gdim).min(ch.h - y0),
+                    );
                     continue;
                 }
                 tokenize_ma_rect(
@@ -255,8 +263,8 @@ pub(super) fn write_local_tree_sections(
                     ac_stream_id(num_dc_groups, group_index),
                     x0,
                     y0,
-                    gdim.min(ch.w - x0),
-                    gdim.min(ch.h - y0),
+                    source.group_columns(gdim).min(ch.w - x0),
+                    source.group_rows(gdim).min(ch.h - y0),
                     &cands_ref[group_index],
                     wp_params,
                     use_wp,

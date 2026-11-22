@@ -319,12 +319,28 @@ pub(super) enum MaTransform {
     /// Global palette over `num_c` components: channel 0 is the palette
     /// meta-channel (`nb_colors` x `num_c`), channel 1 the index image.
     Palette { num_c: u32, nb_colors: u32 },
+    /// A two-color global palette whose index image is packed two pixels to
+    /// a sample: Palette, one Squeeze of the index channel (`horizontal` or
+    /// vertical), then a Palette of `packed_colors` entries over the average
+    /// and residual channels. Channel 0 is the second palette's meta-channel
+    /// (`packed_colors` x 2), channel 1 the first one's, channel 2 the
+    /// half-size index image.
+    PackedPalette {
+        num_c: u32,
+        nb_colors: u32,
+        packed_colors: u32,
+        horizontal: bool,
+    },
 }
 
 /// The modular channels of a frame plus their transform.
 pub(super) struct MaSource<'a> {
     pub(super) channels: Vec<MaChannel<'a>>,
     pub(super) transform: MaTransform,
+    /// Horizontal and vertical shifts of the non-meta channels (a squeezed
+    /// channel covers `dim >> shift` columns or rows of a group).
+    pub(super) hshift: u32,
+    pub(super) vshift: u32,
     /// Per-AC-group channel overrides: a group whose entry is `Some` codes
     /// those channels (a group-local Palette transform declared in its own
     /// GroupHeader) instead of crops of `channels`. Empty means none.
@@ -360,6 +376,20 @@ pub(super) struct MaPlacement {
 }
 
 impl MaSource<'_> {
+    /// Columns of a non-meta channel that one group of `gdim` frame pixels
+    /// holds.
+    #[inline]
+    pub(super) fn group_columns(&self, gdim: usize) -> usize {
+        gdim >> self.hshift
+    }
+
+    /// Rows of a non-meta channel that one group of `gdim` frame pixels
+    /// holds.
+    #[inline]
+    pub(super) fn group_rows(&self, gdim: usize) -> usize {
+        gdim >> self.vshift
+    }
+
     /// Leaf budget of a final learn: the constant channel's leaf, added when
     /// the tree is written, must fit the context limit too.
     pub(super) fn max_leaves(&self) -> usize {
@@ -369,7 +399,9 @@ impl MaSource<'_> {
     /// Split candidates the learner should evaluate for this source.
     pub(super) fn max_candidates(&self) -> usize {
         match self.transform {
-            MaTransform::Palette { .. } => MA_PALETTE_CANDIDATES,
+            MaTransform::Palette { .. } | MaTransform::PackedPalette { .. } => {
+                MA_PALETTE_CANDIDATES
+            }
             MaTransform::Rct(_) => MA_PHOTO_CANDIDATES,
         }
     }
@@ -393,6 +425,27 @@ impl MaSource<'_> {
             }
             MaTransform::Palette { num_c, nb_colors } => {
                 write_palette_transform(num_c, nb_colors, w)
+            }
+            MaTransform::PackedPalette {
+                num_c,
+                nb_colors,
+                packed_colors,
+                horizontal,
+            } => {
+                // transforms count U32(Val(0), Val(1), BitsOffset(4, 2), ..) = 3.
+                w.write(2, 0b10);
+                w.write(4, 1);
+                palette::write_palette_transform_entry(0, num_c, nb_colors, w);
+                super::squeeze::write_squeeze_transform_entry(
+                    &[crate::squeeze::SqueezeStep {
+                        horizontal,
+                        in_place: true,
+                        begin_c: 1,
+                        num_c: 1,
+                    }],
+                    w,
+                );
+                palette::write_palette_transform_entry(1, 2, packed_colors, w);
             }
         }
     }
@@ -603,6 +656,8 @@ pub(super) fn rgb_ma_source<'a>(
     MaSource {
         channels,
         transform: MaTransform::Rct(rct_type),
+        hshift: 0,
+        vshift: 0,
         group_channels: Vec::new(),
     }
 }

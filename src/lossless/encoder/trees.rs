@@ -57,7 +57,7 @@ use crate::lossless::ma_source::{
     rgb_ma_source, source_values_of,
 };
 use crate::lossless::palette::{
-    self, GlobalPalette, OrderRace, PALETTE_COARSE_MARGIN, PALETTE_FINAL_MARGIN,
+    self, GlobalPalette, OrderRace, PALETTE_COARSE_MARGIN, PALETTE_FINAL_MARGIN, PackedPalette,
     build_global_palettes,
 };
 use crate::patches::ModularFrameKind;
@@ -664,6 +664,32 @@ impl Tournament {
     ) {
         let first_stage = sources.palette_stage.take();
         let source = palette.source(frame.xsize, frame.ysize);
+        // A bi-level frame also codes its index image two pixels to a
+        // sample; the smaller written frame stays.
+        if let Some(packed) = PackedPalette::new(palette, frame.xsize, frame.ysize) {
+            let packed_source = packed.source(frame.xsize, frame.ysize);
+            if let Some((layout, cand, _)) = self.learn_palette_layouts(
+                frame,
+                sources,
+                &packed_source,
+                &layouts.all,
+                None,
+                pool,
+                scratch,
+            ) {
+                self.write_palette(
+                    frame,
+                    color,
+                    sources,
+                    &packed_source,
+                    layout,
+                    &cand,
+                    best,
+                    pool,
+                    scratch,
+                );
+            }
+        }
         let Some(raced) = raced else {
             if let Some((layout, cand, coarse)) = self.learn_palette_layouts(
                 frame,

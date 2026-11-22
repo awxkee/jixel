@@ -544,9 +544,15 @@ pub(super) fn learn_ma_candidate(
     }
     let num_dc_groups = xsize.div_ceil(layout.lf_dim()) * ysize.div_ceil(layout.lf_dim());
     let mut jobs: Vec<Job> = Vec::new();
+    // A packed palette has two meta channels of a few samples each. A
+    // subsampled learn keeps one of them or none, and a node holding a
+    // single stray sample of another channel may only split on the channel,
+    // which never pays: the tree would stop at its root. Their values code
+    // under whatever leaves the index image's tree routes them to.
+    let skip_meta = matches!(source.transform, MaTransform::PackedPalette { .. });
     for p in placement.iter().filter(|p| p.global) {
         let ch = &source.channels[p.channel];
-        if ch.constant.is_some() {
+        if ch.constant.is_some() || (skip_meta && ch.meta) {
             continue;
         }
         jobs.push(Job {
@@ -563,8 +569,8 @@ pub(super) fn learn_ma_candidate(
     }
     if num_groups > 1 {
         for group_index in 0..num_groups {
-            let x0 = (group_index % xsize_groups) * gdim;
-            let y0 = (group_index / xsize_groups) * gdim;
+            let x0 = (group_index % xsize_groups) * source.group_columns(gdim);
+            let y0 = (group_index / xsize_groups) * source.group_rows(gdim);
             if let Some(over) = source.group_override(group_index) {
                 // A palettised group codes its own channels whole; reference
                 // properties would compare a color table with an index
@@ -597,8 +603,8 @@ pub(super) fn learn_ma_candidate(
                     group_override: None,
                     x0,
                     y0,
-                    w: gdim.min(ch.w - x0),
-                    h: gdim.min(ch.h - y0),
+                    w: source.group_columns(gdim).min(ch.w - x0),
+                    h: source.group_rows(gdim).min(ch.h - y0),
                 });
             }
         }

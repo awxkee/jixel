@@ -31,8 +31,8 @@
 
 use super::super::rct::inverse_ycocg;
 use super::global::{
-    build_global_palette, cooccurrence_chain_path, estimate_index_plane_cost, improve_chain_tour,
-    index_cost_rows, path_cooccurrence,
+    PackedPalette, build_global_palette, cooccurrence_chain_path, estimate_index_plane_cost,
+    improve_chain_tour, index_cost_rows, path_cooccurrence,
 };
 use super::visit_palette_colors;
 use crate::coder_scratch::CoderScratch;
@@ -247,4 +247,102 @@ fn palette_scan_matches_indexed_crops_and_early_rejection() {
             }
         }
     }
+}
+
+/// A gray plane of `levels` values chosen by `level_at`.
+fn gray_plane(w: usize, h: usize, level_at: impl Fn(usize, usize) -> i32) -> Image3Si {
+    let mut linear = Image3Si::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            linear.plane_row_mut(0, y)[x] = level_at(x, y);
+        }
+    }
+    linear
+}
+
+#[test]
+fn packed_palette_inverts_through_the_decoder_squeeze() {
+    let pool = ThreadPool::new_lossless(2);
+    let mut scratch = CoderScratch::lossless();
+    let (w, h) = (38, 11);
+    let bilevel = |x: usize, y: usize| 255 * i32::from((x * x + 3 * y + x / 5) % 3 == 0);
+    let linear = gray_plane(w, h, bilevel);
+    let palette = build_global_palette(&linear, None, 1, w, h, &pool, &mut scratch).unwrap();
+    assert_eq!(palette.nb_colors, 2);
+    let packed = PackedPalette::new(&palette, w, h).unwrap();
+    assert_eq!(packed.packed_colors, 4);
+    assert_eq!(packed.indices.len(), w / 2 * h);
+    // The decoder's inverse horizontal Squeeze with a zero smoothing term.
+    let unpacked: Vec<u16> = packed
+        .indices
+        .iter()
+        .flat_map(|&index| {
+            let average = packed.tuples[usize::from(index)];
+            let residual = packed.tuples[packed.packed_colors + usize::from(index)];
+            let parity = if residual > 0 {
+                -(residual & 1)
+            } else {
+                residual & 1
+            };
+            let left = (2 * average + residual + parity) >> 1;
+            [left as u16, (left - residual) as u16]
+        })
+        .collect();
+    assert_eq!(unpacked, palette.indices);
+    let source = packed.source(w, h);
+    assert!(packed.horizontal);
+    assert_eq!((source.hshift, source.vshift), (1, 0));
+    assert_eq!(
+        source
+            .channels
+            .iter()
+            .map(|c| (c.w, c.h, c.meta))
+            .collect::<Vec<_>>(),
+        [(4, 2, true), (2, 1, true), (w / 2, h, false)]
+    );
+
+    // An odd width pairs along columns when the height is even.
+    let (w, h) = (37, 12);
+    let linear = gray_plane(w, h, bilevel);
+    let palette = build_global_palette(&linear, None, 1, w, h, &pool, &mut scratch).unwrap();
+    let packed = PackedPalette::new(&palette, w, h).unwrap();
+    assert!(!packed.horizontal);
+    let source = packed.source(w, h);
+    assert_eq!((source.hshift, source.vshift), (0, 1));
+    assert_eq!((source.channels[2].w, source.channels[2].h), (w, h / 2));
+    for (i, &index) in packed.indices.iter().enumerate() {
+        let (x, y) = (i % w, i / w);
+        let average = packed.tuples[usize::from(index)];
+        let residual = packed.tuples[packed.packed_colors + usize::from(index)];
+        let top = (2 * average
+            + residual
+            + if residual > 0 {
+                -(residual & 1)
+            } else {
+                residual & 1
+            })
+            >> 1;
+        assert_eq!(top as u16, palette.indices[2 * y * w + x]);
+        assert_eq!(
+            (top - residual) as u16,
+            palette.indices[(2 * y + 1) * w + x]
+        );
+    }
+
+    // Sizes odd both ways, and palettes of another size, stay unpacked.
+    let (w, h) = (38, 11);
+    let odd = gray_plane(w - 1, h, bilevel);
+    let odd_palette = build_global_palette(&odd, None, 1, w - 1, h, &pool, &mut scratch).unwrap();
+    assert!(PackedPalette::new(&odd_palette, w - 1, h).is_none());
+    let three = gray_plane(w, h, |x, y| 100 * ((x + y) % 3) as i32);
+    let three_palette = build_global_palette(&three, None, 1, w, h, &pool, &mut scratch).unwrap();
+    assert!(PackedPalette::new(&three_palette, w, h).is_none());
+
+    // A plane without one of the four pairs keeps a shorter second palette.
+    let stripes = gray_plane(w, h, |x, _| 255 * (x % 2) as i32);
+    let stripes_palette =
+        build_global_palette(&stripes, None, 1, w, h, &pool, &mut scratch).unwrap();
+    let packed = PackedPalette::new(&stripes_palette, w, h).unwrap();
+    assert_eq!(packed.packed_colors, 1);
+    assert!(packed.indices.iter().all(|&index| index == 0));
 }

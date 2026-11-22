@@ -99,7 +99,10 @@ pub(crate) fn write_modular_transforms_squeeze_palette(
 }
 
 /// One Squeeze transform entry with an explicit step sequence.
-fn write_squeeze_transform_entry(steps: &[crate::squeeze::SqueezeStep], w: &mut BitWriter) {
+pub(crate) fn write_squeeze_transform_entry(
+    steps: &[crate::squeeze::SqueezeStep],
+    w: &mut BitWriter,
+) {
     w.write(2, 0b10); // id = kSqueeze
     // num_squeezes: U32(Val0, BitsOffset(4,1), BitsOffset(6,9), BitsOffset(8,41)).
     let n = steps.len() as u32;
@@ -139,7 +142,7 @@ fn write_squeeze_transform_entry(steps: &[crate::squeeze::SqueezeStep], w: &mut 
 /// pyramid to the RCT'd channels, then tokenizes the resulting channels with
 /// fixed Weighted prediction in Fast mode or adaptive prediction in Slow mode.
 /// The decoder reconstructs the input exactly through inverse-Squeeze + inverse-RCT.
-pub(super) fn encode_squeeze_single_group(
+pub(crate) fn encode_squeeze_single_group(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
     xsize: usize,
