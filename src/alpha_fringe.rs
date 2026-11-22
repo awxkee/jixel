@@ -30,6 +30,10 @@
 //! Near-transparent fringe of a lossy alpha plane: the faint samples
 //! resampling leaves around a cut-out are cleared before coding, which makes
 //! their pixels invisible and frees their color as well.
+//!
+//! The same pass at the other end fills a faint deficit below full opacity
+//! (a dithered 254 / 255 backdrop), which otherwise costs a textured plane
+//! for an invisible change.
 
 /// Largest alpha the fringe pass clears, in 8-bit levels.
 const REACH: u32 = 4;
@@ -38,12 +42,18 @@ const WINDOW_RADIUS: usize = 4;
 /// The mean cleared alpha over that window stays within one 8-bit level in
 /// this many.
 const MEAN_DIVISOR: u64 = 2;
+/// The near-opaque fill runs only when it would change at least one sample
+/// in this many: on fewer it removes no texture worth its bytes, and sparse
+/// fills cost more than they save on patterned planes.
+const FILL_SHARE: usize = 12;
 
 /// An alpha sample of any integer depth.
 pub(crate) trait AlphaSample: Copy {
     const ZERO: Self;
 
     fn level(self) -> u32;
+
+    fn from_level(level: u32) -> Self;
 }
 
 impl AlphaSample for u8 {
@@ -52,6 +62,11 @@ impl AlphaSample for u8 {
     #[inline]
     fn level(self) -> u32 {
         u32::from(self)
+    }
+
+    #[inline]
+    fn from_level(level: u32) -> Self {
+        level as u8
     }
 }
 
@@ -62,22 +77,66 @@ impl AlphaSample for u16 {
     fn level(self) -> u32 {
         u32::from(self)
     }
+
+    #[inline]
+    fn from_level(level: u32) -> Self {
+        level as u16
+    }
 }
 
 /// Clears the near-transparent fringe of a lossy alpha plane, as resampling
-/// leaves around a cut-out; `max` is the full-opacity sample value.
+/// leaves around a cut-out, and fills a faint deficit below full opacity;
+/// `max` is the full-opacity sample value.
 pub(crate) fn clear<T: AlphaSample>(alpha: &mut [T], width: usize, height: usize, max: u32) {
     if width == 0 || height == 0 {
         return;
     }
     let alpha = &mut alpha[..width * height];
+    sweep(alpha, width, height, max, |level| level, T::ZERO);
+
+    // Most planes have no broad near-opaque area and leave here.
+    let reach = REACH * max / 255;
+    let near_opaque = alpha
+        .iter()
+        .filter(|a| (1..=reach).contains(&(max - a.level().min(max))))
+        .count();
+    if near_opaque * FILL_SHARE < alpha.len() {
+        return;
+    }
+    let mut filled = alpha.to_vec();
+    let opaque = T::from_level(max);
+    let changed = sweep(
+        &mut filled,
+        width,
+        height,
+        max,
+        |level| max - level.min(max),
+        opaque,
+    );
+    if changed * FILL_SHARE >= alpha.len() {
+        alpha.copy_from_slice(&filled);
+    }
+}
+
+/// Replaces the samples whose `distance` from one end of the range is at
+/// most [`REACH`] levels, where the mean of that distance over the window
+/// stays within one level in [`MEAN_DIVISOR`]; returns how many changed.
+fn sweep<T: AlphaSample>(
+    alpha: &mut [T],
+    width: usize,
+    height: usize,
+    max: u32,
+    distance: impl Fn(u32) -> u32,
+    replacement: T,
+) -> usize {
     let reach = REACH * max / 255;
     let fringe_level = |a: T| {
-        let level = a.level();
+        let level = distance(a.level());
         if level <= reach { level } else { 0 }
     };
+    let mut changed = 0usize;
     let Some(first) = alpha.iter().position(|&a| fringe_level(a) != 0) else {
-        return;
+        return 0;
     };
     let last = alpha[first..]
         .iter()
@@ -141,7 +200,8 @@ pub(crate) fn clear<T: AlphaSample>(alpha: &mut [T], width: usize, height: usize
                 *column -= fringe_level(*a);
                 if *pending & bit != 0 {
                     *pending &= !bit;
-                    *a = T::ZERO;
+                    *a = replacement;
+                    changed += 1;
                 }
             }
             top += 1;
@@ -159,10 +219,12 @@ pub(crate) fn clear<T: AlphaSample>(alpha: &mut [T], width: usize, height: usize
         let bit = pending_bit(y);
         for (a, &pending) in row.iter_mut().zip(&pending) {
             if pending & bit != 0 {
-                *a = T::ZERO;
+                *a = replacement;
+                changed += 1;
             }
         }
     }
+    changed
 }
 
 #[cfg(test)]
@@ -197,5 +259,42 @@ mod tests {
                 .zip(&alpha)
                 .all(|(&d, &a)| d == u16::from(a) * 257)
         );
+    }
+
+    #[test]
+    fn fills_dithered_near_opaque_backdrop_only_when_broad() {
+        let (w, h) = (64, 64);
+        // A backdrop that is opaque but for a one-level dither on every
+        // fourth sample, over a soft band that must stay.
+        let backdrop = |x: usize, y: usize| match y {
+            0..=7 => 128,
+            _ if (x + 2 * y) % 4 == 0 => 254,
+            _ => 255,
+        };
+        let mut alpha: Vec<u8> = (0..w * h).map(|i| backdrop(i % w, i / w)).collect();
+        let mut deep: Vec<u16> = alpha.iter().map(|&a| u16::from(a) * 257).collect();
+        clear(&mut alpha, w, h, 255);
+        assert!(alpha[8 * w..].iter().all(|&a| a == 255));
+        assert!(alpha[..8 * w].iter().all(|&a| a == 128));
+        clear(&mut deep, w, h, 65535);
+        assert!(
+            deep.iter()
+                .zip(&alpha)
+                .all(|(&d, &a)| d == u16::from(a) * 257)
+        );
+
+        // A few near-opaque samples on a patterned plane are left alone.
+        let mut sparse = vec![255u8; w * h];
+        for i in (0..w * h).step_by(40) {
+            sparse[i] = 254;
+        }
+        let before = sparse.clone();
+        clear(&mut sparse, w, h, 255);
+        assert_eq!(sparse, before);
+
+        // A broad deficit of more than half a level on average is content.
+        let mut shade = vec![253u8; w * h];
+        clear(&mut shade, w, h, 255);
+        assert!(shade.iter().all(|&a| a == 253));
     }
 }
