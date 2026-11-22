@@ -1624,6 +1624,80 @@ pub fn encode_image(
     )
 }
 
+/// A lossy request for an opaque 8-bit image of at most two colors is coded
+/// by the lossless coder, after the outline flips its distance allows
+/// ([`flip_bilevel`]). The bi-level lossless coder is smaller than
+/// every lossy arm on such images even before that: 25 scans, drawings, manga pages and
+/// dithers came out 33 % smaller at Medium (where the lossy file reached
+/// SSIMULACRA2 90, and below zero on dithers at distance 3) and 9 % smaller
+/// at Slow, larger on one by 1 %. Requests that ask for something the
+/// lossless frame does not give (progressive passes, grain, a non-XYB
+/// transform) keep the lossy path.
+fn bilevel_codes_exactly(config: &EncodeConfig) -> bool {
+    !config.lossless
+        && config.near_lossless == 0
+        && !config.progressive
+        && !config.progressive_dc
+        && !config.upsampling
+        && config.coding_transform == CodingTransform::Xyb
+        && config.grain == Grain::Off
+}
+
+/// The lossy step every bi-level encode takes: `pixels` (of at most two
+/// colors) with the outline pixels flipped that the page's own context
+/// model finds costly, as far as `distance` allows and without changing any
+/// shape's topology (see [`crate::bilevel_lossy::flip_pixels`]); `None`
+/// when nothing changes.
+fn flip_bilevel<const CHANNELS: usize>(
+    pixels: &[[u8; CHANNELS]],
+    width: usize,
+    height: usize,
+    distance: f32,
+) -> Option<Vec<[u8; CHANNELS]>> {
+    let budget = crate::bilevel_lossy::FlipBudget::at(distance)?;
+    let (mut ink, colors) = bilevel_ink(pixels)?;
+    // A screen codes through exact repeats, which flips would break: a
+    // screentone scan came out 5-10 % larger flipped. A dither has no
+    // outlines to move.
+    if crate::lossless::is_bilevel_screen(&ink, width, height)
+        || crate::bilevel_lossy::is_dither(&ink, width, height)
+        || crate::bilevel_lossy::flip_pixels(&mut ink, width, height, budget) == 0
+    {
+        return None;
+    }
+    Some(ink.iter().map(|&ink| colors[usize::from(ink)]).collect())
+}
+
+/// The ink mask of a two-color image with its `[paper, ink]` colors; the
+/// rarer color is the ink. `None` for a single color.
+fn bilevel_ink<const CHANNELS: usize>(
+    pixels: &[[u8; CHANNELS]],
+) -> Option<(Vec<bool>, [[u8; CHANNELS]; 2])> {
+    let first = *pixels.first()?;
+    let other = *pixels.iter().find(|&&pixel| pixel != first)?;
+    let first_count = pixels.iter().filter(|&&pixel| pixel == first).count();
+    let (ink_color, paper_color) = if 2 * first_count <= pixels.len() {
+        (first, other)
+    } else {
+        (other, first)
+    };
+    Some((
+        pixels.iter().map(|&pixel| pixel == ink_color).collect(),
+        [paper_color, ink_color],
+    ))
+}
+
+/// No third color among `pixels`.
+fn at_most_two_colors<const CHANNELS: usize>(pixels: &[[u8; CHANNELS]]) -> bool {
+    let Some(&first) = pixels.first() else {
+        return true;
+    };
+    let mut second = None;
+    pixels
+        .iter()
+        .all(|&pixel| pixel == first || *second.get_or_insert(pixel) == pixel)
+}
+
 /// The RGB encode proper (see [`encode_image`]).
 fn encode_image_rgb(
     input: &[u8],
@@ -1646,6 +1720,13 @@ fn encode_image_rgb(
     }
     if !config.distance.is_finite() || config.distance <= 0.0 {
         return Err(EncodeError::InvalidDistance(config.distance));
+    }
+    if bilevel_codes_exactly(config) && at_most_two_colors(input.as_chunks::<3>().0) {
+        let mut exact = config.clone();
+        exact.lossless = true;
+        let flipped = flip_bilevel(input.as_chunks::<3>().0, width, height, config.distance);
+        let pixels = flipped.as_deref().unwrap_or(input.as_chunks::<3>().0);
+        return encode_image_rgb(pixels.as_flattened(), width, height, &exact);
     }
     if config.lossless {
         return encode_with_config_loseless(
@@ -3684,6 +3765,13 @@ fn encode_gray_impl<const CHANNELS: usize>(
         return Err(EncodeError::InvalidDistance(config.distance));
     }
     let pixels = input.as_chunks::<CHANNELS>().0;
+    if CHANNELS == 1 && bilevel_codes_exactly(config) && at_most_two_colors(pixels) {
+        let mut exact = config.clone();
+        exact.lossless = true;
+        let flipped = flip_bilevel(pixels, width, height, config.distance);
+        let pixels = flipped.as_deref().unwrap_or(pixels);
+        return encode_gray_impl::<CHANNELS>(pixels.as_flattened(), width, height, &exact);
+    }
     let alpha = || (CHANNELS == 2).then(|| pixels.iter().map(|px| px[1]).collect::<Vec<_>>());
     if config.lossless {
         let mut image = Image3Si::try_new_per_plane([(width, height), (0, 0), (0, 0)])?;
@@ -5645,6 +5733,46 @@ mod encode_smoke_tests {
             }
         }
         rgb
+    }
+
+    #[test]
+    fn lossy_request_for_two_colors_is_the_lossless_file() {
+        let (w, h) = (96, 80);
+        let ink = |x: usize, y: usize| (x * 3 + y * 5) % 11 < 4 || x / 7 == y / 9;
+        let rgb: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                if ink(i % w, i / w) {
+                    [20, 30, 90]
+                } else {
+                    [250, 250, 240]
+                }
+            })
+            .collect();
+        let gray: Vec<u8> = rgb.chunks_exact(3).map(|px| px[0]).collect();
+        let lossy = EncodeConfig::default()
+            .with_distance(2.0)
+            .with_speed(Speed::Medium);
+        let exact = lossy.clone().with_lossless(true);
+        assert_eq!(
+            encode_image(&rgb, w, h, &lossy).unwrap(),
+            encode_image(&rgb, w, h, &exact).unwrap()
+        );
+        assert_eq!(
+            encode_image_gray(&gray, w, h, &lossy).unwrap(),
+            encode_image_gray(&gray, w, h, &exact).unwrap()
+        );
+        // A third color, or a progressive request, keeps the lossy path.
+        let mut three = rgb.clone();
+        three[..3].copy_from_slice(&[9, 200, 9]);
+        assert_ne!(
+            encode_image(&three, w, h, &lossy).unwrap(),
+            encode_image(&three, w, h, &exact).unwrap()
+        );
+        assert!(!bilevel_codes_exactly(
+            &lossy.clone().with_progressive(true)
+        ));
+        assert!(at_most_two_colors::<1>(&[]) && at_most_two_colors(&[[1u8], [1], [2], [1]]));
+        assert!(!at_most_two_colors(&[[1u8], [2], [3]]));
     }
 
     #[test]

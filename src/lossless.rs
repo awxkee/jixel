@@ -149,6 +149,13 @@ pub(crate) use xyb::{
 use crate::encode_image::AlphaPlane;
 use lz77::LZ77_MIN_SYMBOL;
 
+/// Whether a bi-level page (`ink`, row-major) holds a repeated dot screen:
+/// the lossless coder then runs its Zero-predictor arms, whose LZ77 copies
+/// need the screen's repeats exact (see `palette::screen_share`).
+pub(crate) fn is_bilevel_screen(ink: &[bool], width: usize, height: usize) -> bool {
+    palette::screen_share(|x, y| ink[y * width + x], width, height) >= palette::SCREEN_MIN_SHARE
+}
+
 /// Modular group layout: the frame header's `group_size_shift`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct GroupLayout {

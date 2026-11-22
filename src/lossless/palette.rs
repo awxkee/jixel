@@ -59,7 +59,7 @@ pub(crate) fn palette_row_scalar(above: &[i32], row: &[i32], out: &mut [[i32; 4]
         let sign = |v: i32| v.signum() + 1;
         let ctx = sign(l - tl) * 27 + sign(t - tl) * 9 + sign(t - tr) * 3 + sign(l - ll);
         let gradient =
-            ((l as i64 + t as i64 - tl as i64).clamp(l.min(t) as i64, l.max(t) as i64)) as i32;
+            (l as i64 + t as i64 - tl as i64).clamp(l.min(t) as i64, l.max(t) as i64) as i32;
         *out = [ctx, v - l, v - t, v - gradient];
     }
 }
@@ -69,7 +69,7 @@ mod tests;
 
 pub(super) use global::{
     GlobalPalette, OrderRace, PALETTE_COARSE_MARGIN, PALETTE_FINAL_MARGIN, PackedPalette,
-    build_global_palettes,
+    SCREEN_MIN_SHARE, bilevel_screen_share, build_global_palettes, screen_share,
 };
 pub(super) use local::{
     LOCAL_PALETTE_MAX_COLORS, LocalPaletteGroup, build_local_palette_group_limited,

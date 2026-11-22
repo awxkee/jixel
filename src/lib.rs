@@ -43,6 +43,7 @@ mod alpha_patches;
 mod arbiter;
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 mod avx;
+mod bilevel_lossy;
 mod bit_writer;
 mod cell_layer;
 mod clip_continuation;

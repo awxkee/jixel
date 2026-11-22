@@ -665,29 +665,45 @@ impl Tournament {
         let first_stage = sources.palette_stage.take();
         let source = palette.source(frame.xsize, frame.ysize);
         // A bi-level frame also codes its index image two pixels to a
-        // sample; the smaller written frame stays.
-        if let Some(packed) = PackedPalette::new(palette, frame.xsize, frame.ysize) {
-            let packed_source = packed.source(frame.xsize, frame.ysize);
-            if let Some((layout, cand, _)) = self.learn_palette_layouts(
-                frame,
-                sources,
-                &packed_source,
-                &layouts.all,
-                None,
-                pool,
-                scratch,
-            ) {
-                self.write_palette(
-                    frame,
-                    color,
-                    sources,
-                    &packed_source,
-                    layout,
-                    &cand,
-                    best,
-                    pool,
-                    scratch,
-                );
+        // sample. One holding a repeated screen codes each form under a tree
+        // of Zero-predictor leaves as well, where LZ77 copies the screen's
+        // pixels. The smallest written frame stays.
+        if palette.is_bilevel() {
+            let packed = PackedPalette::new(palette, frame.xsize, frame.ysize);
+            let screen =
+                palette.screen_share(frame.xsize, frame.ysize) >= palette::SCREEN_MIN_SHARE;
+            let mut arms: Vec<MaSource<'_>> = Vec::with_capacity(3);
+            if let Some(packed) = &packed {
+                arms.push(packed.source(frame.xsize, frame.ysize));
+            }
+            if screen {
+                let mut values = palette.source(frame.xsize, frame.ysize);
+                values.value_tree = true;
+                arms.push(values);
+                if let Some(packed) = &packed {
+                    let mut values = packed.source(frame.xsize, frame.ysize);
+                    values.value_tree = true;
+                    arms.push(values);
+                }
+            }
+            for arm in &arms {
+                // The learner's estimate prices literals only. It ranks a
+                // Zero-predictor source's layouts by the tree alone, while
+                // its bytes follow the LZ77 matches: each layout is written.
+                let rounds: Vec<&[GroupLayout]> = if arm.value_tree {
+                    layouts.all.chunks(1).collect()
+                } else {
+                    vec![&layouts.all[..]]
+                };
+                for round in rounds {
+                    if let Some((layout, cand, _)) =
+                        self.learn_palette_layouts(frame, sources, arm, round, None, pool, scratch)
+                    {
+                        self.write_palette(
+                            frame, color, sources, arm, layout, &cand, best, pool, scratch,
+                        );
+                    }
+                }
             }
         }
         let Some(raced) = raced else {

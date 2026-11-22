@@ -306,26 +306,6 @@ impl IsoGainMap {
             && same(&self.alternate_offset_n, &self.alternate_offset_d))
     }
 
-    /// The common denominator, if every rational in the (written) channels
-    /// shares one; the writer then uses the compact common-denominator form.
-    fn common_denominator(&self, channels: usize) -> Option<u32> {
-        let d = self.base_hdr_headroom_d;
-        if d == 0 || self.alternate_hdr_headroom_d != d {
-            return None;
-        }
-        for c in 0..channels {
-            if self.gain_map_min_d[c] != d
-                || self.gain_map_max_d[c] != d
-                || self.gain_map_gamma_d[c] != d
-                || self.base_offset_d[c] != d
-                || self.alternate_offset_d[c] != d
-            {
-                return None;
-            }
-        }
-        Some(d)
-    }
-
     /// Validate the rationals (no zero denominators).
     fn validate(&self) -> Result<(), EncodeError> {
         if self.base_hdr_headroom_d == 0 || self.alternate_hdr_headroom_d == 0 {
@@ -353,18 +333,19 @@ impl IsoGainMap {
     /// u16 minimum_version = 0
     /// u16 writer_version  = 0
     /// u8  flags: bit7 multichannel, bit6 use_base_color_space,
-    ///            bit2 backward_direction, bit3 common denominator
-    /// [u32 common_denominator]
+    ///            bit2 backward_direction
     /// base_hdr_headroom, alternate_hdr_headroom
     /// per channel (1 or 3): min, max, gamma, base_offset, alternate_offset
     /// ```
     ///
-    /// Each rational is `n` alone in the common-denominator form, or `n, d`
-    /// otherwise. Single-channel form is used when all three channels agree.
+    /// Every rational is written as an explicit `n, d` pair. The draft
+    /// common-denominator form (flag bit 3) is still read but never written:
+    /// the final ISO 21496-1 syntax reserves that bit, and final-syntax
+    /// readers (libavif, Apple ImageIO, Skia) misparse or drop such metadata.
+    /// Single-channel form is used when all three channels agree.
     pub fn to_metadata(&self) -> Result<Vec<u8>, EncodeError> {
         self.validate()?;
         let channels = if self.is_multichannel() { 3 } else { 1 };
-        let common = self.common_denominator(channels);
 
         let mut flags = 0u8;
         if channels == 3 {
@@ -376,11 +357,8 @@ impl IsoGainMap {
         if self.backward_direction {
             flags |= BACKWARD_DIRECTION_MASK;
         }
-        if common.is_some() {
-            flags |= USE_COMMON_DENOMINATOR_MASK;
-        }
 
-        let mut out = Vec::with_capacity(5 + 4 + 16 + 40 * channels);
+        let mut out = Vec::with_capacity(5 + 16 + 40 * channels);
         out.extend_from_slice(&0u16.to_be_bytes()); // minimum_version
         out.extend_from_slice(&0u16.to_be_bytes()); // writer_version
         out.push(flags);
@@ -388,34 +366,21 @@ impl IsoGainMap {
         let put_u32 = |out: &mut Vec<u8>, v: u32| out.extend_from_slice(&v.to_be_bytes());
         let put_s32 = |out: &mut Vec<u8>, v: i32| out.extend_from_slice(&v.to_be_bytes());
 
-        if let Some(d) = common {
-            put_u32(&mut out, d);
-            put_u32(&mut out, self.base_hdr_headroom_n);
-            put_u32(&mut out, self.alternate_hdr_headroom_n);
-            for c in 0..channels {
-                put_s32(&mut out, self.gain_map_min_n[c]);
-                put_s32(&mut out, self.gain_map_max_n[c]);
-                put_u32(&mut out, self.gain_map_gamma_n[c]);
-                put_s32(&mut out, self.base_offset_n[c]);
-                put_s32(&mut out, self.alternate_offset_n[c]);
-            }
-        } else {
-            put_u32(&mut out, self.base_hdr_headroom_n);
-            put_u32(&mut out, self.base_hdr_headroom_d);
-            put_u32(&mut out, self.alternate_hdr_headroom_n);
-            put_u32(&mut out, self.alternate_hdr_headroom_d);
-            for c in 0..channels {
-                put_s32(&mut out, self.gain_map_min_n[c]);
-                put_u32(&mut out, self.gain_map_min_d[c]);
-                put_s32(&mut out, self.gain_map_max_n[c]);
-                put_u32(&mut out, self.gain_map_max_d[c]);
-                put_u32(&mut out, self.gain_map_gamma_n[c]);
-                put_u32(&mut out, self.gain_map_gamma_d[c]);
-                put_s32(&mut out, self.base_offset_n[c]);
-                put_u32(&mut out, self.base_offset_d[c]);
-                put_s32(&mut out, self.alternate_offset_n[c]);
-                put_u32(&mut out, self.alternate_offset_d[c]);
-            }
+        put_u32(&mut out, self.base_hdr_headroom_n);
+        put_u32(&mut out, self.base_hdr_headroom_d);
+        put_u32(&mut out, self.alternate_hdr_headroom_n);
+        put_u32(&mut out, self.alternate_hdr_headroom_d);
+        for c in 0..channels {
+            put_s32(&mut out, self.gain_map_min_n[c]);
+            put_u32(&mut out, self.gain_map_min_d[c]);
+            put_s32(&mut out, self.gain_map_max_n[c]);
+            put_u32(&mut out, self.gain_map_max_d[c]);
+            put_u32(&mut out, self.gain_map_gamma_n[c]);
+            put_u32(&mut out, self.gain_map_gamma_d[c]);
+            put_s32(&mut out, self.base_offset_n[c]);
+            put_u32(&mut out, self.base_offset_d[c]);
+            put_s32(&mut out, self.alternate_offset_n[c]);
+            put_u32(&mut out, self.alternate_offset_d[c]);
         }
         Ok(out)
     }
@@ -539,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn single_channel_uses_compact_common_denominator_form() {
+    fn shared_denominators_are_still_written_explicitly() {
         let m = IsoGainMap {
             gain_map_min_n: [-2; 3],
             gain_map_max_n: [6; 3],
@@ -560,15 +525,24 @@ mod tests {
         };
         assert!(!m.is_multichannel());
         let bytes = m.to_metadata().unwrap();
-        // 5 header + common denominator + 2 headroom numerators + 5 numerators.
-        assert_eq!(bytes.len(), 5 + 4 + 8 + 20);
+        // 5 header + 2 headroom pairs + 5 pairs; no common-denominator form.
+        assert_eq!(bytes.len(), 5 + 16 + 40);
         assert_eq!(bytes[..4], [0, 0, 0, 0]);
-        assert_eq!(
-            bytes[4],
-            BACKWARD_DIRECTION_MASK | USE_COMMON_DENOMINATOR_MASK
-        );
+        assert_eq!(bytes[4], BACKWARD_DIRECTION_MASK);
         let back = IsoGainMap::from_metadata(&bytes).unwrap();
         assert_eq!(back, m);
+        // Draft-syntax metadata (bit 3, one shared denominator) still parses.
+        let mut compact = vec![
+            0,
+            0,
+            0,
+            0,
+            BACKWARD_DIRECTION_MASK | USE_COMMON_DENOMINATOR_MASK,
+        ];
+        for v in [4u32, 0, 8, (-2i32) as u32, 6, 4, 0, 0] {
+            compact.extend_from_slice(&v.to_be_bytes());
+        }
+        assert_eq!(IsoGainMap::from_metadata(&compact).unwrap(), m);
         let f = back.to_floats();
         assert_eq!(f.min, [-0.5; 3]);
         assert_eq!(f.max, [1.5; 3]);
