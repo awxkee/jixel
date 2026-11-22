@@ -287,8 +287,25 @@ fn decoded_tile(atlas: &[Vec<i32>; 3]) -> [Vec<f32>; 3] {
 /// Evenly spaced nodes for the tile estimates.
 fn sampled_nodes(nodes: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let count = nodes.len();
-    let take = count.min(MAX_SAMPLED_NODES);
-    (0..take).map(|i| nodes[i * count / take]).collect()
+    if count <= MAX_SAMPLED_NODES {
+        return nodes.to_vec();
+    }
+    // `i * count / MAX_SAMPLED_NODES` for successive `i`, stepped by the
+    // quotient with the remainder carried instead of dividing per node.
+    let (step, step_rem) = (count / MAX_SAMPLED_NODES, count % MAX_SAMPLED_NODES);
+    let (mut index, mut rem) = (0usize, 0usize);
+    (0..MAX_SAMPLED_NODES)
+        .map(|_| {
+            let node = nodes[index];
+            index += step;
+            rem += step_rem;
+            if rem >= MAX_SAMPLED_NODES {
+                rem -= MAX_SAMPLED_NODES;
+                index += 1;
+            }
+            node
+        })
+        .collect()
 }
 
 pub(crate) fn find(xyb: &Image3F) -> Option<LatticePlan> {
@@ -541,6 +558,18 @@ mod tests {
                     assert!((a - e).abs() <= 1e-4, "len {len}, lag {k}: {a} vs {e}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn sampled_nodes_match_division() {
+        for count in [
+            0, 1, 7, 4095, 4096, 4097, 5000, 8191, 8192, 100_003, 1_000_000,
+        ] {
+            let nodes: Vec<(usize, usize)> = (0..count).map(|i| (i, 2 * i)).collect();
+            let take = count.min(MAX_SAMPLED_NODES);
+            let expected: Vec<_> = (0..take).map(|i| nodes[i * count / take]).collect();
+            assert_eq!(sampled_nodes(&nodes), expected, "{count}");
         }
     }
 
