@@ -41,6 +41,7 @@ mod frame;
 mod haar;
 mod inflated_cost;
 mod ink_layer;
+mod lattice;
 mod lossless_grad;
 mod lossless_search;
 mod lz_match;
@@ -89,6 +90,7 @@ pub(crate) use inflated_cost::{
     ssim_deficit_neon,
 };
 pub(crate) use ink_layer::{luma_row_neon, ridge_row_neon};
+pub(crate) use lattice::lag_dots_neon;
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use lossless_search::{palette_row_neon, rct_row_neon};
 pub(crate) use lz_match::{match_len_compact_neon, match_len_neon};

@@ -41,6 +41,7 @@ mod frame;
 mod haar;
 mod inflated_cost;
 mod ink_layer;
+mod lattice;
 mod lossless_grad;
 mod lossless_search;
 mod lz_match;
@@ -93,6 +94,7 @@ pub(crate) use inflated_cost::{
     ssim_deficit_avx2,
 };
 pub(crate) use ink_layer::{luma_row_avx2, ridge_row_avx2};
+pub(crate) use lattice::lag_dots_avx2;
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use lossless_search::{palette_row_avx2, rct_row_avx2};
 pub(crate) use lz_match::{match_len_avx2, match_len_compact_avx2};
