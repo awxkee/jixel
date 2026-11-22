@@ -40,6 +40,7 @@
 use crate::image::Image3F;
 use crate::patches::{MODULAR_PATCH_REF_ID, PATCH_REF_ID, PatchReference};
 use crate::quant_weights::INV_DC_QUANT;
+use crate::util::FastRound;
 
 /// Shortest and longest period tried, in pixels.
 const MIN_PERIOD: usize = 4;
@@ -116,6 +117,49 @@ impl LatticePlan {
     }
 }
 
+/// `dots[k] = sum(line[i] * line[i + k])`; `dots.len() <= line.len() / 2 + 1`.
+#[allow(dead_code)]
+pub(crate) fn lag_dots_scalar(line: &[f32], dots: &mut [f32]) {
+    const LANES: usize = 8;
+    let len = line.len();
+    // Adjacent lags share the head sample, so the lanes vectorize.
+    let count = dots.len();
+    let (groups, rest) = dots.as_chunks_mut::<LANES>();
+    for (k, group) in (0..).step_by(LANES).zip(groups) {
+        let common_len = len - (k + LANES - 1);
+        let mut d = [0.0f32; LANES];
+        for (&a, b) in line.iter().zip(line[k..].array_windows::<LANES>()) {
+            for (d, &b) in d.iter_mut().zip(b) {
+                *d += a * b;
+            }
+        }
+        for (j, (out, mut d)) in group.iter_mut().zip(d).enumerate() {
+            let lag = k + j;
+            for (&a, &b) in line[common_len..len - lag]
+                .iter()
+                .zip(&line[common_len + lag..])
+            {
+                d += a * b;
+            }
+            *out = d;
+        }
+    }
+    for (k, out) in (count - rest.len()..).zip(rest) {
+        *out = line.iter().zip(&line[k..]).map(|(&a, &b)| a * b).sum();
+    }
+}
+
+fn lag_dots_kernel() -> fn(&[f32], &mut [f32]) {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    return |line, dots| unsafe { crate::neon::lag_dots_neon(line, dots) };
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        return |line, dots| unsafe { crate::avx::lag_dots_avx2(line, dots) };
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+    lag_dots_scalar
+}
+
 /// Normalized autocorrelation of the zero-mean luma at lags `0..=MAX_PERIOD`
 /// along one axis, from every `CORRELATION_STRIDE`-th line.
 fn axis_correlation(xyb: &Image3F, horizontal: bool) -> Vec<f32> {
@@ -142,10 +186,12 @@ fn axis_correlation(xyb: &Image3F, horizontal: bool) -> Vec<f32> {
     }
     let mean = (mean / count.max(1) as f64) as f32;
     let max_lag = MAX_PERIOD.min(len / 2);
-    // Dot product, head energy and tail energy for each lag.
-    let mut sums = vec![[0.0f64; 3]; max_lag + 1];
-    const LANES: usize = 8;
-    let grouped_lags = sums.len() / LANES * LANES;
+    let lag_dots = lag_dots_kernel();
+    let mut dots = vec![0.0f64; max_lag + 1];
+    let mut line_dots = vec![0.0f32; max_lag + 1];
+    // Energy of each line position over the sampled lines: the head and tail
+    // energies of every lag are prefix sums of it.
+    let mut energy = vec![0.0f64; len];
     for l in (0..lines).step_by(CORRELATION_STRIDE) {
         if horizontal {
             for (v, &src) in line.iter_mut().zip(xyb.plane_row(1, l)) {
@@ -156,51 +202,27 @@ fn axis_correlation(xyb: &Image3F, horizontal: bool) -> Vec<f32> {
                 *v = src - mean;
             }
         }
-        // Accumulate adjacent lags together: each lane keeps the original
-        // summation order, while the contiguous tail samples can use SIMD.
-        let (groups, remainder) = sums.split_at_mut(grouped_lags);
-        for (k, group) in (0..).step_by(LANES).zip(groups.as_chunks_mut::<LANES>().0) {
-            let common_len = len - (k + LANES - 1);
-            let mut d = [0.0f32; LANES];
-            let mut ts = [0.0f32; LANES];
-            let mut hs = 0.0f32;
-            for (&a, b) in line.iter().zip(line[k..].windows(LANES)) {
-                hs += a * a;
-                for ((d, ts), &b) in d.iter_mut().zip(&mut ts).zip(b) {
-                    *d += a * b;
-                    *ts += b * b;
-                }
-            }
-            for (j, ((sum, mut d), mut ts)) in group.iter_mut().zip(d).zip(ts).enumerate() {
-                let lag = k + j;
-                let mut h = hs;
-                for (&a, &b) in line[common_len..len - lag]
-                    .iter()
-                    .zip(&line[common_len + lag..])
-                {
-                    d += a * b;
-                    h += a * a;
-                    ts += b * b;
-                }
-                sum[0] += f64::from(d);
-                sum[1] += f64::from(h);
-                sum[2] += f64::from(ts);
-            }
+        for (e, &v) in energy.iter_mut().zip(&line) {
+            *e += f64::from(v * v);
         }
-        for (k, sum) in (grouped_lags..).zip(remainder) {
-            let (mut d, mut hs, mut ts) = (0.0f32, 0.0f32, 0.0f32);
-            for (&a, &b) in line.iter().zip(&line[k..]) {
-                d += a * b;
-                hs += a * a;
-                ts += b * b;
-            }
-            sum[0] += f64::from(d);
-            sum[1] += f64::from(hs);
-            sum[2] += f64::from(ts);
+        lag_dots(&line, &mut line_dots);
+        for (sum, &d) in dots.iter_mut().zip(&line_dots) {
+            *sum += f64::from(d);
         }
     }
-    sums.into_iter()
-        .map(|[dot, head, tail]| {
+    // prefix[i] = energy of positions `0..i`.
+    let mut prefix = Vec::with_capacity(len + 1);
+    let mut total = 0.0f64;
+    prefix.push(total);
+    for &e in &energy {
+        total += e;
+        prefix.push(total);
+    }
+    dots.iter()
+        .enumerate()
+        .map(|(k, &dot)| {
+            let head = prefix[len - k];
+            let tail = total - prefix[k];
             let norm = (head * tail).sqrt();
             if norm > 0.0 { (dot / norm) as f32 } else { 0.0 }
         })
@@ -212,7 +234,7 @@ fn axis_correlation(xyb: &Image3F, horizontal: bool) -> Vec<f32> {
 /// correlation falls below the best one.
 fn first_peak(corr: &[f32]) -> Option<usize> {
     let mut best: Option<(usize, f32)> = None;
-    for (k, peak) in (MIN_PERIOD..).zip(corr.windows(3).skip(MIN_PERIOD - 1)) {
+    for (k, peak) in (MIN_PERIOD..).zip(corr.array_windows::<3>().skip(MIN_PERIOD - 1)) {
         let v = peak[1];
         if v >= MIN_CORRELATION && v >= peak[0] && v >= peak[2] {
             if best.is_none_or(|(_, b)| v > b + PEAK_MARGIN) {
@@ -233,12 +255,18 @@ const INV_LATTICE: [f32; 3] = [1.0 / LATTICE[0], 1.0 / LATTICE[1], 1.0 / LATTICE
 /// Atlas planes Y, X, B-Y from a tile given in image plane order X, Y, B.
 fn atlas_from_tile(tile: &[Vec<f32>; 3]) -> [Vec<i32>; 3] {
     let [x, y, b] = tile;
-    let y: Vec<i32> = y.iter().map(|v| (v * LATTICE[1]).round() as i32).collect();
-    let x = x.iter().map(|v| (v * LATTICE[0]).round() as i32).collect();
+    let y: Vec<i32> = y
+        .iter()
+        .map(|v| (v * LATTICE[1]).fast_round() as i32)
+        .collect();
+    let x = x
+        .iter()
+        .map(|v| (v * LATTICE[0]).fast_round() as i32)
+        .collect();
     let by = b
         .iter()
         .zip(&y)
-        .map(|(b, y)| (b * LATTICE[2]).round() as i32 - y)
+        .map(|(b, y)| (b * LATTICE[2]).fast_round() as i32 - y)
         .collect();
     [y, x, by]
 }
@@ -467,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn grouped_correlation_matches_scalar_exactly() {
+    fn simd_correlation_matches_scalar() {
         // Exercise partial groups of lags, the maximum lag and both image axes.
         for len in (1..=33).chain([63, 64, 65, 95, 96, 97, 191, 192, 193, 257]) {
             for (w, h) in [(len, 19), (19, len)] {
@@ -482,11 +510,35 @@ mod tests {
                 for horizontal in [false, true] {
                     let expected = scalar_axis_correlation(&img, horizontal);
                     let actual = axis_correlation(&img, horizontal);
-                    assert_eq!(
-                        actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        "{w}x{h}, horizontal={horizontal}"
-                    );
+                    assert_eq!(actual.len(), expected.len());
+                    for (k, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                        assert!(
+                            (a - e).abs() <= 1e-4,
+                            "{w}x{h}, horizontal={horizontal}, lag {k}: {a} vs {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lag_dots_kernels_agree() {
+        for len in (2..=40).chain([63, 64, 65, 191, 192, 193, 257]) {
+            let mut seed = 5u32;
+            let line: Vec<f32> = (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (seed >> 9) as f32 / (1u32 << 23) as f32 - 0.5
+                })
+                .collect();
+            for count in 1..=MAX_PERIOD.min(len / 2) + 1 {
+                let mut expected = vec![0.0f32; count];
+                let mut actual = vec![0.0f32; count];
+                lag_dots_scalar(&line, &mut expected);
+                lag_dots_kernel()(&line, &mut actual);
+                for (k, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                    assert!((a - e).abs() <= 1e-4, "len {len}, lag {k}: {a} vs {e}");
                 }
             }
         }
