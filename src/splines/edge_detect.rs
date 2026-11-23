@@ -464,7 +464,7 @@ mod tests {
             for normal in &contour.normals {
                 assert!((dot(*normal, *normal) - 1.0).abs() < 1e-5);
             }
-            for normals in contour.normals.windows(2) {
+            for normals in contour.normals.array_windows::<2>() {
                 assert!(dot(normals[0], normals[1]) >= MIN_NORMAL_COS);
             }
             for point in &contour.points {

@@ -112,8 +112,8 @@ pub(super) fn encode_gain_map(
 
     let secondary = primary
         .tail_data
-        .windows(2)
-        .position(|bytes| bytes == [0xFF, 0xD8])
+        .array_windows::<2>()
+        .position(|bytes| *bytes == [0xFF, 0xD8])
         .map(|start| &primary.tail_data[start..]);
     let metadata = secondary.and_then(header_metadata);
     let Some((secondary, metadata)) = secondary.zip(metadata) else {

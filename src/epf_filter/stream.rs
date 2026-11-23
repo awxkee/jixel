@@ -407,7 +407,7 @@ pub(super) fn render(
             first,
             out: out.each_mut().map(|p| &mut **p),
         };
-        for strip in bounds.windows(2) {
+        for strip in bounds.array_windows::<2>() {
             let spans = spans(chain.stages, w, strip[0], strip[1]);
             for ((rings, &(stage, _)), span) in band.rings.iter_mut().zip(chain.stages).zip(spans) {
                 rings.prepare(stage, span);

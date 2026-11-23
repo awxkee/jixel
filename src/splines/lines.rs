@@ -769,7 +769,7 @@ mod tests {
 
     fn polyline(corners: &[(f32, f32)]) -> Chain {
         let mut points = Vec::new();
-        for pair in corners.windows(2) {
+        for pair in corners.array_windows::<2>() {
             let ((x0, y0), (x1, y1)) = (pair[0], pair[1]);
             let n = (x1 - x0).abs().max((y1 - y0).abs()) as usize;
             points.extend((0..n).map(|k| {

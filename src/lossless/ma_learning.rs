@@ -33,11 +33,12 @@ use super::GroupLayout;
 use super::context::PROP_WP;
 use super::ma_sampling::{MaRefPlane, ma_channel_sample_count, sample_channel_ma};
 use super::ma_source::{
-    CoarseLearn, LearnedCandidate, MA_COARSE_MAX_LEAVES, MA_COARSE_TARGET_SAMPLES,
-    MA_DEEPEN_MIN_SAVINGS, MA_FINAL_SPLIT_COST_BITS, MA_LITE_CANDIDATES, MA_LITE_MAX_LEAVES,
-    MA_MIN_NODE_SAMPLES, MA_NO_WP_CHANNELS, MA_PRUNE_LEAF_BITS, MA_PRUNE_MIN_NODE_SAMPLES,
-    MA_PRUNE_SPLIT_COST_BITS, MA_SIDE_PREDS, MA_SPLIT_COST_BITS, MA_WIDE_SIDE_PREDS, MaSource,
-    MaTransform, ac_stream_id, with_ma_pixels,
+    CoarseLearn, DENSE_NO_WP_MAX_COST, LearnedCandidate, MA_COARSE_MAX_LEAVES,
+    MA_COARSE_TARGET_SAMPLES, MA_DEEPEN_MIN_SAVINGS, MA_DENSE_SAMPLING, MA_FINAL_SPLIT_COST_BITS,
+    MA_LITE_CANDIDATES, MA_LITE_MAX_LEAVES, MA_LITE_SAMPLING, MA_MIN_NODE_SAMPLES,
+    MA_NO_WP_CHANNELS, MA_PRUNE_LEAF_BITS, MA_PRUNE_MIN_NODE_SAMPLES, MA_PRUNE_SPLIT_COST_BITS,
+    MA_SIDE_PREDS, MA_SPLIT_COST_BITS, MA_WIDE_SIDE_PREDS, MaSource, MaTransform, ac_stream_id,
+    with_ma_pixels,
 };
 use super::tree::emit_learned_tree;
 use crate::coder_scratch::CoderScratch;
@@ -528,6 +529,50 @@ pub(super) fn rank_presets(
     (best_bits, best_coarse, best_params, best_stage)
 }
 
+/// Whether `source`'s final learn should take the dense sample budget
+/// without the Weighted Predictor: the source can spare the predictor when
+/// a pair of first-stage learns at the lite budget, with and without it,
+/// are within `DENSE_NO_WP_MAX_COST`. `None` when the dense budget samples
+/// no more than the ranking's: a source sampled in full has nothing to gain.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dense_no_wp_final(
+    source: &MaSource<'_>,
+    xsize: usize,
+    ysize: usize,
+    min_symbol: u32,
+    wp_params: WpParams,
+    layout: GroupLayout,
+    rank_sampling: (usize, usize),
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Option<bool> {
+    let stride =
+        |(target, limit): (usize, usize)| ma_sample_stride(source.total_values(), target, limit);
+    if stride(rank_sampling) == stride(MA_DENSE_SAMPLING) {
+        return None;
+    }
+    let mut estimate = |use_wp: bool| {
+        learn_ma_candidate(
+            source,
+            xsize,
+            ysize,
+            layout,
+            min_symbol,
+            wp_params,
+            use_wp,
+            source.max_leaves(),
+            MA_LITE_SAMPLING,
+            pool,
+            scratch,
+        )
+        .map(|stage| stage.candidate.est_real)
+    };
+    Some(match (estimate(true), estimate(false)) {
+        (Some(with_wp), Some(without)) => without <= with_wp * DENSE_NO_WP_MAX_COST,
+        _ => false,
+    })
+}
+
 /// Sample every stream of `source` under `layout` (group-local coordinates
 /// and a fresh WP state per group, exactly as the decoder will see them) and
 /// run the first learning stage. `None` when no tree is estimated to beat
@@ -718,10 +763,7 @@ pub(super) fn learn_ma_candidate(
 }
 
 /// Leaf budget of the ranking learns: the first-stage budget, also for
-/// sample sets small enough to be learned directly (at most
-/// `MA_COARSE_TARGET_SAMPLES` rows, i.e. images under ~20k pixels), where a
-/// 96-leaf learn per preset and candidate was most of a small icon's encode
-/// time (a 128x128 icon: 0.21 s single-threaded, 0.14 s of it ranking).
+/// sample sets small enough to be learned directly.
 const MA_RANK_LEAVES: usize = MA_COARSE_MAX_LEAVES;
 
 /// A ranking candidate whose 32-leaf coarse estimate trails the best coarse
@@ -731,9 +773,7 @@ pub(super) const RANK_COARSE_PRUNE: f64 = 1.005;
 /// First ranking stage of `source`: its coarse learn under `layout` at
 /// `sampling`, the final learn's budget. The 32-leaf first stage
 /// only sees `MA_COARSE_TARGET_SAMPLES` evenly spaced rows of the set, yet
-/// sampling just twice that many rows at a wider stride mis-ranked presets
-/// on a third of Kodak (+0.22% overall, k01 +1.3%): the preset margins are
-/// 0.3-0.6% and need the denser set's row phases.
+/// sampling just twice that many rows at a wider stride mis-ranked presets.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn rank_coarse(
     source: &MaSource<'_>,

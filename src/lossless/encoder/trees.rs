@@ -48,7 +48,8 @@ use crate::coder_scratch::CoderScratch;
 use crate::lossless::GroupLayout;
 use crate::lossless::ma_encoding::write_learned_tree_frame;
 use crate::lossless::ma_learning::{
-    finish_ma_learn, learn_best_layout, learn_ma_candidate, rank_coarse, rank_presets,
+    dense_no_wp_final, finish_ma_learn, learn_best_layout, learn_ma_candidate, rank_coarse,
+    rank_presets,
 };
 use crate::lossless::ma_source::{
     CoarseLearn, DENSE_FINAL_MIN_BITS_PER_VALUE, LearnedCandidate, MA_COARSE_TARGET_SAMPLES,
@@ -223,6 +224,19 @@ const ORDERED_GROUP_PALETTE_MARGIN: f64 = 0.97;
 /// second file changes, 0.88 % larger for 9 % of decode speed.
 const GROUP_PALETTE_CREDIT: f64 = 0.99;
 
+/// The credit when the RGB source's final learns went dense without the
+/// Weighted Predictor (`SourcePlan::rgb_dense_no_wp`) and nearly every group
+/// has a palette (`GROUP_PALETTE_DENSE_COVERAGE`). The denser tree shrinks
+/// the RGB frame more than the per-group-palette one: two UI screenshots
+/// whose palette frames then trail by 1.1 % and 4.1 % decode 1.9-2.5 times
+/// faster with them.
+const GROUP_PALETTE_DENSE_CREDIT: f64 = 0.96;
+
+/// Share of the frame's pixels in palettised groups that earns
+/// `GROUP_PALETTE_DENSE_CREDIT`. Those screenshots are at 99 % and 100 %; a
+/// web page at 93 % decodes 5 % slower from its palette frame, not faster.
+const GROUP_PALETTE_DENSE_COVERAGE: f64 = 0.98;
+
 /// Groups a frame keeps under its large layout. One modular group decodes
 /// on one thread, so an image under ~4 MP in 1024-px groups decodes on one
 /// to four. With 512-px groups there (256-px at Kodak size) djxl decodes
@@ -314,6 +328,11 @@ struct SourcePlan {
     /// The final learns' sample budget: the ranking's, or dense for an RGB
     /// source costing many bits per value.
     final_sampling: (usize, usize),
+    /// The RGB source's final learns (the per-group palettes' too) take the
+    /// dense budget without the Weighted Predictor (`dense_no_wp_final`).
+    rgb_dense_no_wp: bool,
+    /// The same for the palette source.
+    palette_dense_no_wp: bool,
     /// Ranking stages kept for the final learns (`tree_fresh_final_samples`
     /// off): a final learn may start from them instead of sampling again.
     rgb_stage: Option<CoarseLearn>,
@@ -334,9 +353,33 @@ impl SourcePlan {
             palette_wp: wp_params,
             rank_sampling: sampling,
             final_sampling: sampling,
+            rgb_dense_no_wp: false,
+            palette_dense_no_wp: false,
             rgb_stage: None,
             palette_stage: None,
         }
+    }
+
+    fn dense_no_wp(&self, palette: bool) -> bool {
+        if palette {
+            self.palette_dense_no_wp
+        } else {
+            self.rgb_dense_no_wp
+        }
+    }
+
+    /// The sample budget of a source's final learns.
+    fn final_budget(&self, palette: bool) -> (usize, usize) {
+        if self.dense_no_wp(palette) {
+            MA_DENSE_SAMPLING
+        } else {
+            self.final_sampling
+        }
+    }
+
+    /// Whether a source's final learns may use the Weighted Predictor.
+    fn final_wp(&self, frame: &CoreFrame<'_>, palette: bool) -> bool {
+        frame.use_wp && !self.dense_no_wp(palette)
     }
 
     /// Vector frames use the same preset and RCT for the ranking and final
@@ -441,8 +484,31 @@ impl SourcePlan {
             Some(stage)
         };
 
+        let photo = |stage: &CoarseLearn| {
+            stage.candidate.est_real
+                >= DENSE_FINAL_MIN_BITS_PER_VALUE
+                    * source_values_of(xsize, ysize, frame.coded_chans) as f64
+        };
+        let spare_wp = |source: &MaSource<'_>, wp_params: WpParams, scratch: &mut CoderScratch| {
+            if !(effort.tree_dense_sampling && frame.use_wp) {
+                return None;
+            }
+            dense_no_wp_final(
+                source,
+                xsize,
+                ysize,
+                frame.min_symbol,
+                wp_params,
+                rank_layout,
+                rank_sampling,
+                pool,
+                scratch,
+            )
+        };
+
         // One coarse learn per source decides which are learned in full.
         let wp_params = self.wp_params;
+        let mut rgb_spare_wp = None;
         let mut rgb_stage = if palette_only {
             None
         } else {
@@ -456,24 +522,35 @@ impl SourcePlan {
                 frame.alpha_constant,
                 frame.num_color,
             );
-            coarse(&source, wp_params, scratch)
+            let stage = coarse(&source, wp_params, scratch);
+            if stage.as_ref().is_some_and(|stage| !photo(stage)) {
+                rgb_spare_wp = spare_wp(&source, wp_params, scratch);
+            }
+            stage
         };
-        let mut palette_stage =
-            palette.and_then(|p| coarse(&p.source(xsize, ysize), wp_params, scratch));
+        let dense = effort.tree_dense_sampling && rgb_stage.as_ref().is_some_and(photo);
+        let mut palette_spare_wp = None;
+        let mut palette_stage = palette.and_then(|p| {
+            let source = p.source(xsize, ysize);
+            let stage = coarse(&source, wp_params, scratch)?;
+            if !dense {
+                palette_spare_wp = spare_wp(&source, wp_params, scratch);
+            }
+            Some(stage)
+        });
         let coarse_of = |stage: &Option<CoarseLearn>| {
             stage.as_ref().map_or(f64::INFINITY, |s| {
                 s.candidate.est_real + header_bits(wp_params)
             })
         };
         let (rgb_coarse, palette_coarse) = (coarse_of(&rgb_stage), coarse_of(&palette_stage));
-        if effort.tree_dense_sampling
-            && rgb_stage.as_ref().is_some_and(|stage| {
-                stage.candidate.est_real
-                    >= DENSE_FINAL_MIN_BITS_PER_VALUE
-                        * source_values_of(xsize, ysize, frame.coded_chans) as f64
-            })
-        {
+        if dense {
             self.final_sampling = MA_DENSE_SAMPLING;
+        }
+        // A source that needs the predictor keeps it for the other one too.
+        if rgb_spare_wp != Some(false) && palette_spare_wp != Some(false) {
+            self.rgb_dense_no_wp = rgb_spare_wp == Some(true);
+            self.palette_dense_no_wp = palette_spare_wp == Some(true);
         }
         let large_palette = palette.is_some_and(GlobalPalette::is_large);
         self.rgb = large_palette || rgb_coarse <= palette_coarse * PALETTE_COARSE_MARGIN;
@@ -564,16 +641,24 @@ impl SourcePlan {
     /// source under the same layout and budget, and the ranking did not stop
     /// at its direct small-set learn.
     fn keep_reusable_stages(&mut self, layouts: &LayoutPlan) {
-        let same_budget = self.final_sampling == self.rank_sampling;
-        let reusable = |stage: Option<CoarseLearn>, final_layout: GroupLayout| {
+        let rank_sampling = self.rank_sampling;
+        let reusable = |stage: Option<CoarseLearn>, final_layout: GroupLayout, budget| {
             stage.filter(|stage| {
                 final_layout == layouts.rank_layout()
-                    && same_budget
+                    && budget == rank_sampling
                     && stage.samples.len() > MA_COARSE_TARGET_SAMPLES
             })
         };
-        self.rgb_stage = reusable(self.rgb_stage.take(), layouts.rgb()[0]);
-        self.palette_stage = reusable(self.palette_stage.take(), layouts.all[0]);
+        self.rgb_stage = reusable(
+            self.rgb_stage.take(),
+            layouts.rgb()[0],
+            self.final_budget(false),
+        );
+        self.palette_stage = reusable(
+            self.palette_stage.take(),
+            layouts.all[0],
+            self.final_budget(true),
+        );
     }
 }
 
@@ -636,11 +721,11 @@ impl Tournament {
             layouts.rgb(),
             frame.min_symbol,
             sources.wp_params,
-            frame.use_wp,
+            sources.final_wp(frame, false),
             f64::INFINITY,
             f64::INFINITY,
             false,
-            sources.final_sampling,
+            sources.final_budget(false),
             first_stage,
             pool,
             scratch,
@@ -665,7 +750,7 @@ impl Tournament {
             pool,
             scratch,
             sources.wp_params,
-            frame.use_wp,
+            sources.final_wp(frame, false),
             &cand,
             frame.tree_search,
             &mut candidate,
@@ -842,12 +927,12 @@ impl Tournament {
             layouts,
             frame.min_symbol,
             sources.palette_wp,
-            frame.use_wp,
+            sources.final_wp(frame, true),
             self.rgb_coarse * PALETTE_COARSE_MARGIN,
             // Room for the 256 layout's ~4% on palette graphics.
             self.rgb_final * PALETTE_FINAL_MARGIN * PALETTE_LAYOUT_MARGIN,
             true,
-            sources.final_sampling,
+            sources.final_budget(true),
             first_stage,
             pool,
             scratch,
@@ -887,7 +972,7 @@ impl Tournament {
             pool,
             scratch,
             sources.palette_wp,
-            frame.use_wp,
+            sources.final_wp(frame, true),
             cand,
             frame.tree_search,
             &mut candidate,
@@ -941,7 +1026,8 @@ impl Tournament {
         // when most of the frame palettises (a UI screen: 60%; a
         // screen-content photo mosaic: 44%, where the complete frame then
         // loses anyway).
-        if covered * 2 < frame.xsize * frame.ysize {
+        let pixels = frame.xsize * frame.ysize;
+        if covered * 2 < pixels {
             return;
         }
         // Two index orders per group race on their first-stage estimate: the
@@ -982,9 +1068,9 @@ impl Tournament {
                 layout,
                 frame.min_symbol,
                 sources.wp_params,
-                frame.use_wp,
+                sources.final_wp(frame, false),
                 mixed.max_leaves(),
-                sources.final_sampling,
+                sources.final_budget(false),
                 pool,
                 scratch,
             );
@@ -1014,7 +1100,7 @@ impl Tournament {
             frame.settings.speed,
             stage,
             frame.min_symbol,
-            frame.use_wp,
+            sources.final_wp(frame, false),
             mixed.max_leaves(),
             pool,
             scratch,
@@ -1032,7 +1118,7 @@ impl Tournament {
             pool,
             scratch,
             sources.wp_params,
-            frame.use_wp,
+            sources.final_wp(frame, false),
             &cand,
             frame.tree_search,
             &mut candidate,
@@ -1041,6 +1127,12 @@ impl Tournament {
             self.decisive = true;
             color.release_planes();
         }
-        best.offer_credited(candidate, GROUP_PALETTE_CREDIT);
+        let palettised = covered as f64 >= GROUP_PALETTE_DENSE_COVERAGE * pixels as f64;
+        let credit = if sources.rgb_dense_no_wp && palettised {
+            GROUP_PALETTE_DENSE_CREDIT
+        } else {
+            GROUP_PALETTE_CREDIT
+        };
+        best.offer_credited(candidate, credit);
     }
 }
