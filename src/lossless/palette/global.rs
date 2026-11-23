@@ -211,12 +211,17 @@ pub(in crate::lossless) fn bilevel_screen_share(linear: &Image3Si) -> Option<f64
     ))
 }
 
-/// A two-color global palette with its index image packed two pixels to a
-/// sample. One Squeeze of a 0 / 1 index channel leaves an average in 0..=1
-/// and a residual in -1..=1 whose smoothing term is always zero, so each
-/// pixel pair is one of four (average, residual) tuples, and a Palette over
-/// those two channels codes one index per pair. The half-size index image
-/// gives the tree twice the neighborhood and LZ77 a wider alphabet.
+/// Most colors a global palette may have for its index image to be packed.
+pub(in crate::lossless) const PACKED_PALETTE_MAX_COLORS: usize = 4;
+
+/// A global palette of at most [`PACKED_PALETTE_MAX_COLORS`] colors with its
+/// index image packed two pixels to a sample. One Squeeze of the index
+/// channel leaves an average and a residual per pixel pair, and a Palette
+/// over those two channels codes one index per (average, residual) tuple.
+/// On a 0 / 1 index the squeeze smoothing term is always zero, so each pair
+/// is one of four tuples; with more colors it is not, and one pair can take
+/// a few tuples. The half-size index image gives the tree twice the
+/// neighborhood and LZ77 a wider alphabet.
 pub(in crate::lossless) struct PackedPalette<'a> {
     base: &'a GlobalPalette,
     /// The second palette: its averages, then its residuals.
@@ -228,62 +233,77 @@ pub(in crate::lossless) struct PackedPalette<'a> {
 }
 
 impl<'a> PackedPalette<'a> {
-    /// `None` unless the palette has two colors and the samples pair up
-    /// along a row or, failing that, along a column: the average channel of
-    /// an odd size is one sample longer than the residual channel, and a
-    /// Palette needs equal channels.
+    /// `None` unless the palette has 2..=[`PACKED_PALETTE_MAX_COLORS`] colors
+    /// and the samples pair up along a row or, failing that, along a column:
+    /// the average channel of an odd size is one sample longer than the
+    /// residual channel, and a Palette needs equal channels.
     pub(in crate::lossless) fn new(
         base: &'a GlobalPalette,
         xsize: usize,
         ysize: usize,
     ) -> Option<Self> {
-        if base.nb_colors != 2 || xsize == 0 || ysize == 0 {
+        let colors = base.nb_colors;
+        if !(2..=PACKED_PALETTE_MAX_COLORS).contains(&colors) || xsize == 0 || ysize == 0 {
             return None;
         }
         let horizontal = xsize.is_multiple_of(2);
         if !horizontal && !ysize.is_multiple_of(2) {
             return None;
         }
-        // Pair codes `2 * first + second`, in index order.
-        let codes: Vec<u8> = if horizontal {
-            base.indices
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| (pair[0] * 2 + pair[1]) as u8)
-                .collect()
-        } else {
-            base.indices
-                .chunks_exact(2 * xsize)
-                .flat_map(|rows| {
-                    let (top, bottom) = rows.split_at(xsize);
-                    top.iter().zip(bottom).map(|(&t, &b)| (t * 2 + b) as u8)
-                })
-                .collect()
+        // The decoder's own forward Squeeze, smoothing term included.
+        let channel = crate::squeeze::Channel {
+            data: base.indices.iter().map(|&i| i32::from(i)).collect(),
+            w: xsize,
+            h: ysize,
+            hshift: 0,
+            vshift: 0,
         };
-        let mut used = [false; 4];
-        for &code in &codes {
-            used[usize::from(code)] = true;
+        let (avg, res) = if horizontal {
+            crate::squeeze::fwd_h_squeeze(&channel)
+        } else {
+            crate::squeeze::fwd_v_squeeze(&channel)
+        };
+        debug_assert_eq!(avg.data.len(), res.data.len());
+        // Averages lie in 0..colors. A pair difference is below `colors` and
+        // the smoothing term below `2 * colors` in magnitude, so a residual
+        // lies within `3 * colors`.
+        let reach = 3 * colors as i32;
+        let span = 2 * reach + 1;
+        let slot = |a: i32, r: i32| {
+            debug_assert!((0..colors as i32).contains(&a) && r.abs() <= reach);
+            (a * span + r + reach) as usize
+        };
+        let mut used = vec![false; colors * span as usize];
+        for (&a, &r) in avg.data.iter().zip(&res.data) {
+            used[slot(a, r)] = true;
         }
-        let mut index_of = [0u16; 4];
-        let (mut averages, mut residuals) = (Vec::new(), Vec::new());
-        for code in 0..4usize {
-            if !used[code] {
-                continue;
-            }
-            index_of[code] = averages.len() as u16;
-            let (first, second) = ((code >> 1) as i32, (code & 1) as i32);
-            averages.push((first + second + i32::from(first > second)) >> 1);
-            residuals.push(first - second);
+        let mut tuples: Vec<(i32, i32)> = (0..colors as i32)
+            .flat_map(|a| (-reach..=reach).map(move |r| (a, r)))
+            .filter(|&(a, r)| used[slot(a, r)])
+            .collect();
+        // Index order: the pair a tuple decodes to under a zero smoothing
+        // term (the decoder's inverse Squeeze), first pixel major. A bi-level
+        // palette's tuples are exactly its four pairs in `2 * first + second`
+        // order.
+        tuples.sort_by_key(|&(a, r)| {
+            let first = a + r / 2;
+            (first, first - r)
+        });
+        let mut index_of = vec![0u16; used.len()];
+        for (index, &(a, r)) in tuples.iter().enumerate() {
+            index_of[slot(a, r)] = index as u16;
         }
-        let packed_colors = averages.len();
-        averages.extend(residuals);
+        let packed_colors = tuples.len();
+        let mut table: Vec<i32> = tuples.iter().map(|&(a, _)| a).collect();
+        table.extend(tuples.iter().map(|&(_, r)| r));
         Some(Self {
             base,
-            tuples: averages,
-            indices: codes
+            tuples: table,
+            indices: avg
+                .data
                 .iter()
-                .map(|&code| index_of[usize::from(code)])
+                .zip(&res.data)
+                .map(|(&a, &r)| index_of[slot(a, r)])
                 .collect(),
             packed_colors,
             horizontal,
@@ -346,9 +366,6 @@ fn luma_key(c: &[i32; 4]) -> i64 {
 /// holds a few chroma pairs with many lumas each; a chroma-major order keeps
 /// every such ramp contiguous (a full encode under (Co, Cg, Y) was 7-16 %
 /// smaller than under the best order above on three flat illustrations).
-/// The cheap estimate mis-ranks them (+8 % when it picked one), so they are
-/// only candidates of the order race. Returns the orders and how many of them the
-/// estimate may pick.
 fn palette_order_candidates(
     colors: &[[i32; 4]],
     cooc: &Cooccurrence,

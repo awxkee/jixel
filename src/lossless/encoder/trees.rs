@@ -779,14 +779,14 @@ impl Tournament {
     ) {
         let first_stage = sources.palette_stage.take();
         let source = palette.source(frame.xsize, frame.ysize);
-        // A bi-level frame also codes its index image two pixels to a
-        // sample. One holding a repeated screen codes each form under a tree
-        // of Zero-predictor leaves as well, where LZ77 copies the screen's
-        // pixels. The smallest written frame stays.
-        if palette.is_bilevel() {
-            let packed = PackedPalette::new(palette, frame.xsize, frame.ysize);
-            let screen =
-                palette.screen_share(frame.xsize, frame.ysize) >= palette::SCREEN_MIN_SHARE;
+        // A frame of at most four colors also codes its index image two
+        // pixels to a sample. A bi-level one holding a repeated screen codes
+        // each form under a tree of Zero-predictor leaves as well, where LZ77
+        // copies the screen's pixels. The smallest written frame stays.
+        let packed = PackedPalette::new(palette, frame.xsize, frame.ysize);
+        if packed.is_some() || palette.is_bilevel() {
+            let screen = palette.is_bilevel()
+                && palette.screen_share(frame.xsize, frame.ysize) >= palette::SCREEN_MIN_SHARE;
             let mut arms: Vec<MaSource<'_>> = Vec::with_capacity(3);
             if let Some(packed) = &packed {
                 arms.push(packed.source(frame.xsize, frame.ysize));

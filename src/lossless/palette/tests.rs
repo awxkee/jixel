@@ -336,9 +336,10 @@ fn packed_palette_inverts_through_the_decoder_squeeze() {
     let odd = gray_plane(w - 1, h, bilevel);
     let odd_palette = build_global_palette(&odd, None, 1, w - 1, h, &pool, &mut scratch).unwrap();
     assert!(PackedPalette::new(&odd_palette, w - 1, h).is_none());
-    let three = gray_plane(w, h, |x, y| 100 * ((x + y) % 3) as i32);
-    let three_palette = build_global_palette(&three, None, 1, w, h, &pool, &mut scratch).unwrap();
-    assert!(PackedPalette::new(&three_palette, w, h).is_none());
+    let five = gray_plane(w, h, |x, y| 50 * ((x + 2 * y) % 5) as i32);
+    let five_palette = build_global_palette(&five, None, 1, w, h, &pool, &mut scratch).unwrap();
+    assert_eq!(five_palette.nb_colors, 5);
+    assert!(PackedPalette::new(&five_palette, w, h).is_none());
 
     // A plane without one of the four pairs keeps a shorter second palette.
     let stripes = gray_plane(w, h, |x, _| 255 * (x % 2) as i32);
@@ -347,6 +348,54 @@ fn packed_palette_inverts_through_the_decoder_squeeze() {
     let packed = PackedPalette::new(&stripes_palette, w, h).unwrap();
     assert_eq!(packed.packed_colors, 1);
     assert!(packed.indices.iter().all(|&index| index == 0));
+}
+
+#[test]
+fn packed_few_color_palette_inverts_through_the_decoder_squeeze() {
+    let pool = ThreadPool::new_lossless(2);
+    let mut scratch = CoderScratch::lossless();
+    // Ramps of three and four colors: the smoothing term is nonzero on them.
+    for (colors, (w, h)) in [
+        (3usize, (40, 13)),
+        (4, (40, 13)),
+        (3, (37, 14)),
+        (4, (37, 14)),
+    ] {
+        let plane = gray_plane(w, h, |x, y| {
+            60 * (((x / 3 + y / 2) + (x * y) % 7 / 6) % colors) as i32
+        });
+        let palette = build_global_palette(&plane, None, 1, w, h, &pool, &mut scratch).unwrap();
+        assert_eq!(palette.nb_colors, colors);
+        let packed = PackedPalette::new(&palette, w, h).unwrap();
+        assert_eq!(packed.horizontal, w % 2 == 0);
+        let n = packed.packed_colors;
+        assert!(n >= colors && packed.indices.iter().all(|&i| usize::from(i) < n));
+        let (aw, ah) = if packed.horizontal {
+            (w / 2, h)
+        } else {
+            (w, h / 2)
+        };
+        assert_eq!(packed.indices.len(), aw * ah);
+        let channel = |pick: usize| crate::squeeze::Channel {
+            data: packed
+                .indices
+                .iter()
+                .map(|&i| packed.tuples[pick * n + usize::from(i)])
+                .collect(),
+            w: aw,
+            h: ah,
+            hshift: i32::from(packed.horizontal),
+            vshift: i32::from(!packed.horizontal),
+        };
+        let (avg, res) = (channel(0), channel(1));
+        let restored = if packed.horizontal {
+            crate::squeeze::inv_h_squeeze(&avg, &res)
+        } else {
+            crate::squeeze::inv_v_squeeze(&avg, &res)
+        };
+        let expected: Vec<i32> = palette.indices.iter().map(|&i| i32::from(i)).collect();
+        assert_eq!(restored.data, expected, "{colors} colors {w}x{h}");
+    }
 }
 
 #[test]
