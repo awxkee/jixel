@@ -477,8 +477,9 @@ mod tests {
             data.len(),
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(
-            out.stdout == data,
+        assert_eq!(
+            out.stdout,
+            data,
             "brotli decoded our stream to different bytes ({} in, {} out)",
             data.len(),
             out.stdout.len()

@@ -574,9 +574,10 @@ pub(super) fn ramp_path(colors: &[[i32; 4]], indices: &[u16], xsize: usize) -> O
             .sum();
         (d2, t)
     };
-    // Per anchor pair, its colors with their positions.
-    let mut ramps: std::collections::BTreeMap<(usize, usize), Vec<(f64, usize)>> =
-        Default::default();
+    // Per anchor pair, its colors with their positions. The distances that
+    // pick the pair stay in `f64`: in `f32` near ties fall the other way.
+    // The stored position only sorts a ramp.
+    let mut ramps: std::collections::BTreeMap<(usize, usize), Vec<(f32, u32)>> = Default::default();
     for c in 0..n {
         if anchor_of[c] != NONE {
             continue;
@@ -612,14 +613,14 @@ pub(super) fn ramp_path(colors: &[[i32; 4]], indices: &[u16], xsize: usize) -> O
                 (near.1, near.2, near.3)
             }
         };
-        ramps.entry((i, j)).or_default().push((t, c));
+        ramps.entry((i, j)).or_default().push((t as f32, c as u32));
     }
-    type Ramp = ((usize, usize), u64, Vec<(f64, usize)>);
+    type Ramp = ((usize, usize), u64, Vec<(f32, u32)>);
     let mut remaining: Vec<Ramp> = ramps
         .into_iter()
         .map(|(pair, mut list)| {
             list.shared_sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-            let weight = list.iter().map(|&(_, c)| count[c] as u64).sum();
+            let weight = list.iter().map(|&(_, c)| count[c as usize] as u64).sum();
             (pair, weight, list)
         })
         .collect();
@@ -646,9 +647,9 @@ pub(super) fn ramp_path(colors: &[[i32; 4]], indices: &[u16], xsize: usize) -> O
             path.push(anchors[from]);
         }
         if from == i {
-            path.extend(list.iter().map(|&(_, c)| c));
+            path.extend(list.iter().map(|&(_, c)| c as usize));
         } else {
-            path.extend(list.iter().rev().map(|&(_, c)| c));
+            path.extend(list.iter().rev().map(|&(_, c)| c as usize));
         }
         if !std::mem::replace(&mut placed[to], true) {
             path.push(anchors[to]);

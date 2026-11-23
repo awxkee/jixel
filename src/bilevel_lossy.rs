@@ -153,7 +153,11 @@ pub(crate) fn is_dither(ink: &[bool], width: usize, height: usize) -> bool {
     }
     let transitions: usize = ink
         .chunks_exact(width)
-        .map(|row| row.windows(2).filter(|pair| pair[0] != pair[1]).count())
+        .map(|row| {
+            row.array_windows::<2>()
+                .filter(|pair| pair[0] != pair[1])
+                .count()
+        })
         .sum();
     transitions as f64 >= DITHER_MIN_TRANSITIONS * ((width - 1) * height) as f64
 }
@@ -575,7 +579,7 @@ mod tests {
                 .iter()
                 .map(|&d| FlipBudget::at(d).unwrap())
                 .collect();
-        assert!(budgets.windows(2).all(|w| w[1].blur >= w[0].blur
+        assert!(budgets.array_windows::<2>().all(|w| w[1].blur >= w[0].blur
             && w[1].min_gain <= w[0].min_gain
             && w[1].passes >= w[0].passes));
         assert_eq!(

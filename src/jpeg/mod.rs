@@ -299,7 +299,12 @@ pub fn encode_jpeg_lossless_with_config(
             .app_data
             .iter()
             .any(|app| app.first() == Some(&0xE2) && app.get(3..7) == Some(b"MPF\0"));
-        if has_mpf && parsed.tail_data.windows(2).any(|w| w == [0xFF, 0xD8]) {
+        if has_mpf
+            && parsed
+                .tail_data
+                .array_windows::<2>()
+                .any(|w| *w == [0xFF, 0xD8])
+        {
             return Err(EncodeError::Jpeg(
                 "arithmetic-coded MPF requires disabling JPEG reconstruction".into(),
             ));

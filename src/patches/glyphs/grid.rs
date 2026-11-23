@@ -272,7 +272,7 @@ pub(super) fn detect_glyph_grid(
     let mut runs_x = vec![0u32; width];
     let mut phase_y = 0;
     for (y, row) in ink.chunks_exact(width).enumerate() {
-        for (runs, pair) in runs_x[1..].iter_mut().zip(row.windows(2)) {
+        for (runs, pair) in runs_x[1..].iter_mut().zip(row.array_windows::<2>()) {
             *runs += u32::from(pair[0] & pair[1]);
         }
         if y > 0 {

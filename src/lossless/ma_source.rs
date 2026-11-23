@@ -89,6 +89,11 @@ pub(super) const MA_DENSE_SAMPLING: (usize, usize) =
 /// would spend 2.5x the CPU and 2.5 GB, and a web render came out 7% larger.
 pub(super) const DENSE_FINAL_MIN_BITS_PER_VALUE: f64 = 1.0;
 
+/// Screen and flat-art sources below that take the dense budget without the
+/// Weighted Predictor when a pair of lite first-stage learns prices the
+/// predictor's absence at most this factor (`dense_no_wp_final`).
+pub(super) const DENSE_NO_WP_MAX_COST: f64 = 1.07;
+
 /// First-stage learner budget. Most unhelpful or simple trees terminate here;
 /// only a saturated tree with a clear rate win is retrained on the full probe.
 pub(super) const MA_COARSE_TARGET_SAMPLES: usize = 1 << 16;
