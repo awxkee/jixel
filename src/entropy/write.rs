@@ -622,9 +622,6 @@ fn select_free_config_of<const N: usize>(
     if values.is_empty() {
         return (incumbent, 0.0);
     }
-    let log_alpha = N.trailing_zeros();
-    let split_width = uint_config_split_width(log_alpha);
-    let limit = limit.min(N as u32);
     // Distinct values with their counts: every candidate then costs one pass
     // over these, not over the samples.
     let mut sorted = values.to_vec();
@@ -636,10 +633,44 @@ fn select_free_config_of<const N: usize>(
             _ => distinct.push((value, 1)),
         }
     }
+    select_free_config_counted_of::<N>(&distinct, stride, incumbent, max_value, limit)
+}
+
+/// [`select_free_config`] over a cluster's distinct values and their counts.
+pub(crate) fn select_free_config_counted(
+    distinct: &[(u32, u32)],
+    incumbent: HybridUintConfig,
+    max_value: u32,
+    limit: u32,
+    wide: bool,
+) -> HybridUintConfig {
+    if distinct.is_empty() {
+        return incumbent;
+    }
+    if wide {
+        select_free_config_counted_of::<WIDE_TABLE_ENTRIES>(
+            distinct, 1, incumbent, max_value, limit,
+        )
+        .0
+    } else {
+        select_free_config_counted_of::<ALPHABET_SIZE>(distinct, 1, incumbent, max_value, limit).0
+    }
+}
+
+fn select_free_config_counted_of<const N: usize>(
+    distinct: &[(u32, u32)],
+    stride: usize,
+    incumbent: HybridUintConfig,
+    max_value: u32,
+    limit: u32,
+) -> (HybridUintConfig, f64) {
+    let log_alpha = N.trailing_zeros();
+    let split_width = uint_config_split_width(log_alpha);
+    let limit = limit.min(N as u32);
     let histogram_of = |config: HybridUintConfig| {
         let mut counts = [0u32; N];
         let mut extra = 0u64;
-        for &(value, count) in &distinct {
+        for &(value, count) in distinct {
             let (symbol, bits, _) = uint_encode_with_config(value, config);
             counts[symbol as usize] += count;
             extra += u64::from(bits) * u64::from(count);
