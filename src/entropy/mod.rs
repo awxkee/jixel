@@ -66,7 +66,7 @@ pub(crate) use write::{
     build_huffman_codes_into, build_wide_ans_code_parts, optimize_entropy_code,
     optimize_entropy_code_ac_streams, optimize_entropy_code_ac_streams_fast,
     optimize_entropy_code_jpeg_ac_streams, raced_token_stream, recount_entropy_code,
-    refine_ans_entropy_exhaustive, refine_entropy_bundle, write_brotli_prefix_code,
-    write_context_map, write_entropy_code, write_prefix_codes, write_raced_token_stream,
-    write_token,
+    refine_ans_entropy_exhaustive, refine_entropy_bundle, select_free_config_counted,
+    write_brotli_prefix_code, write_context_map, write_entropy_code, write_prefix_codes,
+    write_raced_token_stream, write_token,
 };
