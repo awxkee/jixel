@@ -79,6 +79,7 @@ fn learn_params(min_symbol: u32, stride: usize, max_leaves: usize) -> MaLearnPar
         side_preds: 1,
         max_candidates: MA_PHOTO_CANDIDATES,
         modal_offsets: false,
+        index_first_depth: 0,
         prune_leaf_bits: 0.0,
         channel_first: false,
         no_wp_channels: 0,
@@ -88,8 +89,7 @@ fn learn_params(min_symbol: u32, stride: usize, max_leaves: usize) -> MaLearnPar
 /// MA samples of tag `t`, value properties at full scale. A group tag is
 /// sampled over the crops its streams code, as they code them (crop
 /// positions and edges, crop references): whole-channel samples gave splits
-/// and edge contexts the coder never saw. Same pixels, -1.4 % bytes over 54
-/// forced encodes (photos to -3.7 %, an illustration -15 %).
+/// and edge contexts the coder never saw.
 fn sample(p: &Pyramid, tags: &Tags, refs: &References, t: usize) -> MaSamples {
     let ch = &p.channels[tags.channel[t]];
     let px = ch.w * ch.h;

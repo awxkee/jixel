@@ -346,13 +346,21 @@ impl SourcePlan {
         } else {
             MA_LITE_SAMPLING
         };
+        // A lossy encode's layer frame learns its final trees from the full
+        // budget; its sources are still ranked at the tier's.
+        let final_sampling = if frame.settings.lossy_layer && frame.effort.layer_full_final_sampling
+        {
+            MA_FULL_SAMPLING
+        } else {
+            sampling
+        };
         Self {
             rgb: true,
             palette: has_palette,
             wp_params,
             palette_wp: wp_params,
             rank_sampling: sampling,
-            final_sampling: sampling,
+            final_sampling,
             rgb_dense_no_wp: false,
             palette_dense_no_wp: false,
             rgb_stage: None,
@@ -533,7 +541,11 @@ impl SourcePlan {
         let mut palette_stage = palette.and_then(|p| {
             let source = p.source(xsize, ysize);
             let stage = coarse(&source, wp_params, scratch)?;
-            if !dense {
+            // A two-color index keeps the predictor and the regular budget:
+            // dense without it, 10 of 26 bi-level pages coded 0.4-5.3 %
+            // larger and a scanned manga page 0.3 % smaller at 1.5 times
+            // its encode.
+            if !dense && !p.is_bilevel() {
                 palette_spare_wp = spare_wp(&source, wp_params, scratch);
             }
             Some(stage)

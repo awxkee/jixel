@@ -545,9 +545,11 @@ pub(crate) fn selected_rct_row_fn() -> RctRowFn {
 #[allow(dead_code)]
 pub(crate) fn rct_row_scalar(src: [&[i32]; 3], kind: u32, out: [&mut [i32]; 3]) {
     let [a, b, c] = out;
-    for i in 0..a.len() {
-        (a[i], b[i], c[i]) =
-            crate::lossless::rct_from_ycocg_pixel(src[0][i], src[1][i], src[2][i], kind);
+    let len = a.len();
+    let [y, co, cg] = src.map(|p| &p[..len]);
+    let out = a.iter_mut().zip(&mut b[..len]).zip(&mut c[..len]);
+    for (((&y, &co), &cg), ((a, b), c)) in y.iter().zip(co).zip(cg).zip(out) {
+        (*a, *b, *c) = crate::lossless::rct_from_ycocg_pixel(y, co, cg, kind);
     }
 }
 

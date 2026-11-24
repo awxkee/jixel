@@ -43,7 +43,9 @@ mod tiles;
 pub(crate) use color_key::ContentHashMap;
 pub(crate) use glyphs::{GlyphParams, plan_lossy_glyph_patches};
 pub(crate) use lossless::find_lossless_patches;
-pub(crate) use lossless_glyphs::find_lossless_glyph_patches;
+pub(crate) use lossless_glyphs::{
+    find_lossless_additive_glyph_patches, find_lossless_glyph_patches,
+};
 pub(crate) use tiles::{
     clear_patch_tiles, find_lossy_patch_groups_sized, find_lossy_patches_sized, pack_lossy_atlas,
     pack_lossy_atlas_sized, reuse_tile_quadrants, stack_atlases,

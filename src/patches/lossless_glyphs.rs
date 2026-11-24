@@ -32,6 +32,7 @@ use super::glyphs::{
 };
 use super::{ContentHashMap, LosslessPatches, PATCH_REF_ID, PatchReference};
 use crate::image::Image3Si;
+use crate::lossless::{rct_simd::forward_ycocg_planes, selected_rct_row_fn};
 use crate::shared_sort::SharedSort;
 use crate::thread_pool::ThreadPool;
 
@@ -364,6 +365,37 @@ pub(crate) fn find_lossless_glyph_patches(
     })
 }
 
+/// Glyphs over smooth ground as additive patches (see
+/// `glyphs::additive`): the YCoCg planes go to RGB for the search, since
+/// the decoder adds in RGB, and the atlas and base come back in YCoCg.
+pub(crate) fn find_lossless_additive_glyph_patches(
+    linear: &Image3Si,
+    bits: u32,
+) -> Option<LosslessPatches> {
+    let (width, height) = (linear.xsize(), linear.ysize());
+    let mut rgb = std::array::from_fn(|_| vec![0; width * height]);
+    // RCT type 0 reconstructs untransformed RGB.
+    selected_rct_row_fn()(
+        [0, 1, 2].map(|c| linear.plane_data(c)),
+        0,
+        rgb.each_mut().map(Vec::as_mut_slice),
+    );
+    let plan = super::glyphs::plan_additive_glyphs(rgb, width, height, bits)?;
+    let to_ycocg = |planes: &[Vec<i32>; 3], w: usize, h: usize| -> Option<Image3Si> {
+        let mut image = Image3Si::try_new(w, h).ok()?;
+        forward_ycocg_planes(
+            planes.each_ref().map(Vec::as_slice),
+            image.all_planes_mut().map(|plane| plane.as_mut_slice()),
+        );
+        Some(image)
+    };
+    Some(LosslessPatches {
+        atlas: to_ycocg(&plan.atlas, plan.atlas_width, plan.atlas_height)?,
+        base: to_ycocg(&plan.base, width, height)?,
+        references: plan.references,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,5 +495,121 @@ mod tests {
         assert_eq!(plan.references.len(), 2);
         assert!(plan.references.iter().all(|r| r.positions.len() == 3));
         assert_glyph_reconstruction(&img, &plan);
+    }
+
+    /// Planes of an RGB page in the coder's YCoCg form.
+    fn ycocg_image(rgb: &[Vec<i32>; 3], width: usize, height: usize) -> Image3Si {
+        let mut image = Image3Si::new(width, height);
+        for y in 0..height {
+            let [y_row, co_row, cg_row] = image.all_plane_rows_mut(y);
+            for x in 0..width {
+                let at = y * width + x;
+                let (r, g, b) = (rgb[0][at], rgb[1][at], rgb[2][at]);
+                let co = r - b;
+                let tmp = b + (co >> 1);
+                let cg = g - tmp;
+                y_row[x] = tmp + (cg >> 1);
+                co_row[x] = co;
+                cg_row[x] = cg;
+            }
+        }
+        image
+    }
+
+    fn rgb_of(image: &Image3Si) -> [Vec<i32>; 3] {
+        let mut rgb: [Vec<i32>; 3] = Default::default();
+        for ((&y, &co), &cg) in image
+            .plane_data(0)
+            .iter()
+            .zip(image.plane_data(1))
+            .zip(image.plane_data(2))
+        {
+            let tmp = y - (cg >> 1);
+            let b = tmp - (co >> 1);
+            rgb[0].push(b + co);
+            rgb[1].push(cg + tmp);
+            rgb[2].push(b);
+        }
+        rgb
+    }
+
+    #[test]
+    fn additive_glyphs_on_a_ramp_add_back_exactly() {
+        for bits in [8u32, 16] {
+            let scale = 1i32 << (bits - 8);
+            let (width, height) = (240usize, 96usize);
+            // A ramp of 12-pixel steps, one level each, on every channel a
+            // little differently.
+            let ground = |x: usize| {
+                let step = (x / 12) as i32;
+                [
+                    (100 + step) * scale,
+                    (60 + step) * scale + 3,
+                    (140 - step) * scale,
+                ]
+            };
+            let mut rgb: [Vec<i32>; 3] = std::array::from_fn(|_| vec![0; width * height]);
+            for y in 0..height {
+                for x in 0..width {
+                    for (c, value) in ground(x).into_iter().enumerate() {
+                        rgb[c][y * width + x] = value;
+                    }
+                }
+            }
+            // One white antialiased mark on each of 18 steps.
+            let white = 255 * scale + (scale - 1);
+            let mut marks = Vec::new();
+            for k in 0..18 {
+                let (x0, y0) = (12 * k + 15, 10 + (k % 3) * 27);
+                marks.push((x0, y0));
+                for dy in 0..7 {
+                    for dx in 0..5 {
+                        let coverage = 64 + ((dx * 3 + dy * 5) % 4) as i32 * 64;
+                        let at = (y0 + dy) * width + x0 + dx;
+                        for plane in &mut rgb {
+                            plane[at] += (white - plane[at]) * coverage / 256;
+                        }
+                    }
+                }
+            }
+            let image = ycocg_image(&rgb, width, height);
+            let plan = find_lossless_additive_glyph_patches(&image, bits).expect("a plan");
+            assert!(plan.references.iter().all(|r| r.add && !r.mul));
+            assert!(plan.references.len() < marks.len());
+            let mut placed: Vec<(usize, usize)> = plan
+                .references
+                .iter()
+                .flat_map(|r| r.positions.iter().copied())
+                .collect();
+            placed.shared_sort();
+            placed.dedup();
+            // A mark too far from every tile on its own stays in the base.
+            assert!(placed.len() >= 12 && placed.iter().all(|p| marks.contains(p)));
+            // The decoder adds in RGB: base plus tiles is the page.
+            let mut restored = rgb_of(&plan.base);
+            let atlas = rgb_of(&plan.atlas);
+            let atlas_width = plan.atlas.xsize();
+            for r in &plan.references {
+                for &(x, y) in &r.positions {
+                    for (c, plane) in restored.iter_mut().enumerate() {
+                        for dy in 0..r.height {
+                            for dx in 0..r.width {
+                                plane[(y + dy) * width + x + dx] +=
+                                    atlas[c][(r.atlas_y + dy) * atlas_width + r.atlas_x + dx];
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(restored, rgb, "{bits}-bit");
+            // The base stays a legal image.
+            let max = (1 << bits) - 1;
+            assert!(
+                rgb_of(&plan.base)
+                    .iter()
+                    .flatten()
+                    .all(|v| (0..=max).contains(v))
+            );
+        }
     }
 }

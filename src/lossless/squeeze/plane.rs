@@ -159,6 +159,7 @@ pub(crate) fn learn_global_plane_tree(
         side_preds: GLOBAL_PLANE_SIDE_PREDS,
         max_candidates: MA_PHOTO_CANDIDATES,
         modal_offsets: false,
+        index_first_depth: 0,
         prune_leaf_bits: 0.0,
         channel_first: false,
         no_wp_channels: 0,

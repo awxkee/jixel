@@ -18,7 +18,7 @@ fn main() {
     let cfg = EncodeConfig::default()
         .with_lossless(true)
         .with_distance(distance)
-        .with_speed(Speed::Medium)
+        .with_speed(Speed::ExtraSlow)
         .with_progressive(false)
         .with_decoding_speed(DecodingSpeed::Slow)
         .with_upsampling(false)

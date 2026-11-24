@@ -269,6 +269,9 @@ pub(crate) struct LosslessSettings {
     pub(crate) upsampling: u32,
     /// The planes were quantized onto a `2k+1` grid (see `near_lossless`).
     pub(crate) near_lossless: bool,
+    /// A layer frame of a lossy (XYB) encode, not a lossless image's frame
+    /// (see `Effort::layer_full_final_sampling`).
+    pub(crate) lossy_layer: bool,
 }
 
 impl LosslessSettings {
@@ -282,6 +285,7 @@ impl LosslessSettings {
             decoding_speed,
             upsampling: 1,
             near_lossless: false,
+            lossy_layer: false,
         }
     }
 

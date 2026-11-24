@@ -1029,6 +1029,7 @@ fn ma_dc_params(
         side_preds: budget.side_preds,
         max_candidates: budget.max_candidates,
         modal_offsets: false,
+        index_first_depth: 0,
         prune_leaf_bits: 0.0,
         channel_first: false,
         no_wp_channels: 0,

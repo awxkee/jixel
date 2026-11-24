@@ -38,7 +38,8 @@ use super::lz77::{
 };
 use super::ma_encoding::tokenize_ma_rect;
 use super::ma_learning::{
-    finish_ma_candidate, ma_leaf_price, ma_learn_params, with_ma_prune, with_value_tree,
+    finish_ma_candidate, ma_leaf_price, ma_learn_params, with_index_first, with_ma_prune,
+    with_value_tree,
 };
 use super::ma_sampling::{ma_channel_sample_count, sample_channel_ma};
 use super::ma_source::{
@@ -197,19 +198,22 @@ pub(super) fn write_local_tree_sections(
                 tok: samples.tok.iter().step_by(4).copied().collect(),
                 val: Vec::new(),
             });
-            let params = with_value_tree(
-                with_ma_prune(
-                    ma_learn_params(
-                        min_symbol,
-                        max_leaves,
-                        max_candidates,
+            let params = with_index_first(
+                with_value_tree(
+                    with_ma_prune(
+                        ma_learn_params(
+                            min_symbol,
+                            max_leaves,
+                            max_candidates,
+                            stride as f64,
+                            use_wp,
+                            !leaf_offsets,
+                        ),
                         stride as f64,
-                        use_wp,
-                        !leaf_offsets,
                     ),
-                    stride as f64,
+                    source.value_tree,
                 ),
-                source.value_tree,
+                source.index_first_depth(),
             );
             let leaf_price = ma_leaf_price(&params, stride as f64);
             let tree = learn_ma_tree_in_place(&mut samples, params, pool, scratch);

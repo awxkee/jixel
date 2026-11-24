@@ -34,11 +34,11 @@ use super::context::PROP_WP;
 use super::ma_sampling::{MaRefPlane, ma_channel_sample_count, sample_channel_ma};
 use super::ma_source::{
     CoarseLearn, DENSE_NO_WP_MAX_COST, LearnedCandidate, MA_COARSE_MAX_LEAVES,
-    MA_COARSE_TARGET_SAMPLES, MA_DEEPEN_MIN_SAVINGS, MA_DENSE_SAMPLING, MA_FINAL_SPLIT_COST_BITS,
-    MA_LITE_CANDIDATES, MA_LITE_MAX_LEAVES, MA_LITE_SAMPLING, MA_MIN_NODE_SAMPLES,
-    MA_NO_WP_CHANNELS, MA_PRUNE_LEAF_BITS, MA_PRUNE_MIN_NODE_SAMPLES, MA_PRUNE_SPLIT_COST_BITS,
-    MA_SIDE_PREDS, MA_SPLIT_COST_BITS, MA_WIDE_SIDE_PREDS, MaSource, MaTransform, ac_stream_id,
-    with_ma_pixels,
+    MA_COARSE_TARGET_SAMPLES, MA_DEEPEN_MIN_LEAVES, MA_DEEPEN_MIN_SAVINGS, MA_DENSE_SAMPLING,
+    MA_FINAL_SPLIT_COST_BITS, MA_LITE_CANDIDATES, MA_LITE_MAX_LEAVES, MA_LITE_SAMPLING,
+    MA_MIN_NODE_SAMPLES, MA_NO_WP_CHANNELS, MA_PRUNE_LEAF_BITS, MA_PRUNE_MIN_NODE_SAMPLES,
+    MA_PRUNE_SPLIT_COST_BITS, MA_SIDE_PREDS, MA_SPLIT_COST_BITS, MA_WIDE_SIDE_PREDS, MaSource,
+    MaTransform, ac_stream_id, with_ma_pixels,
 };
 use super::tree::emit_learned_tree;
 use crate::coder_scratch::CoderScratch;
@@ -247,6 +247,7 @@ pub(super) fn ma_learn_params(
         prune_leaf_bits: 0.0,
         channel_first: true,
         no_wp_channels: MA_NO_WP_CHANNELS,
+        index_first_depth: 0,
     }
 }
 
@@ -258,6 +259,12 @@ pub(super) fn with_value_tree(mut params: MaLearnParams, value_tree: bool) -> Ma
         params.modal_offsets = false;
         params.allow_wp = false;
     }
+    params
+}
+
+/// `MaSource::index_first_depth`.
+pub(super) fn with_index_first(mut params: MaLearnParams, depth: u16) -> MaLearnParams {
+    params.index_first_depth = depth;
     params
 }
 
@@ -288,6 +295,7 @@ fn learn_ma_coarse(
     max_candidates: usize,
     leaf_offsets: bool,
     value_tree: bool,
+    index_first_depth: u16,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Option<CoarseLearn> {
@@ -296,16 +304,19 @@ fn learn_ma_coarse(
     }
     if samples.len() <= MA_COARSE_TARGET_SAMPLES {
         let best_first = || {
-            with_value_tree(
-                ma_learn_params(
-                    min_symbol,
-                    max_leaves,
-                    max_candidates,
-                    stride as f64,
-                    use_wp,
-                    !leaf_offsets,
+            with_index_first(
+                with_value_tree(
+                    ma_learn_params(
+                        min_symbol,
+                        max_leaves,
+                        max_candidates,
+                        stride as f64,
+                        use_wp,
+                        !leaf_offsets,
+                    ),
+                    value_tree,
                 ),
-                value_tree,
+                index_first_depth,
             )
         };
         let params = with_value_tree(with_ma_prune(best_first(), stride as f64), value_tree);
@@ -338,6 +349,7 @@ fn learn_ma_coarse(
             max_candidates,
             leaf_offsets,
             value_tree,
+            index_first_depth,
             candidate,
             deepen: false,
         });
@@ -347,16 +359,19 @@ fn learn_ma_coarse(
     let coarse_tree = learn_ma_tree_indexed(
         &samples,
         coarse_indices,
-        with_value_tree(
-            ma_learn_params(
-                min_symbol,
-                MA_COARSE_MAX_LEAVES,
-                max_candidates,
-                coarse_scale,
-                use_wp,
-                !leaf_offsets,
+        with_index_first(
+            with_value_tree(
+                ma_learn_params(
+                    min_symbol,
+                    MA_COARSE_MAX_LEAVES,
+                    max_candidates,
+                    coarse_scale,
+                    use_wp,
+                    !leaf_offsets,
+                ),
+                value_tree,
             ),
-            value_tree,
+            index_first_depth,
         ),
         pool,
         scratch,
@@ -364,13 +379,14 @@ fn learn_ma_coarse(
     let candidate = gate_ma_tree(coarse_tree, coarse_scale, None, None)?;
     let coarse_leaves = candidate.tree.nodes.len().div_ceil(2);
     let coarse_savings = 1.0 - candidate.est_real / candidate.flat_real;
-    let deepen = coarse_leaves == MA_COARSE_MAX_LEAVES && coarse_savings >= MA_DEEPEN_MIN_SAVINGS;
+    let deepen = coarse_leaves >= MA_DEEPEN_MIN_LEAVES && coarse_savings >= MA_DEEPEN_MIN_SAVINGS;
     Some(CoarseLearn {
         samples,
         stride,
         max_candidates,
         leaf_offsets,
         value_tree,
+        index_first_depth,
         candidate,
         deepen,
     })
@@ -404,6 +420,7 @@ pub(super) fn finish_ma_learn(
         ),
         coarse.value_tree,
     );
+    params.index_first_depth = coarse.index_first_depth;
     if !speed.effort().tree_deep_final && coarse.stride > 1 {
         params.max_leaves = params.max_leaves.min(MA_LITE_MAX_LEAVES);
         params.max_candidates = params.max_candidates.min(MA_LITE_CANDIDATES);
@@ -690,7 +707,7 @@ pub(super) fn learn_ma_candidate(
         props: crate::ma_tree::MaProperties::zeroed(total_samples),
         tok: vec![[0; NUM_MA_PREDS]; total_samples],
         // RCT trees fit leaf offsets from routed residual symbols. Only the
-        // modal Zero leaves of other sources need the original sample value.
+        // modal leaves of other sources need the original sample value.
         val: if leaf_offsets {
             Vec::new()
         } else {
@@ -757,6 +774,7 @@ pub(super) fn learn_ma_candidate(
         max_candidates,
         leaf_offsets,
         source.value_tree,
+        source.index_first_depth(),
         pool,
         scratch,
     )
