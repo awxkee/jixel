@@ -106,6 +106,10 @@ const GLYPH_REGULAR_COARSE_MARGIN: f64 = 1.10;
 const GLYPH_UNSURE_CODED_SHARE: f64 = 0.55;
 const GLYPH_REGULAR_UNSURE_MARGIN: f64 = 1.25;
 
+/// A glyph plan covering this share of the image races the regular frame
+/// whatever the estimates say.
+const GLYPH_REGULAR_COVERAGE: f64 = 0.6;
+
 pub(super) fn keep_smaller_writer(best: &mut Option<BitWriter>, candidate: BitWriter) {
     if best
         .as_ref()
@@ -538,9 +542,14 @@ impl FrameCoder<'_, '_> {
         // An additive plan always races: what it leaves in the base is not
         // what the estimates were fitted on, and its gain turned into a 5 %
         // loss on one ramp page with the order its tiles were matched in.
+        // So does a plan covering most of the image: the little it leaves in
+        // the base is not what the estimates rank either.
         let additive = plan.references.iter().any(|r| r.add);
+        let covering =
+            patch_coverage(&plan, linear.xsize() * linear.ysize()) >= GLYPH_REGULAR_COVERAGE;
         let regular_competes = is_glyph_plan
             && (additive
+                || covering
                 || self.regular_competes(
                     linear,
                     alpha,
@@ -710,8 +719,7 @@ fn coarse_frame_bits(
 }
 
 /// Glyph plans covering less than this share of a bi-level page are not
-/// encoded (the pages that lost covered 0.6 to 5.7 %; a clean text render,
-/// where patches halve the frame, 19 to 27 %).
+/// encoded.
 const BILEVEL_GLYPH_MIN_COVERAGE: f64 = 0.10;
 
 /// A bi-level image whose glyph plan is not worth its encode: one with a
