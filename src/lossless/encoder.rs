@@ -48,7 +48,9 @@ mod flat;
 mod trees;
 
 use super::context::{try_encode_context_tree_multi_group, try_encode_context_tree_single_group};
-use super::palette::{try_encode_local_palette_multi_group, try_encode_palette_single_group};
+use super::palette::{
+    is_bilevel_image, try_encode_local_palette_multi_group, try_encode_palette_single_group,
+};
 use super::predictor::{
     GradPackInteriorFn, choose_predictors_with_wp, choose_wp_params, fixed_predictor,
     selected_grad_pack_interior_fn,
@@ -373,6 +375,17 @@ impl<'a> CoreFrame<'a> {
         writer: &mut BitWriter,
     ) -> Option<bool> {
         if !self.kind.is_regular() || self.num_color != 3 {
+            return None;
+        }
+        // A two-color image in several groups leaves this frame to the
+        // learned trees when they compete anyway: over one global palette
+        // they coded 56 bi-level pages 2.4 to 4.2 times smaller than the
+        // per-group palettes, which took a seventh of the encode.
+        if self.effort.palette_dual
+            && !self.grid.single_group()
+            && self.alpha.is_none()
+            && is_bilevel_image(self.ycocg)
+        {
             return None;
         }
         let mut palette_writer = BitWriter::new();

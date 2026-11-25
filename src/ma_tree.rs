@@ -31,7 +31,7 @@
 
 use crate::adaptive_quant::dirty_log2f;
 use crate::coder_scratch::CoderScratch;
-use crate::entropy::{pack_signed, uint_encode};
+use crate::entropy::{f_log2, pack_signed, uint_encode};
 use crate::thread_pool::ThreadPool;
 use crate::util::heap_array;
 use std::sync::OnceLock;
@@ -403,7 +403,7 @@ pub(crate) struct MaLearnParams {
     /// most frequent sample value as its offset, so a leaf predicts the
     /// constant its context implies (an AA level of a palette index image)
     /// instead of 0; Left and Top carry the node's most frequent step from
-    /// that neighbour (the next palette entry of a ramp). Needs
+    /// that neighbor (the next palette entry of a ramp). Needs
     /// `MaSamples::val`.
     pub(crate) modal_offsets: bool,
     /// Grow-then-prune: bits one kept leaf is charged. 0 keeps best-first
@@ -423,25 +423,49 @@ pub(crate) struct MaLearnParams {
     /// then skips the per-pixel WP state for those channels.
     pub(crate) no_wp_channels: u32,
     /// Index first: a node above this depth holding `INDEX_FIRST_MIN_ROWS`
-    /// rows splits on a neighbour's value (`INDEX_PROPS`) when that split
+    /// rows splits on a neighbor's value (`INDEX_PROPS`) when that split
     /// pays and gains no less than 1 / `INDEX_FIRST_MAX_GAIN_RATIO` of the
     /// best one. On a palette index
-    /// image ordered by colour those values name the colour family, and a
+    /// image ordered by color those values name the color family, and a
     /// tree that separates the families at its root shares the edge-shape
     /// splits below instead of repeating the partition inside every branch.
     /// 0 leaves the order to the gains.
     pub(crate) index_first_depth: u16,
+    /// Shared-table growth after the regular one (`grow_shared`).
+    pub(crate) shared_tables: Option<SharedTables>,
+    /// Threshold refinement: a node of at most `FINE_MAX_ROWS` rows scores
+    /// up to this many more thresholds of its winning property, taken
+    /// between the winner's neighboring candidates. The candidates are
+    /// quantiles of the property's distinct values, so a property with more
+    /// values than candidates is first cut coarsely; 0 leaves it at that.
+    pub(crate) fine_candidates: usize,
+}
+
+/// Settings of `grow_shared`, bit costs in sample-domain bits.
+#[derive(Clone, Copy)]
+pub(crate) struct SharedTables {
+    /// Tables the leaf histograms are clustered into, at most.
+    pub(crate) tables: usize,
+    /// A leaf opens a table when its cheapest existing one costs it this
+    /// much more than its own histogram.
+    pub(crate) new_table_bits: f32,
+    /// What a node pays to keep a histogram of its own.
+    pub(crate) own_bits: f32,
+    pub(crate) split_cost_bits: f32,
+    pub(crate) min_node: usize,
+    /// Sources at or above this are left alone.
+    pub(crate) max_bits_per_sample: f32,
 }
 
 /// The properties `MaLearnParams::index_first_depth` prefers: |N| and |W|.
-const INDEX_PROPS: [u8; 2] = [4, 5];
+static INDEX_PROPS: [u8; 2] = [4, 5];
 
 /// Smaller nodes leave the split order to the gains: forced there, the
 /// partition overfits small images.
 const INDEX_FIRST_MIN_ROWS: usize = 4096;
 
 /// Where another property gains more than this many times the best
-/// neighbour-value split, the values name no family worth separating first
+/// neighbor-value split, the values name no family worth separating first
 /// (scanned grey pages, whose trees grew 1.5% index first).
 const INDEX_FIRST_MAX_GAIN_RATIO: f32 = 8.0;
 
@@ -460,6 +484,8 @@ pub(crate) struct MaPropertyScratch {
     multi_hist: Vec<u32>,
     /// One row's four histogram offsets, reused across single-property scans.
     split_slots: Vec<[u8; 4]>,
+    /// Value -> bin table of a threshold refinement.
+    fine_luts: Vec<u8>,
     /// Residual histogram scratch of `rebase_modal` (modal offsets).
     multi_bin_count: Vec<u32>,
     /// Per predictor: running histogram of the `le` side.
@@ -483,6 +509,7 @@ impl Default for MaPropertyScratch {
             luts: Vec::new(),
             multi_hist: Vec::new(),
             split_slots: Vec::new(),
+            fine_luts: Vec::new(),
             multi_bin_count: Vec::new(),
             left_hist: Vec::new(),
             node_hist: Vec::new(),
@@ -504,7 +531,182 @@ impl MaPropertyScratch {
     }
 }
 
+/// The tables of `grow_shared`: clustered leaf histograms as per-symbol
+/// costs (entropy bits + raw bits), `cost[k * alphabet + symbol]`.
+pub(crate) struct Codebook {
+    k: usize,
+    alphabet: usize,
+    cost: Vec<f32>,
+    /// Bits a node pays to keep a histogram of its own.
+    own_bits: f32,
+}
+
+impl Codebook {
+    fn row(&self, k: usize) -> &[f32] {
+        &self.cost[k * self.alphabet..][..self.alphabet]
+    }
+
+    /// Cheapest cluster for a symbol histogram starting at `first`.
+    fn best(&self, hist: &[u32], first: usize) -> f32 {
+        let mut best = f32::INFINITY;
+        for k in 0..self.k {
+            let row = &self.row(k)[first..first + hist.len()];
+            let mut c = 0.0f32;
+            for (&h, &r) in hist.iter().zip(row) {
+                c += h as f32 * r;
+            }
+            best = best.min(c);
+        }
+        best
+    }
+
+    fn build(
+        leaves: &[Vec<u32>],
+        alphabet: usize,
+        max_k: usize,
+        new_bits: f32,
+        own_bits: f32,
+    ) -> Self {
+        let raw = |s: usize| if s >= 16 { ((s >> 2) - 2) as f32 } else { 0.0 };
+        let table = |counts: &[f64]| -> Vec<f32> {
+            let n: f64 = counts.iter().sum();
+            let eps = 0.25;
+            counts
+                .iter()
+                .enumerate()
+                .map(|(s, &c)| {
+                    let p = (c + eps) / (n + eps * alphabet as f64);
+                    (-f_log2(p)).min(13.0) as f32 + raw(s)
+                })
+                .collect()
+        };
+        let own = |h: &[u32]| -> f32 {
+            let n: u32 = h.iter().sum();
+            let mut b = 0.0f32;
+            for (s, &c) in h.iter().enumerate() {
+                if c != 0 {
+                    b += c as f32 * (dirty_log2f(n as f32 / c as f32) + raw(s));
+                }
+            }
+            b
+        };
+        let cross =
+            |h: &[u32], t: &[f32]| -> f32 { h.iter().zip(t).map(|(&c, &r)| c as f32 * r).sum() };
+        let mut order: Vec<usize> = (0..leaves.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(leaves[i].iter().sum::<u32>()));
+        let mut sums: Vec<Vec<f64>> = Vec::new();
+        let mut tables: Vec<Vec<f32>> = Vec::new();
+        let mut assign = vec![0usize; leaves.len()];
+        for &i in &order {
+            let h = &leaves[i];
+            let base = own(h);
+            let mut best = (f32::INFINITY, 0usize);
+            for (k, t) in tables.iter().enumerate() {
+                let c = cross(h, t);
+                if c < best.0 {
+                    best = (c, k);
+                }
+            }
+            if sums.is_empty() || (sums.len() < max_k && best.0 - base > new_bits) {
+                sums.push(h.iter().map(|&c| c as f64).collect());
+                tables.push(table(sums.last().unwrap()));
+                assign[i] = sums.len() - 1;
+            } else {
+                for (a, &c) in sums[best.1].iter_mut().zip(h) {
+                    *a += c as f64;
+                }
+                tables[best.1] = table(&sums[best.1]);
+                assign[i] = best.1;
+            }
+        }
+        for _ in 0..6 {
+            for (i, h) in leaves.iter().enumerate() {
+                let mut best = (f32::INFINITY, 0usize);
+                for (k, t) in tables.iter().enumerate() {
+                    let c = cross(h, t);
+                    if c < best.0 {
+                        best = (c, k);
+                    }
+                }
+                assign[i] = best.1;
+            }
+            for sum in sums.iter_mut() {
+                sum.fill(0.0);
+            }
+            for (i, h) in leaves.iter().enumerate() {
+                for (a, &c) in sums[assign[i]].iter_mut().zip(h) {
+                    *a += c as f64;
+                }
+            }
+            for (t, sum) in tables.iter_mut().zip(&sums) {
+                *t = table(sum);
+            }
+        }
+        let k = tables.len();
+        Codebook {
+            k,
+            alphabet,
+            cost: tables.concat(),
+            own_bits,
+        }
+    }
+}
+
+/// A `Codebook` restricted to one node: per side predictor, the
+/// tables no other table beats on every symbol the node holds, over the
+/// predictor's symbol window.
+struct NodeCodebook {
+    own_bits: f32,
+    /// Per side predictor: (tables kept, their costs `[table][window symbol]`).
+    preds: Vec<(usize, Vec<f32>)>,
+}
+
+impl NodeCodebook {
+    fn new(cb: &Codebook, preds: &[usize], window: &SymbolWindow, all_hist: &[u32]) -> Self {
+        let alphabet = cb.alphabet;
+        let per_pred = preds
+            .iter()
+            .zip(&window.spans)
+            .map(|(&p, span)| {
+                let node = &all_hist[p * alphabet + span.first..][..span.width];
+                let active: Vec<usize> = (0..span.width).filter(|&s| node[s] != 0).collect();
+                let row = |k: usize| &cb.row(k)[span.first..span.first + span.width];
+                let mut kept: Vec<usize> = Vec::new();
+                'tables: for k in 0..cb.k {
+                    let rk = row(k);
+                    // Dominated by a kept table, or by a later one strictly.
+                    for &j in &kept {
+                        let rj = row(j);
+                        if active.iter().all(|&s| rj[s] <= rk[s]) {
+                            continue 'tables;
+                        }
+                    }
+                    for j in k + 1..cb.k {
+                        let rj = row(j);
+                        if active.iter().all(|&s| rj[s] <= rk[s])
+                            && active.iter().any(|&s| rj[s] < rk[s])
+                        {
+                            continue 'tables;
+                        }
+                    }
+                    kept.push(k);
+                }
+                let mut costs = Vec::with_capacity(kept.len() * span.width);
+                for &k in &kept {
+                    costs.extend_from_slice(row(k));
+                }
+                (kept.len(), costs)
+            })
+            .collect();
+        Self {
+            own_bits: cb.own_bits,
+            preds: per_pred,
+        }
+    }
+}
+
 struct Learner<'a> {
+    cb: Option<Codebook>,
     s: &'a mut MaSamples,
     p: MaLearnParams,
     nodes: Vec<MaNode>,
@@ -521,6 +723,10 @@ struct NodeInfo {
     base_bits: f32,
     pred: u32,
     offset: i32,
+    /// The node's rows in the learner's sample set, and its depth.
+    start: u32,
+    end: u32,
+    depth: u16,
 }
 
 impl NodeInfo {
@@ -529,6 +735,9 @@ impl NodeInfo {
             base_bits: pending.base_bits,
             pred: pending.pred,
             offset: pending.offset,
+            start: pending.start as u32,
+            end: pending.end as u32,
+            depth: pending.depth,
         }
     }
 }
@@ -754,13 +963,33 @@ fn plan_split<T: MaProperty>(
     if ncand == 0 {
         return None;
     }
-    let cands_src = &scratch.cands;
+    Some(plan_from_candidates(
+        &scratch.cands[..ncand],
+        properties.len(),
+        prop,
+        bin_stride,
+        hist_start,
+        luts,
+    ))
+}
+
+/// The plan of `prop` over ascending thresholds `cands_src`, none of them
+/// the property's maximum in the node.
+fn plan_from_candidates(
+    cands_src: &[i32],
+    rows: usize,
+    prop: usize,
+    bin_stride: usize,
+    hist_start: u32,
+    luts: &mut Vec<u8>,
+) -> SplitPlan {
+    let ncand = cands_src.len();
     let lo_v = cands_src[0];
     // The maximum probed value is excluded, so the last threshold has room
     // for the overflow bin's sentinel.
     let hi_v = cands_src[ncand - 1] + 1;
     let span = (hi_v as i64 - lo_v as i64) as usize;
-    let use_lut = span <= LUT_MAX_SPAN && span <= 4 * properties.len() + 64;
+    let use_lut = span <= LUT_MAX_SPAN && span <= 4 * rows + 64;
     let lut_start = luts.len() as u32;
     if use_lut {
         let mut k = 0usize;
@@ -774,7 +1003,7 @@ fn plan_split<T: MaProperty>(
     }
     let mut cands = [0i32; MAX_CANDIDATES];
     cands[..ncand].copy_from_slice(cands_src);
-    Some(SplitPlan {
+    SplitPlan {
         prop: prop as u8,
         ncand: ncand as u8,
         use_lut,
@@ -784,8 +1013,49 @@ fn plan_split<T: MaProperty>(
         hist_start,
         bin_stride: bin_stride as u32,
         cands,
-    })
+    }
 }
+
+/// Thresholds of `prop` strictly between `lo` and `hi` (open ends where
+/// `None`) other than `at`, at most `max_fine` at even quantiles of the
+/// node's distinct probed values, into `scratch.cands`. Returns how many.
+fn pick_fine_candidates<T: MaProperty>(
+    properties: &[[T; NUM_MA_PROPS]],
+    prop: usize,
+    (lo, at, hi): (Option<i32>, i32, Option<i32>),
+    max_fine: usize,
+    scratch: &mut MaPropertyScratch,
+) -> usize {
+    scratch.probe.clear();
+    let mut stride = (properties.len() / MAX_QUANTILE_PROBE).max(1);
+    if stride > 1 && stride.is_multiple_of(2) {
+        stride += 1;
+    }
+    scratch.probe.extend(
+        properties
+            .iter()
+            .step_by(stride)
+            .map(|props| Into::<i32>::into(props[prop])),
+    );
+    sort_unique_probe(&mut scratch.probe, &mut scratch.probe_bitmap);
+    scratch.cands.clear();
+    let Some(&max) = scratch.probe.last() else {
+        return 0;
+    };
+    scratch.probe.retain(|&v| {
+        v < max && v != at && lo.is_none_or(|lo| v > lo) && hi.is_none_or(|hi| v < hi)
+    });
+    let distinct = scratch.probe.len();
+    let n = distinct.min(max_fine.min(MAX_CANDIDATES));
+    for k in 0..n {
+        scratch.cands.push(scratch.probe[k * distinct / n]);
+    }
+    n
+}
+
+/// Nodes of more rows keep their coarse threshold: refining them gained
+/// nothing (four images, +0.2 % on three) and their scans are the long ones.
+const FINE_MAX_ROWS: usize = 4096;
 
 /// One pass over the node's rows, binning every planned property at once.
 /// Every side predictor's token lies in its span, so a bin's row count is
@@ -984,10 +1254,31 @@ fn score_split_plan(
     all_hist: &[u32],
     all_nbits: &[u64; NUM_MA_PREDS],
     total_count: u32,
+    cb: Option<&NodeCodebook>,
     scratch: &mut MaPropertyScratch,
 ) -> Option<(i32, f32)> {
     let ncand = plan.ncand as usize;
     let stride = plan.bin_stride as usize;
+    // Per side predictor: where its kept tables start in the running sums.
+    let mut cb_start = [0usize; NUM_MA_PREDS + 1];
+    let (mut cb_tot, mut cb_left) = (Vec::new(), Vec::new());
+    let mut cb_bin: Vec<(u32, f32)> = Vec::new();
+    if let Some(cb) = cb {
+        for (i, (nk, _)) in cb.preds.iter().enumerate() {
+            cb_start[i + 1] = cb_start[i] + nk;
+        }
+        cb_tot = vec![0.0f32; cb_start[cb.preds.len()]];
+        cb_left = vec![0.0f32; cb_tot.len()];
+        for (i, ((&p, span), (nk, costs))) in
+            preds.iter().zip(&window.spans).zip(&cb.preds).enumerate()
+        {
+            let node = &all_hist[p * alphabet + span.first..][..span.width];
+            for k in 0..*nk {
+                let row = &costs[k * span.width..][..span.width];
+                cb_tot[cb_start[i] + k] = node.iter().zip(row).map(|(&c, &r)| c as f32 * r).sum();
+            }
+        }
+    }
     let left_hist = &mut scratch.left_hist[..stride];
     left_hist.fill(0);
     let mut left_nbits = [0; NUM_MA_PREDS];
@@ -1031,6 +1322,32 @@ fn score_split_plan(
             }
             cost_l += left_nbits[i] as f32;
             cost_r += (all_nbits[p] - left_nbits[i]) as f32;
+            if let Some(cb) = cb {
+                cost_l += cb.own_bits;
+                cost_r += cb.own_bits;
+                let (nk, costs) = &cb.preds[i];
+                // A bin of a small node holds a few symbols of the window.
+                cb_bin.clear();
+                cb_bin.extend(
+                    bin.iter()
+                        .enumerate()
+                        .filter(|&(_, &h)| h != 0)
+                        .map(|(s, &h)| (s as u32, h as f32)),
+                );
+                for k in 0..*nk {
+                    let row = &costs[k * span.width..][..span.width];
+                    let l = &mut cb_left[cb_start[i] + k];
+                    if !cb_bin.is_empty() {
+                        let mut c = 0.0f32;
+                        for &(s, h) in &cb_bin {
+                            c += h * row[s as usize];
+                        }
+                        *l += c;
+                    }
+                    cost_l = cost_l.min(*l);
+                    cost_r = cost_r.min((cb_tot[cb_start[i] + k] - *l).max(0.0));
+                }
+            }
             best_l = best_l.min(cost_l);
             best_r = best_r.min(cost_r);
         }
@@ -1060,6 +1377,7 @@ fn raw_bits_from_hist(hist: &[u32]) -> u64 {
 fn node_cost_all<'a>(
     tokens: impl ExactSizeIterator<Item = &'a [u8; NUM_MA_PREDS]>,
     params: &MaLearnParams,
+    cb: Option<&Codebook>,
     scratch: &mut MaPropertyScratch,
 ) -> (f32, usize) {
     let alpha = params.alphabet;
@@ -1076,7 +1394,7 @@ fn node_cost_all<'a>(
     for toks in tokens {
         count_predictor_tokens(hist, alpha, toks);
     }
-    predictor_costs(hist, total, params, node_nbits, node_costs)
+    predictor_costs(hist, total, params, cb, node_nbits, node_costs)
 }
 
 #[inline]
@@ -1090,6 +1408,7 @@ fn predictor_costs(
     hist: &[u32],
     total: u32,
     params: &MaLearnParams,
+    cb: Option<&Codebook>,
     node_nbits: &mut [u64],
     node_costs: &mut [f32; NUM_MA_PREDS],
 ) -> (f32, usize) {
@@ -1113,7 +1432,11 @@ fn predictor_costs(
         if params.allowed_preds & (1 << p) == 0 {
             continue;
         }
-        let bits = hist_entropy_bits(pred_hist, total) + nbits as f32;
+        let own = hist_entropy_bits(pred_hist, total) + nbits as f32;
+        let bits = match cb {
+            Some(cb) => (own + cb.own_bits).min(cb.best(pred_hist, 0)),
+            None => own,
+        };
         *cost = bits;
         if bits < best {
             best = bits;
@@ -1177,6 +1500,27 @@ impl Learner<'_> {
             Some(pool),
             scratch,
         ))
+    }
+
+    /// Apply modes already found when scoring these rows ahead of their turn.
+    /// Residuals are packed as `i32`, so the stored modes' low 32 bits suffice.
+    fn apply_modal_offsets(
+        &mut self,
+        rows: std::ops::Range<usize>,
+        base: ModalOffsets,
+        modes: ModalOffsets,
+        pool: &ThreadPool,
+        scratch: &mut CoderScratch,
+    ) {
+        with_ma_properties!(&self.s.props, |props| retoken_modal(
+            &mut self.s.tok[rows.clone()],
+            &props[rows.clone()],
+            &self.s.val[rows],
+            Some(base),
+            modes.map(i64::from),
+            Some(pool),
+            scratch,
+        ));
     }
 
     /// `evaluate` over rows supplied by the caller: the same rows (in the same
@@ -1262,7 +1606,12 @@ impl Learner<'_> {
         } else {
             &self.p
         };
-        let (base_bits, base_pred) = node_cost_all(tokens.iter(), params, &mut scratch.ma_property);
+        let (base_bits, base_pred) = node_cost_all(
+            tokens.iter(),
+            params,
+            self.cb.as_ref(),
+            &mut scratch.ma_property,
+        );
         let mut split = None;
         let mut gain = 0.0f32;
         // A split gains at most `base_bits - split_cost_bits`: a node that is
@@ -1275,7 +1624,7 @@ impl Learner<'_> {
             && base_bits > self.p.split_cost_bits
         {
             let mut best: Option<(usize, i32, f32)> = None; // (prop, threshold, bits)
-            // Best split on a neighbour's value, tracked apart while the node
+            // Best split on a neighbor's value, tracked apart while the node
             // is within `index_first_depth`.
             let mut best_index: Option<(usize, i32, f32)> = None;
             let index_first =
@@ -1312,6 +1661,10 @@ impl Learner<'_> {
             });
             preds.truncate(self.p.side_preds.max(1));
             let window = SymbolWindow::new(&preds, alphabet, &all_hist);
+            let node_cb = self
+                .cb
+                .as_ref()
+                .map(|cb| NodeCodebook::new(cb, &preds, &window, &all_hist));
             let all_props: &[u8] = if channel == Some(None) {
                 &[0]
             } else {
@@ -1430,6 +1783,7 @@ impl Learner<'_> {
                             &all_hist,
                             &all_nbits,
                             n as u32,
+                            node_cb.as_ref(),
                             &mut scratch.ma_property,
                         );
                         if let Some((t, bits)) = score {
@@ -1471,8 +1825,16 @@ impl Learner<'_> {
                             &mut hist,
                         );
                         let score = score_split_plan(
-                            plan, &preds, alphabet, &window, &hist, &all_hist, &all_nbits,
-                            n as u32, sc,
+                            plan,
+                            &preds,
+                            alphabet,
+                            &window,
+                            &hist,
+                            &all_hist,
+                            &all_nbits,
+                            n as u32,
+                            node_cb.as_ref(),
+                            sc,
                         );
                         sc.multi_hist = hist;
                         score
@@ -1514,6 +1876,76 @@ impl Learner<'_> {
                         })
                 })
                 .or(best);
+            // Threshold refinement: the winning property's distinct values
+            // between the winner's neighbors are scored as well.
+            let mut best = best;
+            if self.p.fine_candidates > 0
+                && n <= FINE_MAX_ROWS
+                && let Some((prop, threshold, bits)) = best
+                && let Some(plan) = scratch
+                    .ma_property
+                    .plans
+                    .iter()
+                    .find(|plan| plan.prop as usize == prop)
+                    .copied()
+            {
+                let cands = &plan.cands[..plan.ncand as usize];
+                let at = cands.partition_point(|&c| c < threshold);
+                let lo = (at > 0).then(|| cands[at - 1]);
+                let hi = cands.get(at + 1).copied();
+                let sc = &mut scratch.ma_property;
+                let fine = pick_fine_candidates(
+                    properties,
+                    prop,
+                    (lo, threshold, hi),
+                    self.p.fine_candidates,
+                    sc,
+                );
+                if fine > 0 {
+                    let mut fine_luts = std::mem::take(&mut sc.fine_luts);
+                    let mut fine_hist = std::mem::take(&mut sc.multi_hist);
+                    fine_luts.clear();
+                    let fine_plan = plan_from_candidates(
+                        &sc.cands[..fine],
+                        n,
+                        prop,
+                        window.bin_stride,
+                        0,
+                        &mut fine_luts,
+                    );
+                    fine_hist.clear();
+                    fine_hist.resize(fine_plan.hist_len(), 0);
+                    scan_split_plan(
+                        properties,
+                        tokens,
+                        &fine_plan,
+                        &fine_luts,
+                        &preds,
+                        &window,
+                        None,
+                        &mut fine_hist,
+                    );
+                    let score = score_split_plan(
+                        &fine_plan,
+                        &preds,
+                        alphabet,
+                        &window,
+                        &fine_hist,
+                        &all_hist,
+                        &all_nbits,
+                        n as u32,
+                        node_cb.as_ref(),
+                        sc,
+                    );
+                    if let Some((fine_threshold, fine_bits)) = score
+                        && fine_bits < bits
+                    {
+                        best = Some((prop, fine_threshold, fine_bits));
+                    }
+                    sc.fine_luts = fine_luts;
+                    sc.multi_hist = fine_hist;
+                }
+            }
             if let Some((prop, threshold, bits)) = best {
                 let g = base_bits - bits - self.p.split_cost_bits;
                 if g > 0.0 {
@@ -1588,15 +2020,22 @@ fn new_learner(samples: &mut MaSamples, params: MaLearnParams, nodes: Vec<MaNode
                 base_bits: 0.0,
                 pred,
                 offset,
+                start: 0,
+                end: 0,
+                depth: 0,
             },
             MaNode::Split { .. } => NodeInfo {
                 base_bits: f32::INFINITY,
                 pred: 0,
                 offset: 0,
+                start: 0,
+                end: 0,
+                depth: 0,
             },
         })
         .collect();
     Learner {
+        cb: None,
         s: samples,
         nodes,
         info,
@@ -1630,7 +2069,7 @@ fn flat_cost(learner: &Learner<'_>, scratch: &mut CoderScratch) -> f64 {
     let mut flat_bits = 0.0;
     for (hist, count) in flat_hist.chunks_exact(channel_stride).zip(counts) {
         if count != 0 {
-            let (bits, _) = predictor_costs(hist, count, &learner.p, node_nbits, node_costs);
+            let (bits, _) = predictor_costs(hist, count, &learner.p, None, node_nbits, node_costs);
             flat_bits += bits as f64;
         }
     }
@@ -1705,7 +2144,7 @@ type ModalOffsets = [i32; MODAL_PREDS.len()];
 const MODAL_MAX_SPAN: i64 = 4096;
 
 /// Nodes of more rows keep Left and Top at offset 0: a step worth an
-/// offset shows once the neighbour's own value is pinned down, deep in the
+/// offset shows once the neighbor's own value is pinned down, deep in the
 /// tree, and scanning every large node for one is most of the cost.
 const MODAL_STEP_MAX_ROWS: usize = 4096;
 
@@ -1713,26 +2152,27 @@ const MODAL_STEP_MAX_ROWS: usize = 4096;
 const EXACT_TOKENS: usize = 16;
 
 /// The most frequent of `rows` residuals, the smallest on a tie.
-fn residual_mode(residual: impl Fn(usize) -> i64, rows: usize, hist: &mut Vec<u32>) -> i64 {
-    let (lo, hi) = (0..rows).fold((i64::MAX, i64::MIN), |(lo, hi), i| {
-        let r = residual(i);
-        (lo.min(r), hi.max(r))
-    });
+fn residual_mode(
+    residuals: impl ExactSizeIterator<Item = i64> + Clone,
+    hist: &mut Vec<u32>,
+) -> i64 {
+    let rows = residuals.len();
+    let (lo, hi) = residuals
+        .clone()
+        .fold((i64::MAX, i64::MIN), |(lo, hi), r| (lo.min(r), hi.max(r)));
     let span = hi - lo + 1;
     hist.clear();
     if span > u32::MAX as i64 {
         0
     } else if span > MODAL_MAX_SPAN.max(4 * rows as i64) {
         // Sparse over a wide range: sort instead of binning.
-        hist.extend((0..rows).map(|i| (residual(i) - lo) as u32));
+        hist.extend(residuals.map(|r| (r - lo) as u32));
         hist.sort_unstable();
         let (mut best, mut count, mut run) = (0u32, 0usize, 0usize);
-        for (i, &r) in hist.iter().enumerate() {
-            run = if i > 0 && hist[i - 1] == r {
-                run + 1
-            } else {
-                1
-            };
+        let mut previous = hist[0];
+        for &r in hist.iter() {
+            run = if previous == r { run + 1 } else { 1 };
+            previous = r;
             if run > count {
                 (best, count) = (r, run);
             }
@@ -1740,8 +2180,8 @@ fn residual_mode(residual: impl Fn(usize) -> i64, rows: usize, hist: &mut Vec<u3
         lo + i64::from(best)
     } else {
         hist.resize(span as usize, 0);
-        for i in 0..rows {
-            hist[(residual(i) - lo) as usize] += 1;
+        for r in residuals {
+            hist[(r - lo) as usize] += 1;
         }
         let (best, _) =
             hist.iter().enumerate().fold(
@@ -1767,16 +2207,18 @@ fn near_counts(tok: &[[u8; NUM_MA_PREDS]]) -> [[u32; EXACT_TOKENS]; MODAL_PREDS.
     near
 }
 
-/// Row `i`'s residual of `MODAL_PREDS[k]`.
+/// Residuals of `MODAL_PREDS[k]` in sample order.
 #[inline]
-fn modal_residual<T: MaProperty>(
-    props: &[[T; NUM_MA_PROPS]],
-    val: &[i32],
+fn modal_residuals<'a, T: MaProperty>(
+    props: &'a [[T; NUM_MA_PROPS]],
+    val: &'a [i32],
     k: usize,
-    i: usize,
-) -> i64 {
-    i64::from(val[i])
-        - MODAL_PRED_PROPS[k].map_or(0, |prop| Into::<i32>::into(props[i][prop]) as i64)
+) -> impl ExactSizeIterator<Item = i64> + Clone + 'a {
+    debug_assert_eq!(props.len(), val.len());
+    let property = MODAL_PRED_PROPS[k];
+    val.iter().zip(props).map(move |(&value, row)| {
+        i64::from(value) - property.map_or(0, |prop| i64::from(row[prop].into()))
+    })
 }
 
 /// Code the `MODAL_PREDS[k]` tokens of the rows against `offset`.
@@ -1787,11 +2229,11 @@ fn retoken<T: MaProperty>(
     k: usize,
     offset: i64,
 ) {
-    for (i, t) in tok.iter_mut().enumerate() {
-        let (token, _, _) = uint_encode(pack_signed(
-            (modal_residual(props, val, k, i) - offset) as i32,
-        ));
-        t[MODAL_PREDS[k]] = token.min(u8::MAX as u32) as u8;
+    debug_assert_eq!(tok.len(), val.len());
+    let pred = MODAL_PREDS[k];
+    for (t, residual) in tok.iter_mut().zip(modal_residuals(props, val, k)) {
+        let (token, _, _) = uint_encode(pack_signed((residual - offset) as i32));
+        t[pred] = token.min(u8::MAX as u32) as u8;
     }
 }
 
@@ -1799,10 +2241,44 @@ fn retoken<T: MaProperty>(
 /// chunks (given a pool).
 const PARALLEL_REBASE_MIN_ROWS: usize = 1 << 15;
 
+fn retoken_modal<T: MaProperty>(
+    tok: &mut [[u8; NUM_MA_PREDS]],
+    props: &[[T; NUM_MA_PROPS]],
+    val: &[i32],
+    base: Option<ModalOffsets>,
+    modes: [i64; MODAL_PREDS.len()],
+    pool: Option<&ThreadPool>,
+    scratch: &mut CoderScratch,
+) {
+    let rows = val.len();
+    let parallel = pool
+        .filter(|pool| pool.num_threads() > 1 && rows >= PARALLEL_REBASE_MIN_ROWS)
+        .map(|pool| {
+            let chunks = (rows / PARALLEL_SCAN_CHUNK_SAMPLES).clamp(2, pool.num_threads());
+            (pool, rows.div_ceil(chunks))
+        });
+    for (k, mode) in modes.into_iter().enumerate() {
+        if base.is_some_and(|base| i64::from(base[k]) == mode) {
+            continue;
+        }
+        match parallel {
+            None => retoken(tok, props, val, k, mode),
+            Some((pool, chunk_rows)) => {
+                let mut chunks: Vec<_> = tok.chunks_mut(chunk_rows).collect();
+                pool.steal_for_each_mut(scratch, &mut chunks, |chunk, tok, _| {
+                    let start = chunk * chunk_rows;
+                    let end = start + tok.len();
+                    retoken(tok, &props[start..end], &val[start..end], k, mode);
+                });
+            }
+        }
+    }
+}
+
 /// Rebase a node's `MODAL_PREDS` tokens on each one's modal residual: a leaf
 /// of the node using that predictor adds the mode as its offset (a Zero leaf
 /// predicts the node's most frequent value, a Left leaf its most frequent
-/// step from the west neighbour), and the split scan prices both children
+/// step from the west neighbor), and the split scan prices both children
 /// against it. Returns the offsets. Left and Top keep offset 0 in nodes of
 /// more than `MODAL_STEP_MAX_ROWS` rows. `base` holds the offsets the tokens
 /// are coded against on entry (`None` when unknown): a predictor keeping its
@@ -1843,38 +2319,157 @@ fn rebase_modal<T: MaProperty + Sync>(
             let far = rows as u32 - near[k].iter().sum::<u32>();
             (count > far).then(|| i64::from(base[k]) + i64::from(best))
         });
-        near_mode.unwrap_or_else(|| residual_mode(|i| modal_residual(props, val, k, i), rows, hist))
+        near_mode.unwrap_or_else(|| residual_mode(modal_residuals(props, val, k), hist))
     });
-    let pool = pool.filter(|pool| pool.num_threads() > 1 && rows >= PARALLEL_REBASE_MIN_ROWS);
-    for k in 0..N {
-        if base.is_some_and(|base| i64::from(base[k]) == modes[k]) {
-            continue;
-        }
-        match pool {
-            None => retoken(tok, props, val, k, modes[k]),
-            Some(pool) => {
-                let chunk_rows = rows
-                    .div_ceil((rows / PARALLEL_SCAN_CHUNK_SAMPLES).clamp(2, pool.num_threads()));
-                let mut chunks: Vec<&mut [[u8; NUM_MA_PREDS]]> =
-                    tok.chunks_mut(chunk_rows).collect();
-                pool.steal_for_each_mut(scratch, &mut chunks, |chunk, tok, _| {
-                    let start = chunk * chunk_rows;
-                    let end = start + tok.len();
-                    retoken(tok, &props[start..end], &val[start..end], k, modes[k]);
-                });
-            }
-        }
-    }
+    retoken_modal(tok, props, val, base, modes, pool, scratch);
     modes.map(|mode| mode as i32)
 }
 
 fn grow_tree(
     mut learner: Learner<'_>,
-    mut heap: std::collections::BinaryHeap<Pending>,
+    heap: std::collections::BinaryHeap<Pending>,
     flat_bits: f64,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> LearnedTree {
+    grow(&mut learner, heap, pool, scratch);
+    if learner.p.prune_leaf_bits > 0.0 {
+        learner.est_bits = prune_tree(
+            &mut learner.nodes,
+            &mut learner.info,
+            learner.p.prune_leaf_bits,
+        );
+        learner.leaves = learner.nodes.len().div_ceil(2) as u32;
+    }
+    grow_shared(&mut learner, pool, scratch);
+    LearnedTree {
+        est_bits: learner.est_bits,
+        flat_bits,
+        nodes: learner.nodes,
+    }
+}
+
+/// Shared-table growth (`MaLearnParams::shared_tables`): the grown tree's
+/// leaf histograms are clustered into a few tables, and growth continues
+/// with a node priced as the cheaper of its own histogram plus
+/// `SharedTables::own_bits` and its cheapest table. A split whose children
+/// each fit a table the tree already pays for costs tree bits only, so it
+/// may go on where a histogram of its own would overfit. Skipped for trees
+/// past half their leaf budget (nothing left to grow into) and for sources
+/// costing `SharedTables::max_bits_per_sample` or more.
+fn grow_shared(learner: &mut Learner<'_>, pool: &ThreadPool, scratch: &mut CoderScratch) {
+    let Some(shared) = learner.p.shared_tables else {
+        return;
+    };
+    if learner.nodes.len() > learner.p.max_leaves
+        || learner.est_bits >= shared.max_bits_per_sample as f64 * learner.s.len() as f64
+    {
+        return;
+    }
+    let leaves: Vec<usize> = (0..learner.nodes.len())
+        .filter(|&node| {
+            matches!(learner.nodes[node], MaNode::Leaf { .. })
+                && learner.info[node].end > learner.info[node].start
+        })
+        .collect();
+    if leaves.len() < 2 {
+        return;
+    }
+    // A pruned leaf's rows carry the tokens of the subtree it replaced:
+    // every leaf is rebased afresh.
+    let ranges: Vec<(usize, usize)> = leaves
+        .iter()
+        .map(|&node| {
+            (
+                learner.info[node].start as usize,
+                learner.info[node].end as usize,
+            )
+        })
+        .collect();
+    let modal: Vec<ModalOffsets> = ranges
+        .iter()
+        .map(|&(start, end)| learner.rebase(start, end, None, pool, scratch))
+        .collect();
+    let alphabet = learner.p.alphabet;
+    // The tables are built from each leaf's tokens under the predictor it
+    // was grown with.
+    let hists: Vec<Vec<u32>> = {
+        let learner_ref = &*learner;
+        pool.steal_map(scratch, leaves.len(), |k, _| {
+            let (start, end) = ranges[k];
+            let pred = (learner_ref.info[leaves[k]].pred as usize).min(NUM_MA_PREDS - 1);
+            let mut hist = vec![0u32; alphabet];
+            for tok in &learner_ref.s.tok[start..end] {
+                hist[tok[pred] as usize] += 1;
+            }
+            hist
+        })
+    };
+    learner.cb = Some(Codebook::build(
+        &hists,
+        alphabet,
+        shared.tables,
+        shared.new_table_bits,
+        shared.own_bits,
+    ));
+    drop(hists);
+    learner.p.split_cost_bits = shared.split_cost_bits;
+    learner.p.min_node = shared.min_node;
+    learner.p.prune_leaf_bits = 0.0;
+    learner.p.index_first_depth = 0;
+    // The phase at most doubles the leaves (a tree tripled to its cap
+    // coded 0.9 % larger than the one it grew from), and a tree free of
+    // the Weighted Predictor stays so: one new leaf using it makes the
+    // decoder keep its per-pixel state for the whole channel.
+    learner.p.max_leaves = learner.p.max_leaves.min(2 * learner.leaves as usize);
+    let uses_wp = learner.nodes.iter().any(|node| match *node {
+        MaNode::Leaf { pred, .. } => pred as usize == PRED_WEIGHTED,
+        MaNode::Split { prop, .. } => prop == 15,
+    });
+    learner.p.allow_wp &= uses_wp;
+    let pendings = {
+        let learner_ref = &*learner;
+        pool.steal_map(scratch, leaves.len(), |k, worker_scratch| {
+            let (start, end) = ranges[k];
+            let mut pending = learner_ref.evaluate(
+                leaves[k] as u32,
+                start,
+                end,
+                learner_ref.info[leaves[k]].depth,
+                modal[k],
+                true,
+                false,
+                pool,
+                worker_scratch,
+            );
+            pending.node_id = leaves[k] as u32;
+            pending
+        })
+    };
+    let mut heap = std::collections::BinaryHeap::new();
+    learner.est_bits = 0.0;
+    for pending in pendings {
+        learner.nodes[pending.node_id as usize] = MaNode::Leaf {
+            pred: pending.pred,
+            offset: pending.offset,
+        };
+        learner.info[pending.node_id as usize] = NodeInfo::of(&pending);
+        learner.est_bits += pending.base_bits as f64;
+        if pending.split.is_some() {
+            heap.push(pending);
+        }
+    }
+    grow(learner, heap, pool, scratch);
+}
+
+/// Best-first growth: splits the pending leaf of the largest gain until the
+/// leaf budget is spent or no split pays.
+fn grow(
+    learner: &mut Learner<'_>,
+    mut heap: std::collections::BinaryHeap<Pending>,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) {
     let window = speculative_splits(pool);
     let mut ahead: std::collections::HashMap<u32, Ahead> = std::collections::HashMap::new();
     let modal = learner.p.modal_offsets && !learner.s.val.is_empty();
@@ -1882,7 +2477,20 @@ fn grow_tree(
         let Some(p) = heap.pop() else { break };
         let remaining = (learner.p.max_leaves as u32 - learner.leaves) as usize;
         let (prop, threshold) = p.split.expect("only splittable nodes are queued");
-        if !ahead.contains_key(&p.node_id) {
+        let children = if let Some(Ahead { children }) = ahead.remove(&p.node_id) {
+            let lo = p.start + learner.s.partition(p.start, p.end, prop, threshold);
+            if modal {
+                if let Some((split, gt, le)) = &children {
+                    debug_assert_eq!(*split, lo);
+                    learner.apply_modal_offsets(p.start..lo, p.modal, gt.modal, pool, scratch);
+                    learner.apply_modal_offsets(lo..p.end, p.modal, le.modal, pool, scratch);
+                } else {
+                    learner.rebase(p.start, lo, Some(p.modal), pool, scratch);
+                    learner.rebase(lo, p.end, Some(p.modal), pool, scratch);
+                }
+            }
+            children
+        } else {
             // The committed node: use the original two-ended partition order,
             // but move complete rows instead of indices. Each child is a
             // contiguous view of the local rows; every child and quantile
@@ -1925,7 +2533,7 @@ fn grow_tree(
             // its rows in place; a speculated child gathers only its own rows
             // after partitioning the indices.
             let committed_tasks = if committed_live { 2 } else { 0 };
-            let learner_ref = &learner;
+            let learner_ref = &*learner;
             let speculated_ref = &speculated;
             let score = |k: usize, worker_scratch: &mut CoderScratch| -> Option<(usize, Pending)> {
                 if k < committed_tasks {
@@ -2008,7 +2616,6 @@ fn grow_tree(
                 let (_, le) = scored.next().expect("le child").expect("committed le");
                 (lo, gt, le)
             });
-            ahead.insert(p.node_id, Ahead { children });
             for &(node_id, ..) in &speculated {
                 let gt = scored.next().expect("gt child");
                 let le = scored.next().expect("le child");
@@ -2018,15 +2625,9 @@ fn grow_tree(
                 };
                 ahead.insert(node_id, Ahead { children });
             }
-        } else {
-            // Scored ahead on a copy: partition the learner's rows now, and
-            // rebase the children's Zero tokens as the copy was.
-            let lo = p.start + learner.s.partition(p.start, p.end, prop, threshold);
-            learner.rebase(p.start, lo, Some(p.modal), pool, scratch);
-            learner.rebase(lo, p.end, Some(p.modal), pool, scratch);
-        }
-        let Some((_, mut gt, mut le)) = ahead.remove(&p.node_id).expect("scored ahead").children
-        else {
+            children
+        };
+        let Some((_, mut gt, mut le)) = children else {
             // Quantile candidate straddled no actual sample boundary.
             continue;
         };
@@ -2061,16 +2662,6 @@ fn grow_tree(
             heap.push(le);
         }
     }
-
-    if learner.p.prune_leaf_bits > 0.0 {
-        learner.est_bits = prune_tree(&mut learner.nodes, &learner.info, learner.p.prune_leaf_bits);
-    }
-
-    LearnedTree {
-        est_bits: learner.est_bits,
-        flat_bits,
-        nodes: learner.nodes,
-    }
 }
 
 /// Grow-then-prune (`MaLearnParams::prune_leaf_bits`): bottom-up over the
@@ -2078,9 +2669,9 @@ fn grow_tree(
 /// codes no more than its pruned subtree plus one leaf's bits per split
 /// kept, whatever the subtree's depth. Children are numbered after their
 /// parent, so one descending pass prices every subtree before its parent.
-/// The reachable nodes are then renumbered in preorder. Returns the pruned
-/// tree's estimated bits.
-fn prune_tree(nodes: &mut Vec<MaNode>, info: &[NodeInfo], leaf_bits: f32) -> f64 {
+/// The reachable nodes (and their `info`) are then renumbered in preorder.
+/// Returns the pruned tree's estimated bits.
+fn prune_tree(nodes: &mut Vec<MaNode>, info: &mut Vec<NodeInfo>, leaf_bits: f32) -> f64 {
     let n = nodes.len();
     // Leaf bits of each pruned subtree, and the same plus the penalty of
     // every split it keeps: the first is the estimate, the second decides.
@@ -2132,6 +2723,7 @@ fn prune_tree(nodes: &mut Vec<MaNode>, info: &[NodeInfo], leaf_bits: f32) -> f64
         })
         .collect();
     *nodes = compact;
+    *info = order.iter().map(|&i| info[i as usize]).collect();
     subtree_bits[0]
 }
 
@@ -2232,30 +2824,28 @@ pub(crate) fn deepen_ma_tree(
         let num_rows = samples.len();
         let num_nodes = seed.nodes.len();
         assert!(num_nodes <= usize::from(u16::MAX) + 1);
-        let routed: Vec<(Vec<u16>, Vec<usize>)> = with_ma_properties!(&samples.props, |rows| {
-            let seed = &seed;
-            pool.steal_map(scratch, num_rows.div_ceil(ROUTE_CHUNK_ROWS), |chunk, _| {
+        let mut keys = vec![0u16; num_rows];
+        let mut chunk_counts = vec![0usize; num_rows.div_ceil(ROUTE_CHUNK_ROWS) * num_nodes];
+        let mut chunks: Vec<_> = keys
+            .chunks_mut(ROUTE_CHUNK_ROWS)
+            .zip(chunk_counts.chunks_exact_mut(num_nodes))
+            .collect();
+        with_ma_properties!(&samples.props, |rows| {
+            pool.steal_for_each_mut(scratch, &mut chunks, |chunk, (keys, counts), _| {
                 let start = chunk * ROUTE_CHUNK_ROWS;
-                let part = &rows[start..(start + ROUTE_CHUNK_ROWS).min(num_rows)];
-                let mut counts = vec![0usize; num_nodes];
-                let leaves = part
-                    .iter()
-                    .map(|props| {
-                        let (leaf, _) = seed.lookup(props);
-                        counts[leaf as usize] += 1;
-                        leaf as u16
-                    })
-                    .collect();
-                (leaves, counts)
-            })
+                let part = &rows[start..start + keys.len()];
+                for (key, props) in keys.iter_mut().zip(part) {
+                    let (leaf, _) = seed.lookup(props);
+                    *key = leaf as u16;
+                    counts[leaf as usize] += 1;
+                }
+            });
         });
         let mut counts = vec![0usize; num_nodes];
-        let mut keys = Vec::with_capacity(num_rows);
-        for (leaves, part) in routed {
-            for (count, more) in counts.iter_mut().zip(part) {
+        for part in chunk_counts.chunks_exact(num_nodes) {
+            for (count, &more) in counts.iter_mut().zip(part) {
                 *count += more;
             }
-            keys.extend_from_slice(&leaves);
         }
         let mut offsets = vec![0usize; num_nodes + 1];
         let mut total = 0;
@@ -2461,6 +3051,8 @@ mod tests {
                 max_candidates: MAX_CANDIDATES,
                 modal_offsets: false,
                 index_first_depth: 0,
+                shared_tables: None,
+                fine_candidates: 0,
                 prune_leaf_bits: 0.0,
                 channel_first: false,
                 no_wp_channels: 0,
@@ -2483,6 +3075,8 @@ mod tests {
                 max_candidates: MAX_CANDIDATES,
                 modal_offsets: false,
                 index_first_depth: 0,
+                shared_tables: None,
+                fine_candidates: 0,
                 prune_leaf_bits: 0.0,
                 channel_first: false,
                 no_wp_channels: 0,
@@ -2503,6 +3097,82 @@ mod tests {
     }
 
     #[test]
+    fn modal_deepening_preserves_order_and_costs_in_parallel() {
+        // Both seed leaves split further, so the parallel learner can score
+        // a split ahead. The final routing chunk is shorter than the first.
+        let samples = || {
+            let mut samples = MaSamples::new();
+            for i in 0..32_777 {
+                let group = i % 8;
+                let sample = i / 8;
+                let value = 11 + 13 * group + sample % 3;
+                let mut props = [0; NUM_MA_PROPS];
+                props[4] = group;
+                props[6] = (sample % 11) * 3;
+                props[7] = (sample % 13) * 5;
+                let mut tokens = [0; NUM_MA_PREDS];
+                for (pred, prediction) in [0, props[7], props[6]].into_iter().enumerate() {
+                    tokens[pred] = uint_encode(pack_signed(value - prediction)).0 as u8;
+                }
+                samples.push_val(props, tokens, value);
+            }
+            samples
+        };
+        let seed = LearnedTree {
+            nodes: vec![
+                MaNode::Split {
+                    prop: 4,
+                    val: 3,
+                    gt: 1,
+                    le: 2,
+                },
+                MaNode::Leaf { pred: 0, offset: 0 },
+                MaNode::Leaf { pred: 0, offset: 0 },
+            ],
+            est_bits: 0.0,
+            flat_bits: 0.0,
+        };
+        let params = MaLearnParams {
+            alphabet: 64,
+            max_leaves: 8,
+            split_cost_bits: 10.0,
+            min_node: 64,
+            allow_wp: false,
+            allowed_preds: 1 << PRED_ZERO,
+            side_preds: 1,
+            max_candidates: MAX_CANDIDATES,
+            modal_offsets: true,
+            index_first_depth: 0,
+            shared_tables: None,
+            fine_candidates: 0,
+            prune_leaf_bits: 0.0,
+            channel_first: false,
+            no_wp_channels: 0,
+        };
+        let (serial, serial_samples) = deepen_ma_tree(
+            samples(),
+            params,
+            seed.clone(),
+            &ThreadPool::new(1),
+            &mut CoderScratch::default(),
+        );
+        let (parallel, parallel_samples) = deepen_ma_tree(
+            samples(),
+            params,
+            seed,
+            &ThreadPool::new(4),
+            &mut CoderScratch::default(),
+        );
+        assert_eq!(serial.nodes.len(), 15);
+        assert_eq!(serial.nodes, parallel.nodes);
+        assert_eq!(serial.est_bits.to_bits(), parallel.est_bits.to_bits());
+        assert_eq!(serial.flat_bits.to_bits(), parallel.flat_bits.to_bits());
+        assert_eq!(serial_samples.props, parallel_samples.props);
+        assert_eq!(serial_samples.tok, parallel_samples.tok);
+        assert_eq!(serial_samples.val, parallel_samples.val);
+    }
+
+    #[test]
     fn prune_merges_sibling_leaves_bottom_up_and_compacts() {
         let leaf = |pred: u32| MaNode::Leaf { pred, offset: 0 };
         let split = |gt: u32, le: u32| MaNode::Split {
@@ -2515,6 +3185,9 @@ mod tests {
             base_bits,
             pred,
             offset,
+            start: 0,
+            end: 0,
+            depth: 0,
         };
         // Root (200 bits as a leaf) over an inner split (100 bits) with leaf
         // children of 40 + 45 bits, and a 50-bit leaf.
@@ -2530,7 +3203,7 @@ mod tests {
         // 20 bits per leaf: the inner split (40 + 45 + 20 >= 100) merges
         // into its Zero+7 leaf; the root (100 + 50 + 20 < 200) stays.
         let mut nodes = grown.clone();
-        let est = prune_tree(&mut nodes, &infos, 20.0);
+        let est = prune_tree(&mut nodes, &mut infos.to_vec(), 20.0);
         assert_eq!(
             nodes,
             vec![split(1, 2), MaNode::Leaf { pred: 0, offset: 7 }, leaf(1)]
@@ -2539,7 +3212,7 @@ mod tests {
 
         // 60 bits per leaf: the merge cascades to the root.
         let mut nodes = grown.clone();
-        let est = prune_tree(&mut nodes, &infos, 60.0);
+        let est = prune_tree(&mut nodes, &mut infos.to_vec(), 60.0);
         assert_eq!(nodes, vec![leaf(5)]);
         assert_eq!(est, 200.0);
 
@@ -2550,7 +3223,7 @@ mod tests {
         let mut nodes = grown;
         let mut infos = infos;
         infos[0].base_bits = 150.0;
-        let est = prune_tree(&mut nodes, &infos, 10.0);
+        let est = prune_tree(&mut nodes, &mut infos.to_vec(), 10.0);
         assert_eq!(nodes, vec![leaf(5)]);
         assert_eq!(est, 150.0);
     }

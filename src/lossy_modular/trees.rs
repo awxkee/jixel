@@ -80,6 +80,8 @@ fn learn_params(min_symbol: u32, stride: usize, max_leaves: usize) -> MaLearnPar
         max_candidates: MA_PHOTO_CANDIDATES,
         modal_offsets: false,
         index_first_depth: 0,
+        shared_tables: None,
+        fine_candidates: 0,
         prune_leaf_bits: 0.0,
         channel_first: false,
         no_wp_channels: 0,

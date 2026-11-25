@@ -1030,6 +1030,8 @@ fn ma_dc_params(
         max_candidates: budget.max_candidates,
         modal_offsets: false,
         index_first_depth: 0,
+        shared_tables: None,
+        fine_candidates: 0,
         prune_leaf_bits: 0.0,
         channel_first: false,
         no_wp_channels: 0,

@@ -234,9 +234,10 @@ impl FrameCoder<'_, '_> {
         // The whole frame's glyph plan, found once for both steps.
         let mut whole_glyphs: Option<Option<LosslessPatches>> = None;
 
-        // Step 1: the region split, when the estimates favour it.
+        // Step 1: the region split, when the estimates favor it.
         if let Some((split, sure)) = self.plan_region_split(linear, alpha, &mut whole_glyphs) {
             if sure {
+                drop(whole_glyphs);
                 self.encode_region_split(&split, writer);
                 return;
             }
@@ -299,8 +300,9 @@ impl FrameCoder<'_, '_> {
             // frames it sent to the race (flags, emoji, flat illustrations,
             // a page of contour bands) ten lost it, at 1.3-2.7 times their
             // encode; the proxy turns nine of those away, and of the two
-            // wins it keeps one and loses a colour-bar chart 4.5 %.
-            _ => {
+            // wins it keeps one and loses a color-bar chart 4.5 %.
+            rejected => {
+                drop(rejected);
                 self.region_candidate(linear, alpha, regions, whole_glyphs, &mut whole)?
                     .0
             }
@@ -326,11 +328,14 @@ impl FrameCoder<'_, '_> {
             pool: self.pool,
             scratch: &mut *self.scratch,
         };
-        let mut split_writer = BitWriter::new();
-        proxy.encode_region_split(split, &mut split_writer);
+        let split_bits = {
+            let mut split_writer = BitWriter::new();
+            proxy.encode_region_split(split, &mut split_writer);
+            split_writer.bits_written()
+        };
         let mut whole_writer = BitWriter::new();
         proxy.encode_displayed(linear, alpha, false, None, &mut whole_writer);
-        split_writer.bits_written() as f64 / whole_writer.bits_written().max(1) as f64
+        split_bits as f64 / whole_writer.bits_written().max(1) as f64
     }
 
     /// The split of `regions` once text-like rectangles stay in the base,
@@ -474,6 +479,7 @@ impl FrameCoder<'_, '_> {
         if let Some(plan) = &glyph_plan
             && bilevel_keeps_regular(linear, alpha, plan)
         {
+            drop(glyph_plan);
             self.core(linear, alpha, self.settings, regular, false, writer);
             return;
         }
@@ -533,7 +539,7 @@ impl FrameCoder<'_, '_> {
         // what the estimates were fitted on, and its gain turned into a 5 %
         // loss on one ramp page with the order its tiles were matched in.
         let additive = plan.references.iter().any(|r| r.add);
-        if is_glyph_plan
+        let regular_competes = is_glyph_plan
             && (additive
                 || self.regular_competes(
                     linear,
@@ -541,8 +547,9 @@ impl FrameCoder<'_, '_> {
                     &plan,
                     atlas_bits,
                     patched_writer.bits_written(),
-                ))
-        {
+                ));
+        drop(plan);
+        if regular_competes {
             self.core(
                 linear,
                 alpha,

@@ -59,9 +59,12 @@ pub(super) const LZ_DEEP_MATCHER_MAX_RATIO_PALETTE: f64 = 1.6;
 
 pub(super) const LZ_DEEP_MATCHER_MAX_RATIO_RCT: f64 = 1.01;
 
-/// Keep the full race unless a vector palette's LZ parse estimates at least
-/// 20% above literals. Actual entropy tables still arbitrate closer parses.
-const VECTOR_PALETTE_LZ_MAX_RATIO: f64 = 1.20;
+/// A variant whose order-0 estimate trails the other's by this factor is
+/// dropped before its entropy code is built: the codes move the two
+/// estimates 1-6 % apart, and of 272 lossless images (86 of them bi-level
+/// pages, where a screen's arms each built a code for a variant 35 % behind)
+/// and 40 lossy layer encodes no file changed.
+const VARIANT_ESTIMATE_MAX_RATIO: f64 = 1.10;
 
 /// A later variant is written when its code-based estimate is within this
 /// factor of the best written one (the estimate itself is ~0.5% accurate).
@@ -170,7 +173,6 @@ pub(super) fn choose_tree_streams<T: lz77::LiteralToken>(
     num_contexts: usize,
     min_symbol: u32,
     deep_lz_max_ratio: f64,
-    prune_trailing_lz: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Vec<TreeStreams<T>> {
@@ -199,7 +201,6 @@ pub(super) fn choose_tree_streams<T: lz77::LiteralToken>(
         num_contexts,
         min_symbol,
         deep_lz_max_ratio,
-        prune_trailing_lz,
         pool,
         scratch,
     );
@@ -216,7 +217,6 @@ fn choose_tree_streams_standard<T: lz77::LiteralToken>(
     num_contexts: usize,
     min_symbol: u32,
     deep_lz_max_ratio: f64,
-    prune_trailing_lz: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Vec<TreeStreams<T>> {
@@ -265,6 +265,11 @@ fn choose_tree_streams_standard<T: lz77::LiteralToken>(
             pool,
             scratch,
         ) {
+            let slices: Vec<&[LzToken]> = priced.iter().map(Vec::as_slice).collect();
+            let e_priced = estimate_streams_bits(&slices, num_contexts, min_symbol, pool, scratch);
+            if e_priced * VARIANT_ESTIMATE_MAX_RATIO < e_lit {
+                return vec![TreeStreams::Lz(priced)];
+            }
             return vec![TreeStreams::Literals(tokens), TreeStreams::Lz(priced)];
         }
         return vec![TreeStreams::Literals(tokens)];
@@ -272,7 +277,7 @@ fn choose_tree_streams_standard<T: lz77::LiteralToken>(
     let lz = deep(scratch);
     let slices: Vec<&[LzToken]> = lz.iter().map(Vec::as_slice).collect();
     let e_lz = estimate_streams_bits(&slices, num_contexts, min_symbol, pool, scratch);
-    if prune_trailing_lz && e_lz >= e_lit * VECTOR_PALETTE_LZ_MAX_RATIO {
+    if e_lz >= e_lit * VARIANT_ESTIMATE_MAX_RATIO {
         vec![TreeStreams::Literals(tokens)]
     } else if e_lz < e_lit {
         vec![TreeStreams::Lz(lz), TreeStreams::Literals(tokens)]

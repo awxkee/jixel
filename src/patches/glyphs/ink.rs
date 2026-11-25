@@ -30,7 +30,7 @@ use super::{GLYPH_BG_TILE, GlyphParams, Lattice};
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
 use crate::patches::PATCH_TILE;
-use crate::patches::color_key::{color_key, most_frequent_color, round_to_multiple};
+use crate::patches::color_key::{color_key, most_frequent_color};
 
 /// Share of the frame that may be ink before it stops being a page.
 pub(super) const GLYPH_MAX_INK_SHARE: f64 = 0.6;
@@ -50,14 +50,15 @@ pub(super) fn sample_is_mostly_ink(xyb: &Image3F, params: &GlyphParams) -> bool 
     let mut colors = [[0i32; 3]; PATCH_TILE * PATCH_TILE];
     let mut sample_keys = [0u64; PATCH_TILE * PATCH_TILE];
     let (mut ink, mut smooth, mut total) = (0usize, 0usize, 0usize);
+    debug_assert!(params.coarse > 0 && (params.coarse as u32).is_power_of_two());
+    let shift = params.coarse.trailing_zeros();
     for y0 in (0..height.saturating_sub(PATCH_TILE)).step_by(GLYPH_SCREEN_STRIDE) {
         for x0 in (0..width.saturating_sub(PATCH_TILE)).step_by(GLYPH_SCREEN_STRIDE) {
             crate::xyb::quantize_xyb_tile_colors(xyb, x0, y0, 1, &mut colors);
-            let k = params.coarse;
             for (key, c) in sample_keys.iter_mut().zip(&colors) {
-                // Same granularity as the full pass; tile colors are Y, X, B-Y.
-                let r = round_to_multiple;
-                *key = color_key(r(c[0], k), r(c[1], k), r(c[2] + c[0], k));
+                // The full pass's power-of-two rounding; tile colors are Y, X, B-Y.
+                let r = |v| crate::xyb::round_lattice_pow2_value(v, shift);
+                *key = color_key(r(c[0]), r(c[1]), r(c[2] + c[0]));
             }
             let mut sorted = sample_keys;
             let mode = most_frequent_color(&mut sorted);

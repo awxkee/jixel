@@ -466,9 +466,12 @@ impl SourcePlan {
         let keep_stages = !effort.tree_fresh_final_samples;
         let rank_presets_deep = effort.tree_rank_deep();
         // An ink frame is a palette image by construction: its color planes
-        // hold one value per ink, so only the palette source is learned.
-        let palette_only =
-            matches!(frame.kind, ModularFrameKind::XybBlend { .. }) && palette.is_some();
+        // hold one value per ink, so only the palette source is learned. A
+        // two-color palette also stands alone: the RGB source never came
+        // within the margin of it on 86 bi-level pages.
+        let palette_only = (matches!(frame.kind, ModularFrameKind::XybBlend { .. })
+            && palette.is_some())
+            || palette.is_some_and(GlobalPalette::is_bilevel);
         let rank_sampling = self.rank_sampling;
         let coarse = |source: &MaSource<'_>, wp_params: WpParams, scratch: &mut CoderScratch| {
             let mut stage = rank_coarse(
@@ -791,6 +794,16 @@ impl Tournament {
     ) {
         let first_stage = sources.palette_stage.take();
         let source = palette.source(frame.xsize, frame.ysize);
+        // A large palette learns the first layout only: the second changed
+        // no file of thirteen and took a fifth of their encode time. So does
+        // a two-color one, in each of its forms: over 56 bi-level pages the
+        // second layout's estimate led in 4 of 91 learns, by 0.6-2.2 % and
+        // in a form that lost to another, so no file changed.
+        let palette_layouts = if palette.is_large() || palette.is_bilevel() {
+            &layouts.all[..1]
+        } else {
+            &layouts.all[..]
+        };
         // A frame of at most four colors also codes its index image two
         // pixels to a sample. A bi-level one holding a repeated screen codes
         // each form under a tree of Zero-predictor leaves as well, where LZ77
@@ -814,32 +827,22 @@ impl Tournament {
                 }
             }
             for arm in &arms {
-                // The learner's estimate prices literals only. It ranks a
-                // Zero-predictor source's layouts by the tree alone, while
-                // its bytes follow the LZ77 matches: each layout is written.
-                let rounds: Vec<&[GroupLayout]> = if arm.value_tree {
-                    layouts.all.chunks(1).collect()
-                } else {
-                    vec![&layouts.all[..]]
-                };
-                for round in rounds {
-                    if let Some((layout, cand, _)) =
-                        self.learn_palette_layouts(frame, sources, arm, round, None, pool, scratch)
-                    {
-                        self.write_palette(
-                            frame, color, sources, arm, layout, &cand, best, pool, scratch,
-                        );
-                    }
+                if let Some((layout, cand, _)) = self.learn_palette_layouts(
+                    frame,
+                    sources,
+                    arm,
+                    palette_layouts,
+                    None,
+                    pool,
+                    scratch,
+                ) {
+                    self.write_palette(
+                        frame, color, sources, arm, layout, &cand, best, pool, scratch,
+                    );
                 }
             }
         }
-        // A large palette learns the first layout only: the second changed
-        // no file of thirteen and took a fifth of their encode time.
-        let palette_layouts = if palette.is_large() {
-            &layouts.all[..1]
-        } else {
-            &layouts.all[..]
-        };
+        drop(packed);
         let Some(raced) = raced else {
             if let Some((layout, cand, coarse)) = self.learn_palette_layouts(
                 frame,
