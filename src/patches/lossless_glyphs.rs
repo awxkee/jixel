@@ -32,7 +32,7 @@ use super::glyphs::{
 };
 use super::{ContentHashMap, LosslessPatches, PATCH_REF_ID, PatchReference};
 use crate::image::Image3Si;
-use crate::lossless::{rct_simd::forward_ycocg_planes, selected_rct_row_fn};
+use crate::lossless::{rct_simd::forward_ycocg_in_place, selected_rct_row_fn};
 use crate::shared_sort::SharedSort;
 use crate::thread_pool::ThreadPool;
 
@@ -373,6 +373,9 @@ pub(crate) fn find_lossless_additive_glyph_patches(
     bits: u32,
 ) -> Option<LosslessPatches> {
     let (width, height) = (linear.xsize(), linear.ysize());
+    if width < GLYPH_BG_TILE || height < GLYPH_BG_TILE {
+        return None;
+    }
     let mut rgb = std::array::from_fn(|_| vec![0; width * height]);
     // RCT type 0 reconstructs untransformed RGB.
     selected_rct_row_fn()(
@@ -381,17 +384,13 @@ pub(crate) fn find_lossless_additive_glyph_patches(
         rgb.each_mut().map(Vec::as_mut_slice),
     );
     let plan = super::glyphs::plan_additive_glyphs(rgb, width, height, bits)?;
-    let to_ycocg = |planes: &[Vec<i32>; 3], w: usize, h: usize| -> Option<Image3Si> {
-        let mut image = Image3Si::try_new(w, h).ok()?;
-        forward_ycocg_planes(
-            planes.each_ref().map(Vec::as_slice),
-            image.all_planes_mut().map(|plane| plane.as_mut_slice()),
-        );
-        Some(image)
+    let to_ycocg = |mut planes: [Vec<i32>; 3], w, h| {
+        forward_ycocg_in_place(planes.each_mut().map(Vec::as_mut_slice));
+        Image3Si::from_plane_data(w, h, planes)
     };
     Some(LosslessPatches {
-        atlas: to_ycocg(&plan.atlas, plan.atlas_width, plan.atlas_height)?,
-        base: to_ycocg(&plan.base, width, height)?,
+        atlas: to_ycocg(plan.atlas, plan.atlas_width, plan.atlas_height),
+        base: to_ycocg(plan.base, width, height),
         references: plan.references,
     })
 }

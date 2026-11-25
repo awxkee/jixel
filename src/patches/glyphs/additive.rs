@@ -261,34 +261,49 @@ pub(crate) fn plan_additive_glyphs(
     }
     let atlas_height = cy + shelf;
     let mut atlas: [Vec<i32>; 3] = std::array::from_fn(|_| vec![0; atlas_width * atlas_height]);
-    let mut base = rgb.clone();
+    // Build all tiles from the original samples before reusing those planes
+    // as the base. A placement can overlap the box of another tile's leader.
+    for (g, &(ax, ay)) in groups.iter().zip(&slots) {
+        let leader = &shapes[g[0]];
+        let bg = &grounds[g[0]];
+        for (c, plane) in atlas.iter_mut().enumerate() {
+            let rows = &mut plane[ay * atlas_width..(ay + leader.h) * atlas_width];
+            for (dy, row) in rows.chunks_exact_mut(atlas_width).enumerate() {
+                for (dx, value) in row[ax..ax + leader.w].iter_mut().enumerate() {
+                    *value = diff(leader, bg, c, dx, dy);
+                }
+            }
+        }
+    }
+    drop((label, grounds));
+    let mut base = rgb;
     let mut references = Vec::with_capacity(groups.len());
     for (g, (ax, ay)) in groups.into_iter().zip(slots) {
         let leader = &shapes[g[0]];
-        let leader_ground = grounds[g[0]];
-        for c in 0..3 {
-            for dy in 0..leader.h {
-                for dx in 0..leader.w {
-                    let shared = diff(leader, &leader_ground, c, dx, dy);
-                    atlas[c][(ay + dy) * atlas_width + ax + dx] = shared;
-                    if shared == 0 {
-                        continue;
-                    }
-                    for &i in &g {
-                        let s = &shapes[i];
-                        base[c][(s.y0 + dy) * width + s.x0 + dx] -= shared;
+        let (w, h) = (leader.w, leader.h);
+        let mut positions: Vec<(usize, usize)> =
+            g.iter().map(|&i| (shapes[i].x0, shapes[i].y0)).collect();
+        for (atlas_plane, base_plane) in atlas.iter().zip(&mut base) {
+            let tile_rows = &atlas_plane[ay * atlas_width..(ay + h) * atlas_width];
+            for &(x, y) in &positions {
+                let base_rows = &mut base_plane[y * width..(y + h) * width];
+                for (base_row, tile_row) in base_rows
+                    .chunks_exact_mut(width)
+                    .zip(tile_rows.chunks_exact(atlas_width))
+                {
+                    for (pixel, &shared) in base_row[x..x + w].iter_mut().zip(&tile_row[ax..ax + w])
+                    {
+                        *pixel -= shared;
                     }
                 }
             }
         }
-        let mut positions: Vec<(usize, usize)> =
-            g.iter().map(|&i| (shapes[i].x0, shapes[i].y0)).collect();
         positions.shared_sort_unstable_by_key(|&(x, y)| (y, x));
         references.push(PatchReference {
             atlas_x: ax,
             atlas_y: ay,
-            width: leader.w,
-            height: leader.h,
+            width: w,
+            height: h,
             ref_frame: PATCH_REF_ID,
             alpha_only: false,
             add: true,

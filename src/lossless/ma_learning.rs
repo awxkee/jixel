@@ -35,16 +35,18 @@ use super::ma_sampling::{MaRefPlane, ma_channel_sample_count, sample_channel_ma}
 use super::ma_source::{
     CoarseLearn, DENSE_NO_WP_MAX_COST, LearnedCandidate, MA_COARSE_MAX_LEAVES,
     MA_COARSE_TARGET_SAMPLES, MA_DEEPEN_MIN_LEAVES, MA_DEEPEN_MIN_SAVINGS, MA_DENSE_SAMPLING,
-    MA_FINAL_SPLIT_COST_BITS, MA_LITE_CANDIDATES, MA_LITE_MAX_LEAVES, MA_LITE_SAMPLING,
-    MA_MIN_NODE_SAMPLES, MA_NO_WP_CHANNELS, MA_PRUNE_LEAF_BITS, MA_PRUNE_MIN_NODE_SAMPLES,
-    MA_PRUNE_SPLIT_COST_BITS, MA_SIDE_PREDS, MA_SPLIT_COST_BITS, MA_WIDE_SIDE_PREDS, MaSource,
-    MaTransform, ac_stream_id, with_ma_pixels,
+    MA_FINAL_SPLIT_COST_BITS, MA_FINE_CANDIDATES, MA_LITE_CANDIDATES, MA_LITE_MAX_LEAVES,
+    MA_LITE_SAMPLING, MA_MIN_NODE_SAMPLES, MA_NO_WP_CHANNELS, MA_PRUNE_LEAF_BITS,
+    MA_PRUNE_MIN_NODE_SAMPLES, MA_PRUNE_SPLIT_COST_BITS, MA_SHARED_MAX_BITS_PER_VALUE,
+    MA_SHARED_MIN_NODE_SAMPLES, MA_SHARED_NEW_TABLE_BITS, MA_SHARED_OWN_BITS,
+    MA_SHARED_SPLIT_COST_BITS, MA_SHARED_TABLES, MA_SIDE_PREDS, MA_SPLIT_COST_BITS,
+    MA_WIDE_SIDE_PREDS, MaSource, MaTransform, ac_stream_id, with_ma_pixels,
 };
 use super::tree::emit_learned_tree;
 use crate::coder_scratch::CoderScratch;
 use crate::ma_tree::{
-    LearnedTree, MaLearnParams, MaNode, MaSamples, NUM_MA_PREDS, NUM_MA_PROPS, deepen_ma_tree,
-    learn_ma_tree, learn_ma_tree_indexed,
+    LearnedTree, MaLearnParams, MaNode, MaSamples, NUM_MA_PREDS, NUM_MA_PROPS, SharedTables,
+    deepen_ma_tree, learn_ma_tree, learn_ma_tree_indexed,
 };
 use crate::thread_pool::ThreadPool;
 use crate::weighted_predictor::WpParams;
@@ -248,6 +250,8 @@ pub(super) fn ma_learn_params(
         channel_first: true,
         no_wp_channels: MA_NO_WP_CHANNELS,
         index_first_depth: 0,
+        shared_tables: None,
+        fine_candidates: MA_FINE_CANDIDATES,
     }
 }
 
@@ -431,6 +435,17 @@ pub(super) fn finish_ma_learn(
         params.side_preds = MA_WIDE_SIDE_PREDS;
     }
     let leaf_price = ma_leaf_price(&params, coarse.stride as f64);
+    let scale = coarse.stride as f32;
+    // Slow and slower only: at Medium the phase halved the decode speed of
+    // two line drawings (their estimates pick the frame there).
+    params.shared_tables = speed.effort().tree_dense_sampling.then_some(SharedTables {
+        tables: MA_SHARED_TABLES,
+        new_table_bits: MA_SHARED_NEW_TABLE_BITS,
+        own_bits: MA_SHARED_OWN_BITS / scale,
+        split_cost_bits: MA_SHARED_SPLIT_COST_BITS / scale,
+        min_node: MA_SHARED_MIN_NODE_SAMPLES,
+        max_bits_per_sample: MA_SHARED_MAX_BITS_PER_VALUE,
+    });
     let (deep_tree, samples) = deepen_ma_tree(
         coarse.samples,
         params,

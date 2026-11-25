@@ -234,6 +234,65 @@ pub(crate) fn fwd_v_squeeze(chin: &Channel) -> (Channel, Channel) {
     (avg, res)
 }
 
+/// Visit each forward Squeeze row for an index plane with complete pairs.
+/// Only the current rows and the vertical predictor's neighbors are widened.
+pub(crate) fn visit_squeezed_index_rows(
+    indices: &[u16],
+    width: usize,
+    horizontal: bool,
+    mut visit: impl FnMut(&[i32], &[i32]),
+) {
+    let widen = |src: &[u16], dst: &mut [i32]| {
+        for (&index, value) in src.iter().zip(dst) {
+            *value = i32::from(index);
+        }
+    };
+    let kernels = row_kernels::selected();
+    if horizontal {
+        debug_assert!(width.is_multiple_of(2));
+        let mut scratch = vec![0; 2 * width];
+        let (row, output) = scratch.split_at_mut(width);
+        let (avg, res) = output.split_at_mut(width / 2);
+        for input in indices.chunks_exact(width) {
+            widen(input, row);
+            (kernels.forward_horizontal)(row, avg, res);
+            visit(avg, res);
+        }
+        return;
+    }
+
+    let mut pairs = indices.chunks_exact(2 * width);
+    let Some(first) = pairs.next() else {
+        return;
+    };
+    let mut scratch = vec![0; 7 * width];
+    let (output, rows) = scratch.split_at_mut(2 * width);
+    let (avg, res) = output.split_at_mut(width);
+    let mut rows = rows.chunks_exact_mut(width);
+    let [mut top, mut a, mut b, mut next_a, mut next_b] =
+        std::array::from_fn(|_| rows.next().unwrap());
+    let widen_pair = |pair: &[u16], a: &mut [i32], b: &mut [i32]| {
+        let (first, second) = pair.split_at(width);
+        widen(first, a);
+        widen(second, b);
+    };
+    let mut forward = |top: Option<&[i32]>, pixels: [&[i32]; 2], next: [&[i32]; 2]| {
+        (kernels.forward_vertical)(row_kernels::ForwardRow { pixels, top, next }, [avg, res]);
+        visit(avg, res);
+    };
+    let mut has_top = false;
+    widen_pair(first, a, b);
+    for pair in pairs {
+        widen_pair(pair, next_a, next_b);
+        forward(has_top.then_some(&*top), [a, b], [next_a, next_b]);
+        std::mem::swap(&mut top, &mut b);
+        std::mem::swap(&mut a, &mut next_a);
+        std::mem::swap(&mut b, &mut next_b);
+        has_top = true;
+    }
+    forward(has_top.then_some(&*top), [a, b], [a, b]);
+}
+
 pub(crate) fn inv_v_squeeze(avg: &Channel, res: &Channel) -> Channel {
     let w = avg.w;
     let oh = avg.h;

@@ -117,6 +117,15 @@ pub(crate) struct Image3<T> {
 }
 
 impl<T: Copy + Default> Image3<T> {
+    /// Wrap three tightly packed planes without copying their pixel storage.
+    pub(crate) fn from_plane_data(xsize: usize, ysize: usize, data: [Vec<T>; 3]) -> Self {
+        let len = xsize.checked_mul(ysize).expect("image dimensions overflow");
+        assert!(data.iter().all(|plane| plane.len() == len));
+        Self {
+            planes: data.map(|data| Plane { data, xsize, ysize }),
+        }
+    }
+
     /// Transfer plane ownership without copying pixel storage, allowing
     /// callers to release channels whose last use precedes the others'.
     pub(crate) fn into_planes(self) -> [Plane<T>; 3] {

@@ -83,10 +83,7 @@ pub(crate) const MA_DENSE_SAMPLING: (usize, usize) =
     (MA_FINAL_TARGET_SAMPLES, MA_FINAL_FULL_SAMPLE_LIMIT);
 
 /// The dense final budget applies to sources whose first-stage estimate
-/// costs at least this many bits per value: photos and paintings (2-3 b/v).
-/// Screen and text content (0.3 b/v and below) gets nothing from it — its
-/// gains come from local trees and patches — while a 7.7 MP UI screenshot
-/// would spend 2.5x the CPU and 2.5 GB, and a web render came out 7% larger.
+/// costs at least this many bits per value.
 pub(crate) const DENSE_FINAL_MIN_BITS_PER_VALUE: f64 = 1.0;
 
 /// Screen and flat-art sources below that take the dense budget without the
@@ -94,20 +91,32 @@ pub(crate) const DENSE_FINAL_MIN_BITS_PER_VALUE: f64 = 1.0;
 /// predictor's absence at most this factor (`dense_no_wp_final`).
 pub(crate) const DENSE_NO_WP_MAX_COST: f64 = 1.07;
 
+/// `MaLearnParams::fine_candidates` of the lossless learns: 8, 16 and 32
+/// refined thresholds coded the same within 0.03 %.
+pub(crate) const MA_FINE_CANDIDATES: usize = 16;
+
+/// Shared-table growth of a final learn (`ma_tree::SharedTables`).
+pub(crate) const MA_SHARED_TABLES: usize = 32;
+pub(crate) const MA_SHARED_NEW_TABLE_BITS: f32 = 150.0;
+pub(crate) const MA_SHARED_OWN_BITS: f32 = 100.0;
+pub(crate) const MA_SHARED_SPLIT_COST_BITS: f32 = 24.0;
+pub(crate) const MA_SHARED_MIN_NODE_SAMPLES: usize = 8;
+
+/// Sources estimated at this many bits per value or more skip it: photos
+/// gained 0.1 % at twice their encode.
+pub(crate) const MA_SHARED_MAX_BITS_PER_VALUE: f32 = 1.0;
+
 /// `MaLearnParams::index_first_depth` of a global palette's index image.
 const MA_INDEX_FIRST_DEPTH: u16 = 8;
 
 /// A one-dimensional palette (`MaSource::palette_is_ramp`) above this many
-/// colours keeps the split order of the gains: its index is the grey level
-/// itself and names no colour family (scanned grey pages coded up to 1.4%
+/// colors keeps the split order of the gains: its index is the grey level
+/// itself and names no color family (scanned grey pages coded up to 1.4%
 /// larger index first; a handful of flat tones still gains).
 const MA_INDEX_FIRST_RAMP_MAX_COLORS: u32 = 16;
 
 /// Share of a row's index changes that go to the next or the previous
-/// palette entry from which the index is a level
-/// (`MaSource::index_is_level`): contour bands in a palette ordered along
-/// them gave 0.69 to 0.77 and coded 0.9 to 13.9% larger index first; the
-/// illustrations, comics and screenshots that gain from it 0.36 and less.
+/// palette entry from which the index is a level.
 const MA_INDEX_LEVEL_MIN_SHARE: f64 = 0.5;
 
 /// Rows between the ones `MaSource::index_is_level` reads.
@@ -441,8 +450,8 @@ impl MaSource<'_> {
     /// Whether the global palette's index image is a level: where it
     /// changes along a row it mostly steps to the entry beside it, as the
     /// grey level of a ramp does. The palette order follows the image there
-    /// (contour bands, height maps): a neighbour's index predicts the next
-    /// one by its value, and its range names no colour family.
+    /// (contour bands, height maps): a neighbor's index predicts the next
+    /// one by its value, and its range names no color family.
     fn index_is_level(&self) -> bool {
         let index = &self.channels[1];
         let width = index.w.max(1);

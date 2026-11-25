@@ -188,11 +188,11 @@ pub(in crate::lossless) fn screen_share(
     }
 }
 
-/// [`screen_share`] of an image of exactly two colors, `None` for any other.
-pub(in crate::lossless) fn bilevel_screen_share(linear: &Image3Si) -> Option<f64> {
+/// Whether `linear` holds exactly two colors.
+pub(in crate::lossless) fn is_bilevel_image(linear: &Image3Si) -> bool {
     let (xsize, ysize) = (linear.xsize(), linear.ysize());
     if xsize == 0 || ysize == 0 {
-        return None;
+        return false;
     }
     let planes = [0, 1, 2].map(|c| linear.plane_data(c));
     let color_at = |i: usize| planes.map(|p| p[i]);
@@ -201,14 +201,25 @@ pub(in crate::lossless) fn bilevel_screen_share(linear: &Image3Si) -> Option<f64
     for i in 0..xsize * ysize {
         let color = color_at(i);
         if color != first && *second.get_or_insert(color) != color {
-            return None;
+            return false;
         }
     }
-    second?;
+    second.is_some()
+}
+
+/// [`screen_share`] of an image of exactly two colors, `None` for any other.
+pub(in crate::lossless) fn bilevel_screen_share(linear: &Image3Si) -> Option<f64> {
+    if !is_bilevel_image(linear) {
+        return None;
+    }
+    let xsize = linear.xsize();
+    let planes = [0, 1, 2].map(|c| linear.plane_data(c));
+    let color_at = |i: usize| planes.map(|p| p[i]);
+    let first = color_at(0);
     Some(screen_share(
         |x, y| color_at(y * xsize + x) != first,
         xsize,
-        ysize,
+        linear.ysize(),
     ))
 }
 
@@ -251,36 +262,30 @@ impl<'a> PackedPalette<'a> {
         if !horizontal && !ysize.is_multiple_of(2) {
             return None;
         }
-        // The decoder's own forward Squeeze, smoothing term included.
-        let channel = crate::squeeze::Channel {
-            data: base.indices.iter().map(|&i| i32::from(i)).collect(),
-            w: xsize,
-            h: ysize,
-            hshift: 0,
-            vshift: 0,
-        };
-        let (avg, res) = if horizontal {
-            crate::squeeze::fwd_h_squeeze(&channel)
-        } else {
-            crate::squeeze::fwd_v_squeeze(&channel)
-        };
-        debug_assert_eq!(avg.data.len(), res.data.len());
         // Averages lie in 0..colors. A pair difference is below `colors` and
         // the smoothing term below `2 * colors` in magnitude, so a residual
         // lies within `3 * colors`.
+        const MAX_SLOTS: usize = PACKED_PALETTE_MAX_COLORS * (6 * PACKED_PALETTE_MAX_COLORS + 1);
         let reach = 3 * colors as i32;
         let span = 2 * reach + 1;
         let slot = |a: i32, r: i32| {
             debug_assert!((0..colors as i32).contains(&a) && r.abs() <= reach);
             (a * span + r + reach) as usize
         };
-        let mut used = vec![false; colors * span as usize];
-        for (&a, &r) in avg.data.iter().zip(&res.data) {
-            used[slot(a, r)] = true;
-        }
+        let mut indices = Vec::with_capacity(base.indices.len() / 2);
+        let mut index_of = [0u16; MAX_SLOTS];
+        // Store tuple slots in the final index buffer while Squeeze's rows
+        // are still in scratch. Remap them once the tuple order is known.
+        crate::squeeze::visit_squeezed_index_rows(&base.indices, xsize, horizontal, |avg, res| {
+            indices.extend(avg.iter().zip(res).map(|(&a, &r)| {
+                let slot = slot(a, r);
+                index_of[slot] = 1;
+                slot as u16
+            }));
+        });
         let mut tuples: Vec<(i32, i32)> = (0..colors as i32)
             .flat_map(|a| (-reach..=reach).map(move |r| (a, r)))
-            .filter(|&(a, r)| used[slot(a, r)])
+            .filter(|&(a, r)| index_of[slot(a, r)] != 0)
             .collect();
         // Index order: the pair a tuple decodes to under a zero smoothing
         // term (the decoder's inverse Squeeze), first pixel major. A bi-level
@@ -290,22 +295,20 @@ impl<'a> PackedPalette<'a> {
             let first = a + r / 2;
             (first, first - r)
         });
-        let mut index_of = vec![0u16; used.len()];
         for (index, &(a, r)) in tuples.iter().enumerate() {
             index_of[slot(a, r)] = index as u16;
         }
+        for index in &mut indices {
+            *index = index_of[usize::from(*index)];
+        }
         let packed_colors = tuples.len();
-        let mut table: Vec<i32> = tuples.iter().map(|&(a, _)| a).collect();
+        let mut table = Vec::with_capacity(2 * packed_colors);
+        table.extend(tuples.iter().map(|&(a, _)| a));
         table.extend(tuples.iter().map(|&(_, r)| r));
         Some(Self {
             base,
             tuples: table,
-            indices: avg
-                .data
-                .iter()
-                .zip(&res.data)
-                .map(|(&a, &r)| index_of[slot(a, r)])
-                .collect(),
+            indices,
             packed_colors,
             horizontal,
         })
@@ -1439,7 +1442,7 @@ pub(in crate::lossless) fn build_global_palettes(
         }
     }
     // The palette under `order` (`order[canonical] = final index`).
-    let under = |order: &[i32]| {
+    let make_palette = |order: &[i32], indices| {
         let mut palette = vec![0i32; num_c * nb_colors];
         for (canonical, color) in colors.iter().enumerate() {
             let index = order[canonical] as usize;
@@ -1451,13 +1454,26 @@ pub(in crate::lossless) fn build_global_palettes(
         }
         GlobalPalette {
             palette,
-            indices: indices.iter().map(|&v| order[v as usize] as u16).collect(),
+            indices,
             nb_colors,
             num_c,
         }
     };
     let Some(race) = race else {
-        return Some((under(&orders[best_order]), None));
+        let order = &orders[best_order];
+        for index in &mut indices {
+            *index = order[usize::from(*index)] as u16;
+        }
+        return Some((make_palette(order, indices), None));
+    };
+    let under = |order: &[i32]| {
+        make_palette(
+            order,
+            indices
+                .iter()
+                .map(|&v| order[usize::from(v)] as u16)
+                .collect(),
+        )
     };
     let mut coarse = |palette: &GlobalPalette, gain_order: bool| {
         let mut source = palette.source(xsize, ysize);

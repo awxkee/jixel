@@ -450,7 +450,7 @@ mod tests {
         for r in 0..rows {
             for c in 0..cols {
                 let (x0, y0) = (3 + c * 7, 2 + r * 13);
-                // Horizontal arm over the whole cell, so neighbours touch.
+                // Horizontal arm over the whole cell, so neighbors touch.
                 for dx in 0..7 {
                     ink[(y0 + 6) * width + x0 + dx] = true;
                 }

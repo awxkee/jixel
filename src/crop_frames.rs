@@ -152,7 +152,7 @@ pub(crate) fn plan(rgb: &[u8], width: usize, height: usize) -> Vec<CropBox> {
 
 /// A crop's most common color, which the surrounding flat art usually
 /// continues.
-/// (A Coons patch of the border pixels streaks a neighbouring photo's grain
+/// (A Coons patch of the border pixels streaks a neighboring photo's grain
 /// across the box: base +4..+8 %, and the corpus wins shrink by a third.)
 pub(crate) fn background_color(rgb: &[u8], width: usize, b: CropBox) -> [u8; 3] {
     let pixels = rgb.as_chunks::<3>().0;
