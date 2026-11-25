@@ -574,6 +574,9 @@ pub struct EncodeConfig {
     /// `patches` came from the speed tier's lite default, not from
     /// `with_patches`: lossy frames only, without the Slow-tier races.
     pub(crate) patches_lite: bool,
+    /// A lossy request coded losslessly (bi-level or few-level content):
+    /// its frames count as a lossy encode's (`LosslessSettings::lossy_layer`).
+    pub(crate) lossy_fallback: bool,
     /// The plain arm of the glyph-template race: glyph searches report how
     /// many shapes templates could share.
     pub(crate) template_probe: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
@@ -634,6 +637,9 @@ pub(crate) struct EncodeConfigImpl {
     /// If true, encode losslessly via the modular encoder. `distance` is then
     /// ignored. RGB and alpha both round-trip bit-perfectly.
     pub(crate) lossless: bool,
+    /// A lossy request coded losslessly (bi-level or few-level content): its
+    /// frames count as a lossy encode's (`LosslessSettings::lossy_layer`).
+    pub(crate) lossy_fallback: bool,
     /// Invisible-color preprocessing (see `EncodeConfig::fill_invisible`).
     pub(crate) fill_invisible: bool,
     pub(crate) progressive: bool,
@@ -727,6 +733,7 @@ impl Default for EncodeConfig {
             templates_active: false,
             templates_ground_only: false,
             patches_lite: false,
+            lossy_fallback: false,
             template_probe: None,
         }
     }
@@ -746,6 +753,7 @@ impl Default for EncodeConfigImpl {
             black: false,
             bits_per_sample: BitsPerSample::Eight,
             lossless: false,
+            lossy_fallback: false,
             fill_invisible: true,
             progressive: false,
             patches: false,
@@ -776,6 +784,11 @@ impl Default for EncodeConfigImpl {
 }
 
 impl EncodeConfigImpl {
+    pub(crate) fn with_lossy_fallback(mut self, lossy_fallback: bool) -> Self {
+        self.lossy_fallback = lossy_fallback;
+        self
+    }
+
     /// Convenience builder with the given butteraugli distance and otherwise
     /// default settings (sRGB primaries and transfer).
     pub(crate) fn with_distance(distance: f32) -> Self {
@@ -1771,6 +1784,7 @@ fn encode_image_rgb(
     if bilevel_codes_exactly(config) && at_most_two_colors(input.as_chunks::<3>().0) {
         let mut exact = config.clone();
         exact.lossless = true;
+        exact.lossy_fallback = true;
         let flipped = flip_bilevel(input.as_chunks::<3>().0, width, height, config.distance);
         let pixels = flipped.as_deref().unwrap_or(input.as_chunks::<3>().0);
         return encode_image_rgb(pixels.as_flattened(), width, height, &exact);
@@ -1780,6 +1794,7 @@ fn encode_image_rgb(
     {
         let mut exact = config.clone();
         exact.lossless = true;
+        exact.lossy_fallback = true;
         return encode_image_rgb(quantized.as_flattened(), width, height, &exact);
     }
     if config.lossless {
@@ -1791,6 +1806,7 @@ fn encode_image_rgb(
             8,
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(config.lossless)
+                .with_lossy_fallback(config.lossy_fallback)
                 .with_progressive(config.progressive)
                 .with_patches(config.patches_in(config.lossless))
                 .with_icc_profile(config.icc_profile.clone())
@@ -3435,6 +3451,7 @@ pub fn encode_image_with_alpha(
             8,
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(config.lossless)
+                .with_lossy_fallback(config.lossy_fallback)
                 .with_progressive(config.progressive)
                 .with_patches(config.patches_in(config.lossless))
                 .with_icc_profile(config.icc_profile.clone())
@@ -3828,6 +3845,7 @@ fn encode_gray_impl<const CHANNELS: usize>(
     if CHANNELS == 1 && bilevel_codes_exactly(config) && at_most_two_colors(pixels) {
         let mut exact = config.clone();
         exact.lossless = true;
+        exact.lossy_fallback = true;
         let flipped = flip_bilevel(pixels, width, height, config.distance);
         let pixels = flipped.as_deref().unwrap_or(pixels);
         return encode_gray_impl::<CHANNELS>(pixels.as_flattened(), width, height, &exact);
@@ -3838,6 +3856,7 @@ fn encode_gray_impl<const CHANNELS: usize>(
     {
         let mut exact = config.clone();
         exact.lossless = true;
+        exact.lossy_fallback = true;
         return encode_gray_impl::<CHANNELS>(&quantized, width, height, &exact);
     }
     let alpha = || (CHANNELS == 2).then(|| pixels.iter().map(|px| px[1]).collect::<Vec<_>>());
@@ -3854,6 +3873,7 @@ fn encode_gray_impl<const CHANNELS: usize>(
             8,
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(true)
+                .with_lossy_fallback(config.lossy_fallback)
                 .with_grayscale(true)
                 .with_patches(config.patches_in(true))
                 .with_icc_profile(config.icc_profile.clone())
@@ -4068,6 +4088,7 @@ fn encode_gray_high_depth_impl<const CHANNELS: usize>(
             bps.bits() as u8,
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(true)
+                .with_lossy_fallback(config.lossy_fallback)
                 .with_grayscale(true)
                 .with_patches(config.patches_in(true))
                 .with_bits_per_sample(bps)
@@ -4166,6 +4187,7 @@ fn encode_high_depth_rgba(
             bps.bits() as u8,
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(config.lossless)
+                .with_lossy_fallback(config.lossy_fallback)
                 .with_bits_per_sample(bps)
                 .with_patches(config.patches_in(config.lossless))
                 .with_icc_profile(config.icc_profile.clone())
@@ -5001,6 +5023,7 @@ fn encode_lossless_planes(
             decoding_speed: config.decoding_speed,
             upsampling,
             near_lossless: config.near_lossless > 0,
+            lossy_layer: config.lossy_fallback,
         },
         config.patches,
         config.num_threads,

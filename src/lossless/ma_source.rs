@@ -74,12 +74,12 @@ const MA_FINAL_FULL_SAMPLE_LIMIT: usize = 1 << 24;
 
 /// (target samples, full-sample limit) of `tree_full_sampling`, the lite
 /// budget and the dense final learn.
-pub(super) const MA_FULL_SAMPLING: (usize, usize) = (MA_TARGET_SAMPLES, MA_FULL_SAMPLE_LIMIT);
+pub(crate) const MA_FULL_SAMPLING: (usize, usize) = (MA_TARGET_SAMPLES, MA_FULL_SAMPLE_LIMIT);
 
-pub(super) const MA_LITE_SAMPLING: (usize, usize) =
+pub(crate) const MA_LITE_SAMPLING: (usize, usize) =
     (MA_LITE_TARGET_SAMPLES, MA_LITE_FULL_SAMPLE_LIMIT);
 
-pub(super) const MA_DENSE_SAMPLING: (usize, usize) =
+pub(crate) const MA_DENSE_SAMPLING: (usize, usize) =
     (MA_FINAL_TARGET_SAMPLES, MA_FINAL_FULL_SAMPLE_LIMIT);
 
 /// The dense final budget applies to sources whose first-stage estimate
@@ -87,20 +87,46 @@ pub(super) const MA_DENSE_SAMPLING: (usize, usize) =
 /// Screen and text content (0.3 b/v and below) gets nothing from it — its
 /// gains come from local trees and patches — while a 7.7 MP UI screenshot
 /// would spend 2.5x the CPU and 2.5 GB, and a web render came out 7% larger.
-pub(super) const DENSE_FINAL_MIN_BITS_PER_VALUE: f64 = 1.0;
+pub(crate) const DENSE_FINAL_MIN_BITS_PER_VALUE: f64 = 1.0;
 
 /// Screen and flat-art sources below that take the dense budget without the
 /// Weighted Predictor when a pair of lite first-stage learns prices the
 /// predictor's absence at most this factor (`dense_no_wp_final`).
-pub(super) const DENSE_NO_WP_MAX_COST: f64 = 1.07;
+pub(crate) const DENSE_NO_WP_MAX_COST: f64 = 1.07;
+
+/// `MaLearnParams::index_first_depth` of a global palette's index image.
+const MA_INDEX_FIRST_DEPTH: u16 = 8;
+
+/// A one-dimensional palette (`MaSource::palette_is_ramp`) above this many
+/// colours keeps the split order of the gains: its index is the grey level
+/// itself and names no colour family (scanned grey pages coded up to 1.4%
+/// larger index first; a handful of flat tones still gains).
+const MA_INDEX_FIRST_RAMP_MAX_COLORS: u32 = 16;
+
+/// Share of a row's index changes that go to the next or the previous
+/// palette entry from which the index is a level
+/// (`MaSource::index_is_level`): contour bands in a palette ordered along
+/// them gave 0.69 to 0.77 and coded 0.9 to 13.9% larger index first; the
+/// illustrations, comics and screenshots that gain from it 0.36 and less.
+const MA_INDEX_LEVEL_MIN_SHARE: f64 = 0.5;
+
+/// Rows between the ones `MaSource::index_is_level` reads.
+const MA_INDEX_LEVEL_ROW_STRIDE: usize = 4;
 
 /// First-stage learner budget. Most unhelpful or simple trees terminate here;
 /// only a saturated tree with a clear rate win is retrained on the full probe.
-pub(super) const MA_COARSE_TARGET_SAMPLES: usize = 1 << 16;
+pub(crate) const MA_COARSE_TARGET_SAMPLES: usize = 1 << 16;
 
-pub(super) const MA_COARSE_MAX_LEAVES: usize = 32;
+pub(crate) const MA_COARSE_MAX_LEAVES: usize = 32;
 
-pub(super) const MA_DEEPEN_MIN_SAVINGS: f64 = 0.02;
+/// A coarse tree with at least this many leaves is deepened (when it also
+/// saves `MA_DEEPEN_MIN_SAVINGS`). Below the cap: a source sampled at stride
+/// 1 scales its split cost up by the coarse subsample, and its coarse tree
+/// can stop a few leaves short of the cap on an image that needs 5× more
+/// (a 1.6 MP RGBA layer: 29 coarse leaves kept, 169 when deepened, +6 %).
+pub(crate) const MA_DEEPEN_MIN_LEAVES: usize = 24;
+
+pub(crate) const MA_DEEPEN_MIN_SAVINGS: f64 = 0.02;
 
 /// Bits a split must save (image domain) before it's kept. Growth is
 /// best-first, so this mostly prunes the tail once the leaf budget is spent.
@@ -108,81 +134,80 @@ pub(crate) const MA_SPLIT_COST_BITS: f32 = 100.0;
 
 /// Split cost of the final learns. Half the first-stage cost grows trees
 /// that code 0.4-2.2% smaller on nearly every photo, painting and UI screen
-/// (Kodak 24/24, -0.72% in total) for 15-25% more encode time there. Ranking
-/// and coarse learns keep the full cost: their estimates gate candidate
-/// sources and frames, and a text render lost 33% when a lower cost flipped
-/// one of those gates. Below 50 the trees overfit (25: Kodak +9%).
-pub(super) const MA_FINAL_SPLIT_COST_BITS: f32 = 50.0;
+/// for 15-25% more encode time there.
+pub(crate) const MA_FINAL_SPLIT_COST_BITS: f32 = 50.0;
 
 /// Leaf cap: pixel contexts + the LZ77 distance context must fit the
 /// LZ77_MAX_CONTEXTS scratch; ANS clustering reduces them to <= 128
 /// histograms. Best-first growth adds exactly one leaf per split, so the cap
 /// is hard.
-pub(super) const MA_MAX_LEAVES: usize = LZ77_MAX_CONTEXTS - 1;
+pub(crate) const MA_MAX_LEAVES: usize = LZ77_MAX_CONTEXTS - 1;
 
 /// Channels of a learned lossless tree that go without the Weighted
 /// Predictor (`MaLearnParams::no_wp_channels`). `0b110`, the two chroma
 /// channels of an RCT source.
-pub(super) const MA_NO_WP_CHANNELS: u32 = 0;
+pub(crate) const MA_NO_WP_CHANNELS: u32 = 0;
 
 /// Minimum samples in a node before it must become a leaf.
 pub(crate) const MA_MIN_NODE_SAMPLES: usize = 128;
 
 /// Grow-then-prune of palette index trees (`with_ma_prune`): growth split
 /// cost and minimum node, and the bits the prune charges per kept leaf.
-pub(super) const MA_PRUNE_SPLIT_COST_BITS: f32 = 20.0;
+pub(crate) const MA_PRUNE_SPLIT_COST_BITS: f32 = 20.0;
 
-pub(super) const MA_PRUNE_MIN_NODE_SAMPLES: usize = 16;
+pub(crate) const MA_PRUNE_MIN_NODE_SAMPLES: usize = 16;
 
-pub(super) const MA_PRUNE_LEAF_BITS: f32 = 40.0;
+pub(crate) const MA_PRUNE_LEAF_BITS: f32 = 40.0;
 
 /// Predictors each side of a candidate split may choose from (the node's
 /// cheapest ones).
-pub(super) const MA_SIDE_PREDS: usize = 4;
+pub(crate) const MA_SIDE_PREDS: usize = 4;
 
 /// `MA_SIDE_PREDS` of the final RCT tree learn under `tree_wide_side_preds`.
-pub(super) const MA_WIDE_SIDE_PREDS: usize = 7;
+pub(crate) const MA_WIDE_SIDE_PREDS: usize = 7;
 
 /// Leaf cap of sub-sampled final learns without `tree_deep_final`.
-pub(super) const MA_LITE_MAX_LEAVES: usize = 1024;
+pub(crate) const MA_LITE_MAX_LEAVES: usize = 1024;
 
 /// Split candidates of sub-sampled final learns without `tree_deep_final`.
-pub(super) const MA_LITE_CANDIDATES: usize = 16;
+pub(crate) const MA_LITE_CANDIDATES: usize = 16;
 
 /// First learning stage: the merged samples with a gated coarse tree (or the
 /// complete tree for small sample sets). Cheap enough to run once per group
 /// layout; only the winning layout is deepened.
-pub(super) struct CoarseLearn {
-    pub(super) samples: MaSamples,
-    pub(super) stride: usize,
-    pub(super) max_candidates: usize,
+pub(crate) struct CoarseLearn {
+    pub(crate) samples: MaSamples,
+    pub(crate) stride: usize,
+    pub(crate) max_candidates: usize,
     /// Leaf predictor offsets apply (RCT sources; palette indices lose).
-    pub(super) leaf_offsets: bool,
+    pub(crate) leaf_offsets: bool,
     /// `MaSource::value_tree`.
-    pub(super) value_tree: bool,
-    pub(super) candidate: LearnedCandidate,
+    pub(crate) value_tree: bool,
+    /// `MaSource::index_first_depth`.
+    pub(crate) index_first_depth: u16,
+    pub(crate) candidate: LearnedCandidate,
     /// The coarse tree saturated its leaf budget with a clear win, so the
     /// full-probe second stage is worth its cost.
-    pub(super) deepen: bool,
+    pub(crate) deepen: bool,
 }
 
 /// A gated learned tree with its BFS emission and rate estimate.
-pub(super) struct LearnedCandidate {
-    pub(super) tree: LearnedTree,
-    pub(super) tree_tokens: Vec<Token>,
-    pub(super) leaf_ctx: Vec<u32>,
+pub(crate) struct LearnedCandidate {
+    pub(crate) tree: LearnedTree,
+    pub(crate) tree_tokens: Vec<Token>,
+    pub(crate) leaf_ctx: Vec<u32>,
     /// Predictor offset per context (see `leaf_offsets`).
-    pub(super) leaf_offset: Vec<i32>,
-    pub(super) num_ctx: u32,
+    pub(crate) leaf_offset: Vec<i32>,
+    pub(crate) num_ctx: u32,
     /// Estimated image-domain bits of the tree-coded frame, headers included.
-    pub(super) est_real: f64,
+    pub(crate) est_real: f64,
     /// Estimated image-domain bits of the flat alternative.
-    pub(super) flat_real: f64,
+    pub(crate) flat_real: f64,
     /// Estimated fractional saving over the flat path.
-    pub(super) estimated_savings: f64,
+    pub(crate) estimated_savings: f64,
     /// The context of the constant channel's leaf, once `with_constant_channel`
     /// wrapped the tree (always 0: the leaf is the root's first child).
-    pub(super) constant_ctx: Option<u32>,
+    pub(crate) constant_ctx: Option<u32>,
 }
 
 impl LearnedCandidate {
@@ -190,7 +215,7 @@ impl LearnedCandidate {
     /// Zero-predictor leaf with offset `value` for channel `chan_id` (the
     /// last channel of its stream); the learned tree keeps every other
     /// channel. Leaf contexts shift by one; the new leaf is context 0.
-    pub(super) fn with_constant_channel(&self, chan_id: u32, value: i32) -> LearnedCandidate {
+    pub(crate) fn with_constant_channel(&self, chan_id: u32, value: i32) -> LearnedCandidate {
         assert!(
             chan_id >= 1,
             "a constant channel follows the color channels"
@@ -248,7 +273,7 @@ impl LearnedCandidate {
     }
 
     /// The tail of a `w` x `h` crop of the constant channel.
-    pub(super) fn constant_tail(&self, w: usize, h: usize) -> ConstantTail {
+    pub(crate) fn constant_tail(&self, w: usize, h: usize) -> ConstantTail {
         ConstantTail {
             context: self.constant_ctx.expect("constant channel leaf"),
             count: w * h,
@@ -256,7 +281,7 @@ impl LearnedCandidate {
     }
 
     /// Fill offset tokens in BFS context order from the retained offset sample.
-    pub(super) fn set_leaf_offsets(&mut self, samples: &MaSamples, step: usize) {
+    pub(crate) fn set_leaf_offsets(&mut self, samples: &MaSamples, step: usize) {
         self.leaf_offset = crate::ma_tree::with_ma_properties!(&samples.props, |rows| {
             leaf_offsets(
                 &self.tree,
@@ -277,22 +302,22 @@ impl LearnedCandidate {
 }
 
 /// One modular channel as the learner and tokenizer see it.
-pub(super) struct MaChannel<'a> {
-    pub(super) w: usize,
-    pub(super) h: usize,
+pub(crate) struct MaChannel<'a> {
+    pub(crate) w: usize,
+    pub(crate) h: usize,
     /// Meta channels (palette) always live in the global stream, whatever
     /// their size.
-    pub(super) meta: bool,
-    pub(super) pixels: MaPixels<'a>,
+    pub(crate) meta: bool,
+    pub(crate) pixels: MaPixels<'a>,
     /// `Some(value)` for a channel whose every sample is `value`: it is
     /// neither sampled nor tokenized, and the written tree routes it to a
     /// Zero-predictor leaf with that offset (see `ConstantTail`).
-    pub(super) constant: Option<i32>,
+    pub(crate) constant: Option<i32>,
 }
 
 /// Borrow the original sample representation, including palette indices and
 /// alpha, without expanding or copying rows for MA traversal.
-pub(super) enum MaPixels<'a> {
+pub(crate) enum MaPixels<'a> {
     U8(&'a [u8]),
     U16(&'a [u16]),
     I32(&'a [i32]),
@@ -316,11 +341,11 @@ pub(crate) const MA_PHOTO_CANDIDATES: usize = 32;
 
 /// Split candidates for a palette index image: more than this overfits the
 /// near-deterministic index.
-pub(super) const MA_PALETTE_CANDIDATES: usize = 16;
+pub(crate) const MA_PALETTE_CANDIDATES: usize = 16;
 
 /// The single global transform a learned-tree frame declares.
 #[derive(Clone, Copy)]
-pub(super) enum MaTransform {
+pub(crate) enum MaTransform {
     /// RCT on the first three channels (`6` = YCoCg).
     Rct(u32),
     /// Global palette over `num_c` components: channel 0 is the palette
@@ -341,30 +366,34 @@ pub(super) enum MaTransform {
 }
 
 /// The modular channels of a frame plus their transform.
-pub(super) struct MaSource<'a> {
-    pub(super) channels: Vec<MaChannel<'a>>,
-    pub(super) transform: MaTransform,
+pub(crate) struct MaSource<'a> {
+    pub(crate) channels: Vec<MaChannel<'a>>,
+    pub(crate) transform: MaTransform,
     /// Horizontal and vertical shifts of the non-meta channels (a squeezed
     /// channel covers `dim >> shift` columns or rows of a group).
-    pub(super) hshift: u32,
-    pub(super) vshift: u32,
+    pub(crate) hshift: u32,
+    pub(crate) vshift: u32,
     /// Every leaf uses the Zero predictor without an offset, so the coded
     /// residual is the sample itself. LZ77 copies residuals: under per-leaf
     /// predictors those of a repeated pattern differ from one occurrence to
     /// the next, and a screentone a period back is never matched.
-    pub(super) value_tree: bool,
+    pub(crate) value_tree: bool,
+    /// The split order is left to the gains whatever the palette
+    /// (`index_first_depth` is 0): the order race's first-stage learns,
+    /// whose 32 leaves an index-first root fills before any other split.
+    pub(crate) gain_order: bool,
     /// Per-AC-group channel overrides: a group whose entry is `Some` codes
     /// those channels (a group-local Palette transform declared in its own
     /// GroupHeader) instead of crops of `channels`. Empty means none.
-    pub(super) group_channels: Vec<Option<MaGroupChannels<'a>>>,
+    pub(crate) group_channels: Vec<Option<MaGroupChannels<'a>>>,
 }
 
 /// One AC group's own channels: the palette meta-channel followed by the
 /// index channel, as the decoder reads them after that group's transform.
-pub(super) struct MaGroupChannels<'a> {
-    pub(super) channels: Vec<MaChannel<'a>>,
-    pub(super) nb_colors: u32,
-    pub(super) num_c: u32,
+pub(crate) struct MaGroupChannels<'a> {
+    pub(crate) channels: Vec<MaChannel<'a>>,
+    pub(crate) nb_colors: u32,
+    pub(crate) num_c: u32,
 }
 
 /// Quant tables reserved in the decoder's modular stream numbering
@@ -381,35 +410,96 @@ pub(crate) fn ac_stream_id(num_dc_groups: usize, group_index: usize) -> i32 {
 /// Where a channel is coded under a layout: in the single section / the
 /// DC-global stream, or per AC group. Channel ids restart per stream, as the
 /// decoder's channel property does.
-pub(super) struct MaPlacement {
-    pub(super) channel: usize,
-    pub(super) chan_id: u32,
-    pub(super) global: bool,
+pub(crate) struct MaPlacement {
+    pub(crate) channel: usize,
+    pub(crate) chan_id: u32,
+    pub(crate) global: bool,
 }
 
 impl MaSource<'_> {
+    /// Whether the global palette is one-dimensional: every component is
+    /// constant or equals the first one that varies (an opaque grey ramp).
+    fn palette_is_ramp(&self) -> bool {
+        let meta = &self.channels[0];
+        let MaPixels::I32(palette) = meta.pixels else {
+            return false;
+        };
+        let mut varying: Option<&[i32]> = None;
+        for component in palette.chunks_exact(meta.w.max(1)) {
+            if component.iter().all(|&v| v == component[0]) {
+                continue;
+            }
+            match varying {
+                None => varying = Some(component),
+                Some(first) if first == component => {}
+                Some(_) => return false,
+            }
+        }
+        true
+    }
+
+    /// Whether the global palette's index image is a level: where it
+    /// changes along a row it mostly steps to the entry beside it, as the
+    /// grey level of a ramp does. The palette order follows the image there
+    /// (contour bands, height maps): a neighbour's index predicts the next
+    /// one by its value, and its range names no colour family.
+    fn index_is_level(&self) -> bool {
+        let index = &self.channels[1];
+        let width = index.w.max(1);
+        let (mut changes, mut steps) = (0u64, 0u64);
+        with_ma_pixels!(index, |pixels| {
+            for row in pixels
+                .chunks_exact(width)
+                .step_by(MA_INDEX_LEVEL_ROW_STRIDE)
+            {
+                for pair in row.windows(2) {
+                    let step = i64::from(pair[1]) - i64::from(pair[0]);
+                    changes += u64::from(step != 0);
+                    steps += u64::from(step.abs() == 1);
+                }
+            }
+        });
+        steps as f64 >= MA_INDEX_LEVEL_MIN_SHARE * changes as f64
+    }
+
+    /// `MaLearnParams::index_first_depth` of this source's trees.
+    pub(crate) fn index_first_depth(&self) -> u16 {
+        if self.gain_order {
+            return 0;
+        }
+        match self.transform {
+            MaTransform::Palette { nb_colors, .. }
+                if nb_colors <= MA_INDEX_FIRST_RAMP_MAX_COLORS
+                    || !(self.palette_is_ramp() || self.index_is_level()) =>
+            {
+                MA_INDEX_FIRST_DEPTH
+            }
+            _ => 0,
+        }
+    }
+
     /// Columns of a non-meta channel that one group of `gdim` frame pixels
     /// holds.
     #[inline]
-    pub(super) fn group_columns(&self, gdim: usize) -> usize {
+    pub(crate) fn group_columns(&self, gdim: usize) -> usize {
         gdim >> self.hshift
     }
 
     /// Rows of a non-meta channel that one group of `gdim` frame pixels
     /// holds.
     #[inline]
-    pub(super) fn group_rows(&self, gdim: usize) -> usize {
+    pub(crate) fn group_rows(&self, gdim: usize) -> usize {
         gdim >> self.vshift
     }
 
     /// Leaf budget of a final learn: the constant channel's leaf, added when
     /// the tree is written, must fit the context limit too.
-    pub(super) fn max_leaves(&self) -> usize {
+    pub(crate) fn max_leaves(&self) -> usize {
         MA_MAX_LEAVES - usize::from(self.channels.iter().any(|ch| ch.constant.is_some()))
     }
 
     /// Split candidates the learner should evaluate for this source.
-    pub(super) fn max_candidates(&self) -> usize {
+    pub(crate) fn max_candidates(&self) -> usize {
         match self.transform {
             MaTransform::Palette { .. } | MaTransform::PackedPalette { .. } => {
                 MA_PALETTE_CANDIDATES
@@ -421,7 +511,7 @@ impl MaSource<'_> {
     /// How far the run-token estimate may trail literals before the deep
     /// LZ77 matcher is skipped (see `LZ_DEEP_MATCHER_MAX_RATIO_RCT`); any
     /// palette index stream, global or per group, keeps the wide margin.
-    pub(super) fn deep_lz_max_ratio(&self) -> f64 {
+    pub(crate) fn deep_lz_max_ratio(&self) -> f64 {
         match self.transform {
             MaTransform::Rct(_) if self.group_channels.iter().all(Option::is_none) => {
                 LZ_DEEP_MATCHER_MAX_RATIO_RCT
@@ -430,7 +520,7 @@ impl MaSource<'_> {
         }
     }
 
-    pub(super) fn write_transforms(&self, w: &mut BitWriter) {
+    pub(crate) fn write_transforms(&self, w: &mut BitWriter) {
         match self.transform {
             MaTransform::Rct(rct_type) => {
                 write_modular_transforms(self.channels.len(), rct_type, w)
@@ -465,7 +555,7 @@ impl MaSource<'_> {
     /// Channels no larger than a group are coded in the global stream (the
     /// decoder stops the global decode at the first bigger channel); in a
     /// single-group frame everything shares one stream.
-    pub(super) fn placement(&self, layout: GroupLayout, single_group: bool) -> Vec<MaPlacement> {
+    pub(crate) fn placement(&self, layout: GroupLayout, single_group: bool) -> Vec<MaPlacement> {
         let gdim = layout.dim();
         let mut global_id = 0u32;
         let mut group_id = 0u32;
@@ -496,7 +586,7 @@ impl MaSource<'_> {
 
     /// Values the learner samples and the tokenizer codes (constant
     /// channels have none).
-    pub(super) fn total_values(&self) -> usize {
+    pub(crate) fn total_values(&self) -> usize {
         self.channels
             .iter()
             .filter(|c| c.constant.is_none())
@@ -507,7 +597,7 @@ impl MaSource<'_> {
     /// The constant channel of this source with its value, if it has one.
     /// It is the last channel of its stream, so the root channel split of
     /// `LearnedCandidate::with_constant_channel` isolates it.
-    pub(super) fn constant_placement<'p>(
+    pub(crate) fn constant_placement<'p>(
         &self,
         placement: &'p [MaPlacement],
     ) -> Option<(&'p MaPlacement, i32)> {
@@ -530,7 +620,7 @@ impl MaSource<'_> {
     }
 
     /// The override of AC group `group_index`, if it has one.
-    pub(super) fn group_override(&self, group_index: usize) -> Option<&MaGroupChannels<'_>> {
+    pub(crate) fn group_override(&self, group_index: usize) -> Option<&MaGroupChannels<'_>> {
         self.group_channels
             .get(group_index)
             .and_then(Option::as_ref)
@@ -538,7 +628,7 @@ impl MaSource<'_> {
 
     /// The channel a job or placement refers to: an override's own channel
     /// when `group_override` is set, else one of the source's channels.
-    pub(super) fn channel_at(
+    pub(crate) fn channel_at(
         &self,
         group_override: Option<usize>,
         channel: usize,
@@ -556,7 +646,7 @@ impl MaSource<'_> {
 
     /// The reference planes of placement `p`'s channel: earlier channels of
     /// the same stream and size, most recent first, cropped at (x0, y0).
-    pub(super) fn ref_planes(
+    pub(crate) fn ref_planes(
         &self,
         placement: &[MaPlacement],
         p: &MaPlacement,
@@ -592,7 +682,7 @@ impl MaSource<'_> {
 /// The YCoCg(A) planes with per-group Palette transforms where a group's
 /// color count allows one. Groups without a palette code the planes
 /// directly, so the frame keeps its RCT and one learned tree serves both.
-pub(super) fn mixed_ma_source<'a>(
+pub(crate) fn mixed_ma_source<'a>(
     ycocg: &'a Image3Si,
     alpha: Option<&'a AlphaPlane>,
     xsize: usize,
@@ -631,7 +721,7 @@ pub(super) fn mixed_ma_source<'a>(
 }
 
 /// The YCoCg(A) planes, or the single gray plane, as a learned-tree source.
-pub(super) fn rgb_ma_source<'a>(
+pub(crate) fn rgb_ma_source<'a>(
     linear: &'a Image3Si,
     alpha: Option<&'a AlphaPlane>,
     xsize: usize,
@@ -671,35 +761,36 @@ pub(super) fn rgb_ma_source<'a>(
         hshift: 0,
         vshift: 0,
         value_tree: false,
+        gain_order: false,
         group_channels: Vec::new(),
     }
 }
 
 /// Below this covered-area fraction the patched alternative is not encoded.
-pub(super) const PATCH_MIN_COVERAGE: f64 = 0.05;
+pub(crate) const PATCH_MIN_COVERAGE: f64 = 0.05;
 
 /// A palette candidate whose first complete layout trails the RGB frame's
 /// final estimate by more than `PALETTE_FINAL_MARGIN` times this does not
 /// learn its 256-px layout.
-pub(super) const PALETTE_LAYOUT_MARGIN: f64 = 1.04;
+pub(crate) const PALETTE_LAYOUT_MARGIN: f64 = 1.04;
 
 /// Below this many values (pixels x channels) the WP-preset rankings are
 /// skipped: each is a complete learn of the image
 /// (20-35 ms single-threaded for a 128x128 icon coded in under a kilobyte),
 /// six to eight of them were most of a small icon's encode time, and their
 /// absolute gain on such files is a few bytes.
-pub(super) const RANK_MIN_VALUES: usize = 1 << 19;
+pub(crate) const RANK_MIN_VALUES: usize = 1 << 19;
 
 /// RGB sources above this many values (pixels x channels) learn only the
 /// 1024-px group layout; see the layout selection.
-pub(super) const RGB_SINGLE_LAYOUT_MIN_VALUES: usize = 1 << 20;
+pub(crate) const RGB_SINGLE_LAYOUT_MIN_VALUES: usize = 1 << 20;
 
-pub(super) fn source_values_of(xsize: usize, ysize: usize, nb_chans: usize) -> usize {
+pub(crate) fn source_values_of(xsize: usize, ysize: usize, nb_chans: usize) -> usize {
     xsize * ysize * nb_chans
 }
 
 /// A per-group-palette first stage is grown into a complete frame only when
 /// it already beats the best source's own first stage.
-pub(super) const PER_GROUP_MARGIN: f64 = 1.0;
+pub(crate) const PER_GROUP_MARGIN: f64 = 1.0;
 
-pub(super) use with_ma_pixels;
+pub(crate) use with_ma_pixels;

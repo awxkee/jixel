@@ -334,6 +334,7 @@ pub(crate) fn encode_frame_lossless_xyb_ink(
         Some(alpha),
         LosslessSettings {
             max_bits: 13 + crate::xyb::CROP_LATTICE_SCALE.ilog2(),
+            lossy_layer: true,
             ..LosslessSettings::rgb8(speed, decoding_speed)
         },
         ModularFrameKind::XybBlend { last: true },
@@ -364,6 +365,7 @@ pub(crate) fn encode_frame_lossless_xyb_crop(
         None,
         LosslessSettings {
             max_bits: 13 + crate::xyb::CROP_LATTICE_SCALE.ilog2(),
+            lossy_layer: true,
             ..LosslessSettings::rgb8(speed, decoding_speed)
         },
         kind,
@@ -394,7 +396,10 @@ pub(crate) fn encode_frame_lossless_layer(
     encode_frame_lossless_core_impl(
         linear,
         Some(alpha),
-        LosslessSettings::rgb8(speed, decoding_speed),
+        LosslessSettings {
+            lossy_layer: true,
+            ..LosslessSettings::rgb8(speed, decoding_speed)
+        },
         kind,
         true,
         tree_search,
@@ -460,6 +465,7 @@ pub(crate) fn encode_modular_xyb_atlas_tree_slot(
         alpha,
         LosslessSettings {
             max_bits: 14,
+            lossy_layer: true,
             ..LosslessSettings::rgb8(speed, crate::DecodingSpeed::Slow)
         },
         ModularFrameKind::XybReferenceOnly {

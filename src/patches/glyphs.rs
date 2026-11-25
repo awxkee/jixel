@@ -31,11 +31,14 @@ use crate::image::Image3F;
 use crate::patches::PatchReference;
 use crate::shared_sort::SharedSort;
 
+mod additive;
 mod components;
 mod exact;
 mod grid;
 mod ink;
 mod templates;
+
+pub(crate) use additive::plan_additive_glyphs;
 
 /// Largest glyph box side the glyph detector keeps.
 pub(super) const GLYPH_MAX_SIDE: usize = 64;

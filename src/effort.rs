@@ -224,6 +224,11 @@ effort_gates! {
     tree_dense_sampling,
     /// 2M-sample tree learn (otherwise 512K).
     tree_full_sampling,
+    /// The final tree learns of a lossy encode's lossless layer frames (ink,
+    /// crop, vector and atlas frames) take the 2M-sample budget while the
+    /// ranking learns keep the tier's: these frames are a small share of the
+    /// encode and on graphics up to a third of its bytes.
+    layer_full_final_sampling,
     /// Learn under both the 1024 px and the 256 px group layouts.
     tree_dual_layout,
     /// Final learns of sub-sampled sources keep the full leaf budget and split
@@ -369,6 +374,7 @@ static MEDIUM: Effort = Effort {
     palette_dual: true,
     learned_tree: true,
     tree_rank: true,
+    layer_full_final_sampling: true,
     tree_global_palette: true,
     palette_large: true,
     tree_group_palette: true,

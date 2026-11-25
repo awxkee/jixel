@@ -771,6 +771,16 @@ fn compact_clusters_first_use(
 /// Relocation passes of [`reassign_contexts`] per round.
 const REASSIGN_PASSES: usize = 4;
 
+/// Times per round [`reassign_contexts`] opens new clusters once its moves
+/// settle, at most `SEED_BATCH` each time, one per cluster it takes a
+/// context from. The clusterer priced a cluster's table on default tokens;
+/// under the chosen configurations tables are cheaper and more clusters pay.
+const REASSIGN_SEEDINGS: usize = 4;
+const SEED_BATCH: usize = 16;
+
+/// Table bits a seeded cluster is charged beyond its symbols.
+const SEED_CLUSTER_BITS: f64 = 30.0;
+
 /// [`reassign_contexts`] keeps its moves when their entropy estimate saves at
 /// least this share of the stream.
 const REASSIGN_MIN_GAIN: f64 = 0.0005;
@@ -778,8 +788,9 @@ const REASSIGN_MIN_GAIN: f64 = 0.0005;
 /// The clusters were formed on default-configuration tokens, before each got
 /// its own integer configuration. Move every context to the cluster that
 /// codes it smallest under those configurations (entropy of the symbols plus
-/// the raw bits), then, for each further round, fit the configurations to the
-/// new members and move again. The contexts of constant tails and the
+/// the raw bits), open clusters for the contexts that code smaller alone, and
+/// for each further round fit the configurations to the new members and move
+/// again. `configs` holds `used` clusters and room for the new ones. The contexts of constant tails and the
 /// distance cluster stay as they are. Returns the new cluster count, or
 /// `None` when the map is left unchanged. The result does not depend on the
 /// thread count.
@@ -788,6 +799,7 @@ fn reassign_contexts<T: LzTokenSource>(
     streams: &[&[T]],
     context_map: &mut [u8],
     configs: &mut [HybridUintConfig],
+    used: usize,
     lz_min_symbol: u32,
     wide: bool,
     rounds: usize,
@@ -799,6 +811,7 @@ fn reassign_contexts<T: LzTokenSource>(
     const LENGTHS: usize = 48;
     let num_contexts = context_map.len();
     let num_clusters = configs.len();
+    let mut active = used;
     let distance_context = num_contexts - 1;
     let mut frozen = vec![false; num_clusters];
     frozen[context_map[distance_context] as usize] = true;
@@ -898,18 +911,25 @@ fn reassign_contexts<T: LzTokenSource>(
     };
     let original_map = context_map.to_vec();
     let original_configs = configs.to_vec();
+    let mut seedings = REASSIGN_SEEDINGS;
     let (mut gain_sum, mut start_bits) = (0.0f64, 0.0f64);
     let mut moved = false;
     for round in 0..rounds {
         // Distinct configurations among the clusters.
         let mut distinct: Vec<HybridUintConfig> = Vec::new();
-        let config_id: Vec<usize> = configs
+        let mut config_id: Vec<usize> = configs
             .iter()
-            .map(|c| match distinct.iter().position(|d| d == c) {
-                Some(i) => i,
-                None => {
-                    distinct.push(*c);
-                    distinct.len() - 1
+            .enumerate()
+            .map(|(cluster, c)| {
+                if cluster >= active {
+                    return 0;
+                }
+                match distinct.iter().position(|d| d == c) {
+                    Some(i) => i,
+                    None => {
+                        distinct.push(*c);
+                        distinct.len() - 1
+                    }
                 }
             })
             .collect();
@@ -1016,67 +1036,138 @@ fn reassign_contexts<T: LzTokenSource>(
             join
         };
         let mut round_moved = false;
-        for _ in 0..REASSIGN_PASSES {
-            // Every context's best move against this pass's starting state,
-            // then applied in order, each rechecked against the live one.
-            let (map_ref, counts_ref, totals_ref): (&[u8], &[[u32; WIDE_TABLE_ENTRIES]], &[u64]) =
-                (context_map, &counts, &totals);
-            let proposals: Vec<(f64, f64, usize)> = par(chunks, &|chunk| {
-                (chunk * CHUNK..((chunk + 1) * CHUNK).min(num_contexts))
-                    .map(|context| {
-                        let from = map_ref[context] as usize;
-                        let own = &coded[context][config_id[from]];
-                        if frozen[from] || own.total == 0 {
-                            return (0.0, 0.0, from);
-                        }
-                        let leave = leave_bits(own, &counts_ref[from], totals_ref[from]);
-                        let mut best = (leave, from);
-                        for to in 0..num_clusters {
-                            if to == from || frozen[to] || totals_ref[to] == 0 {
-                                continue;
+        loop {
+            for _ in 0..REASSIGN_PASSES {
+                // Every context's best move against this pass's starting state,
+                // then applied in order, each rechecked against the live one.
+                let (map_ref, counts_ref, totals_ref): (
+                    &[u8],
+                    &[[u32; WIDE_TABLE_ENTRIES]],
+                    &[u64],
+                ) = (context_map, &counts, &totals);
+                let proposals: Vec<(f64, f64, usize)> = par(chunks, &|chunk| {
+                    (chunk * CHUNK..((chunk + 1) * CHUNK).min(num_contexts))
+                        .map(|context| {
+                            let from = map_ref[context] as usize;
+                            let own = &coded[context][config_id[from]];
+                            if frozen[from] || own.total == 0 {
+                                return (0.0, 0.0, from);
                             }
-                            let other = &coded[context][config_id[to]];
-                            if !other.valid {
-                                continue;
+                            let leave = leave_bits(own, &counts_ref[from], totals_ref[from]);
+                            let mut best = (leave, from);
+                            for to in 0..active {
+                                if to == from || frozen[to] || totals_ref[to] == 0 {
+                                    continue;
+                                }
+                                let other = &coded[context][config_id[to]];
+                                if !other.valid {
+                                    continue;
+                                }
+                                let join = join_bits(other, &counts_ref[to], totals_ref[to]);
+                                if join < best.0 {
+                                    best = (join, to);
+                                }
                             }
-                            let join = join_bits(other, &counts_ref[to], totals_ref[to]);
-                            if join < best.0 {
-                                best = (join, to);
-                            }
-                        }
-                        (leave, best.0, best.1)
-                    })
-                    .collect()
-            })
-            .into_iter()
-            .flatten()
-            .collect();
-            let mut pass_moved = false;
-            for (context, &(_, _, to)) in proposals.iter().enumerate() {
+                            (leave, best.0, best.1)
+                        })
+                        .collect()
+                })
+                .into_iter()
+                .flatten()
+                .collect();
+                let mut pass_moved = false;
+                for (context, &(_, _, to)) in proposals.iter().enumerate() {
+                    let from = context_map[context] as usize;
+                    if to == from || totals[to] == 0 {
+                        continue;
+                    }
+                    let own = &coded[context][config_id[from]];
+                    let other = &coded[context][config_id[to]];
+                    let leave = leave_bits(own, &counts[from], totals[from]);
+                    let join = join_bits(other, &counts[to], totals[to]);
+                    if join >= leave {
+                        continue;
+                    }
+                    gain_sum += leave - join;
+                    for &(symbol, count) in &own.symbols {
+                        counts[from][symbol as usize] -= count;
+                    }
+                    totals[from] -= u64::from(own.total);
+                    for &(symbol, count) in &other.symbols {
+                        counts[to][symbol as usize] += count;
+                    }
+                    totals[to] += u64::from(other.total);
+                    context_map[context] = to as u8;
+                    pass_moved = true;
+                }
+                if !pass_moved {
+                    break;
+                }
+                round_moved = true;
+            }
+            if seedings == 0 || active >= num_clusters {
+                break;
+            }
+            seedings -= 1;
+            // Seed new clusters: contexts that code smaller alone, table included.
+            let mut seeds: Vec<(f64, usize, usize)> = Vec::new();
+            for context in 0..num_contexts {
                 let from = context_map[context] as usize;
-                if to == from || totals[to] == 0 {
-                    continue;
-                }
                 let own = &coded[context][config_id[from]];
-                let other = &coded[context][config_id[to]];
-                let leave = leave_bits(own, &counts[from], totals[from]);
-                let join = join_bits(other, &counts[to], totals[to]);
-                if join >= leave {
+                if frozen[from] || own.total == 0 || totals[from] == u64::from(own.total) {
                     continue;
                 }
-                gain_sum += leave - join;
+                let leave = leave_bits(own, &counts[from], totals[from]);
+                let mut best = (f64::INFINITY, 0usize);
+                for (id, alone) in coded[context].iter().enumerate() {
+                    if !alone.valid {
+                        continue;
+                    }
+                    let mut bits =
+                        phi(u64::from(alone.total)) + alone.raw as f64 + SEED_CLUSTER_BITS;
+                    for &(_, count) in &alone.symbols {
+                        bits += SYMBOL_HEADER_BITS - phi(u64::from(count));
+                    }
+                    if bits < best.0 {
+                        best = (bits, id);
+                    }
+                }
+                if leave > best.0 {
+                    seeds.push((leave - best.0, context, best.1));
+                }
+            }
+            seeds.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            let mut taken = vec![false; num_clusters];
+            let mut seeded = 0usize;
+            for &(benefit, context, id) in &seeds {
+                if seeded == SEED_BATCH || active >= num_clusters {
+                    break;
+                }
+                let from = context_map[context] as usize;
+                if taken[from] {
+                    continue;
+                }
+                taken[from] = true;
+                let own = &coded[context][config_id[from]];
                 for &(symbol, count) in &own.symbols {
                     counts[from][symbol as usize] -= count;
                 }
                 totals[from] -= u64::from(own.total);
-                for &(symbol, count) in &other.symbols {
+                let to = active;
+                active += 1;
+                configs[to] = distinct[id];
+                config_id[to] = id;
+                frozen[to] = false;
+                let alone = &coded[context][id];
+                for &(symbol, count) in &alone.symbols {
                     counts[to][symbol as usize] += count;
                 }
-                totals[to] += u64::from(other.total);
+                totals[to] += u64::from(alone.total);
                 context_map[context] = to as u8;
-                pass_moved = true;
+                gain_sum += benefit;
+                seeded += 1;
             }
-            if !pass_moved {
+            if seeded == 0 {
                 break;
             }
             round_moved = true;
@@ -1329,8 +1420,9 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
         num_clusters =
             compact_clusters_first_use(&mut context_map[..num_contexts], histograms, num_clusters);
     }
-    let histograms = &mut histograms[..num_clusters];
-    let configs = &mut configs[..num_clusters];
+    // `reassign_contexts` may add clusters: keep the whole scratch.
+    let histograms = &mut histograms[..];
+    let configs: &mut [HybridUintConfig] = &mut configs[..];
     let mut lz_min_symbol = min_symbol;
     // The clusters' 256-symbol counts when the code is a wide one.
     let mut wide_counts: Option<Vec<[u32; WIDE_TABLE_ENTRIES]>> = None;
@@ -1403,7 +1495,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
                 }
             }
             let samples = crate::entropy::HybridUintSamples::from_parts(values, strides);
-            configs.copy_from_slice(&if thorough {
+            configs[..num_clusters].copy_from_slice(&if thorough {
                 match pool {
                     Some(pool) => samples.select_exhaustive_with_pool(
                         min_symbol,
@@ -1427,7 +1519,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
             // 192, for one more header bit per cluster.
             let search = |limit: u32, wide: bool| {
                 samples.select_free(
-                    configs,
+                    &configs[..num_clusters],
                     &maxima,
                     limit,
                     wide,
@@ -1453,7 +1545,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
                     wide_counts = Some(Vec::new());
                 }
             }
-            configs.copy_from_slice(&best);
+            configs[..num_clusters].copy_from_slice(&best);
         }
         let mut regrouped = false;
         if use_ans {
@@ -1461,7 +1553,8 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
             if let Some(count) = reassign_contexts(
                 streams,
                 &mut context_map[..num_contexts],
-                configs,
+                &mut configs[..histograms.len().min(crate::entropy::ANS_CLUSTERS_LIMIT)],
+                num_clusters,
                 lz_min_symbol,
                 wide_counts.is_some(),
                 if thorough { 2 } else { 1 },

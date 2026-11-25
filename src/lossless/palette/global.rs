@@ -133,6 +133,7 @@ impl GlobalPalette {
             hshift: 0,
             vshift: 0,
             value_tree: false,
+            gain_order: false,
             group_channels: Vec::new(),
         }
     }
@@ -345,6 +346,7 @@ impl<'a> PackedPalette<'a> {
             hshift,
             vshift,
             value_tree: false,
+            gain_order: false,
             group_channels: Vec::new(),
         }
     }
@@ -1457,9 +1459,11 @@ pub(in crate::lossless) fn build_global_palettes(
     let Some(race) = race else {
         return Some((under(&orders[best_order]), None));
     };
-    let mut coarse = |palette: &GlobalPalette| {
+    let mut coarse = |palette: &GlobalPalette, gain_order: bool| {
+        let mut source = palette.source(xsize, ysize);
+        source.gain_order = gain_order;
         rank_coarse(
-            &palette.source(xsize, ysize),
+            &source,
             xsize,
             ysize,
             race.min_symbol,
@@ -1485,22 +1489,26 @@ pub(in crate::lossless) fn build_global_palettes(
             } else {
                 1.0
             };
-            let bits = coarse(&palette) * handicap;
+            let bits = coarse(&palette, false) * handicap;
             if best.as_ref().is_none_or(|(least, _)| bits < *least) {
                 best = Some((bits, palette));
             }
         }
         return best.map(|(_, palette)| (palette, None));
     }
+    // Whether a second order races is read from learns that split in the
+    // order of the gains: index first, a fractal's two orders came within
+    // the lead of each other, both were learned and written (1.6 times the
+    // encode) and the second lost.
     let first = under(&orders[best_order]);
-    let first_bits = coarse(&first);
+    let first_bits = coarse(&first, true);
     let mut second: Option<(f64, GlobalPalette)> = None;
     for (k, order) in orders.iter().enumerate() {
         if k == best_order || orders[..k].contains(order) {
             continue;
         }
         let palette = under(order);
-        let bits = coarse(&palette);
+        let bits = coarse(&palette, true);
         let to_beat = second
             .as_ref()
             .map_or(first_bits * ORDER_RACE_COARSE_LEAD, |(best, _)| *best);

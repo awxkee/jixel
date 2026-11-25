@@ -122,8 +122,9 @@ pub(crate) enum MaNode {
     },
     Leaf {
         pred: u32,
-        /// Added to the prediction (libjxl `predictor_offset`); nonzero only
-        /// for modal Zero leaves, which predict the leaf's most frequent value.
+        /// Added to the prediction (libjxl `predictor_offset`): the leaf's
+        /// most frequent residual under `modal_offsets` (for a Zero leaf, its
+        /// most frequent value).
         offset: i32,
     },
 }
@@ -162,7 +163,7 @@ impl LearnedTree {
 pub(crate) struct MaSamples {
     pub(crate) props: MaProperties,
     pub(crate) tok: Vec<[u8; NUM_MA_PREDS]>,
-    /// The sampled value itself, for modal Zero leaves (`MaLearnParams::
+    /// The sampled value itself, for modal leaves (`MaLearnParams::
     /// modal_offsets`); empty when the learn does not use them.
     pub(crate) val: Vec<i32>,
 }
@@ -398,10 +399,12 @@ pub(crate) struct MaLearnParams {
     /// Photos want the full 32; near-deterministic palette index images
     /// overfit at more than 16.
     pub(crate) max_candidates: usize,
-    /// Modal Zero leaves: the Zero predictor of every node carries the node's
+    /// Modal leaves: the Zero predictor of every node carries the node's
     /// most frequent sample value as its offset, so a leaf predicts the
     /// constant its context implies (an AA level of a palette index image)
-    /// instead of 0. Needs `MaSamples::val`.
+    /// instead of 0; Left and Top carry the node's most frequent step from
+    /// that neighbour (the next palette entry of a ramp). Needs
+    /// `MaSamples::val`.
     pub(crate) modal_offsets: bool,
     /// Grow-then-prune: bits one kept leaf is charged. 0 keeps best-first
     /// growth as it is. Otherwise the tree grows to its leaf cap at the
@@ -419,7 +422,28 @@ pub(crate) struct MaLearnParams {
     /// or split on its error property (needs `channel_first`): the decoder
     /// then skips the per-pixel WP state for those channels.
     pub(crate) no_wp_channels: u32,
+    /// Index first: a node above this depth holding `INDEX_FIRST_MIN_ROWS`
+    /// rows splits on a neighbour's value (`INDEX_PROPS`) when that split
+    /// pays and gains no less than 1 / `INDEX_FIRST_MAX_GAIN_RATIO` of the
+    /// best one. On a palette index
+    /// image ordered by colour those values name the colour family, and a
+    /// tree that separates the families at its root shares the edge-shape
+    /// splits below instead of repeating the partition inside every branch.
+    /// 0 leaves the order to the gains.
+    pub(crate) index_first_depth: u16,
 }
+
+/// The properties `MaLearnParams::index_first_depth` prefers: |N| and |W|.
+const INDEX_PROPS: [u8; 2] = [4, 5];
+
+/// Smaller nodes leave the split order to the gains: forced there, the
+/// partition overfits small images.
+const INDEX_FIRST_MIN_ROWS: usize = 4096;
+
+/// Where another property gains more than this many times the best
+/// neighbour-value split, the values name no family worth separating first
+/// (scanned grey pages, whose trees grew 1.5% index first).
+const INDEX_FIRST_MAX_GAIN_RATIO: f32 = 8.0;
 
 /// Reusable scratch for scoring one property of one MA-tree node. One lives in
 /// each encoder worker's `CoderScratch`, allowing independent properties to be
@@ -436,7 +460,7 @@ pub(crate) struct MaPropertyScratch {
     multi_hist: Vec<u32>,
     /// One row's four histogram offsets, reused across single-property scans.
     split_slots: Vec<[u8; 4]>,
-    /// Value histogram scratch of `rebase_zero` (modal offsets).
+    /// Residual histogram scratch of `rebase_modal` (modal offsets).
     multi_bin_count: Vec<u32>,
     /// Per predictor: running histogram of the `le` side.
     left_hist: Vec<u32>,
@@ -1109,8 +1133,9 @@ impl Learner<'_> {
         start: usize,
         end: usize,
         depth: u16,
-        zero_offset: i32,
+        modal: ModalOffsets,
         score_split: bool,
+        index_only: bool,
         pool: &ThreadPool,
         scratch: &mut CoderScratch,
     ) -> Pending {
@@ -1121,24 +1146,37 @@ impl Learner<'_> {
             self.s.props.slice(start..end),
             &self.s.tok[start..end],
             depth,
-            zero_offset,
+            modal,
             score_split,
+            index_only,
             pool,
             scratch,
         )
     }
 
-    /// `rebase_zero` over the learner's rows `start..end` (0 without
+    /// `rebase_modal` over the learner's rows `start..end` (zeros without
     /// `modal_offsets`).
-    fn rebase(&mut self, start: usize, end: usize, scratch: &mut CoderScratch) -> i32 {
+    fn rebase(
+        &mut self,
+        start: usize,
+        end: usize,
+        base: Option<ModalOffsets>,
+        pool: &ThreadPool,
+        scratch: &mut CoderScratch,
+    ) -> ModalOffsets {
         if !self.p.modal_offsets || self.s.val.is_empty() {
-            return 0;
+            return [0; MODAL_PREDS.len()];
         }
-        rebase_zero(
-            &mut self.s.tok[start..end],
-            &self.s.val[start..end],
-            &mut scratch.ma_property.multi_bin_count,
-        )
+        let tok = &mut self.s.tok[start..end];
+        let val = &self.s.val[start..end];
+        with_ma_properties!(&self.s.props, |rows| rebase_modal(
+            tok,
+            &rows[start..end],
+            val,
+            base,
+            Some(pool),
+            scratch,
+        ))
     }
 
     /// `evaluate` over rows supplied by the caller: the same rows (in the same
@@ -1153,8 +1191,9 @@ impl Learner<'_> {
         properties: MaPropertySlice<'_>,
         tokens: &[[u8; NUM_MA_PREDS]],
         depth: u16,
-        zero_offset: i32,
+        modal: ModalOffsets,
         score_split: bool,
+        index_only: bool,
         pool: &ThreadPool,
         scratch: &mut CoderScratch,
     ) -> Pending {
@@ -1166,8 +1205,9 @@ impl Learner<'_> {
                 rows,
                 tokens,
                 depth,
-                zero_offset,
+                modal,
                 score_split,
+                index_only,
                 pool,
                 scratch,
             ),
@@ -1178,8 +1218,9 @@ impl Learner<'_> {
                 rows,
                 tokens,
                 depth,
-                zero_offset,
+                modal,
                 score_split,
+                index_only,
                 pool,
                 scratch,
             ),
@@ -1195,8 +1236,9 @@ impl Learner<'_> {
         properties: &[[T; NUM_MA_PROPS]],
         tokens: &[[u8; NUM_MA_PREDS]],
         depth: u16,
-        zero_offset: i32,
+        modal: ModalOffsets,
         score_split: bool,
+        index_only: bool,
         pool: &ThreadPool,
         scratch: &mut CoderScratch,
     ) -> Pending {
@@ -1233,6 +1275,26 @@ impl Learner<'_> {
             && base_bits > self.p.split_cost_bits
         {
             let mut best: Option<(usize, i32, f32)> = None; // (prop, threshold, bits)
+            // Best split on a neighbour's value, tracked apart while the node
+            // is within `index_first_depth`.
+            let mut best_index: Option<(usize, i32, f32)> = None;
+            let index_first =
+                depth < self.p.index_first_depth && properties.len() >= INDEX_FIRST_MIN_ROWS;
+            let consider = |best: &mut Option<(usize, i32, f32)>,
+                            best_index: &mut Option<(usize, i32, f32)>,
+                            prop: u8,
+                            t: i32,
+                            bits: f32| {
+                if best.is_none_or(|b| bits < b.2) {
+                    *best = Some((prop as usize, t, bits));
+                }
+                if index_first
+                    && INDEX_PROPS.contains(&prop)
+                    && best_index.is_none_or(|b| bits < b.2)
+                {
+                    *best_index = Some((prop as usize, t, bits));
+                }
+            };
             let alphabet = self.p.alphabet;
             let all_hist = scratch.ma_property.node_hist[..NUM_MA_PREDS * alphabet].to_vec();
             let mut all_nbits = [0u64; NUM_MA_PREDS];
@@ -1250,11 +1312,14 @@ impl Learner<'_> {
             });
             preds.truncate(self.p.side_preds.max(1));
             let window = SymbolWindow::new(&preds, alphabet, &all_hist);
-            let props: &[u8] = if channel == Some(None) {
+            let all_props: &[u8] = if channel == Some(None) {
                 &[0]
             } else {
                 split_props(params.allow_wp)
             };
+            // Below an index split only the index properties are scored
+            // first; every property follows where none of them pays.
+            let index_only = index_only && index_first && channel != Some(None);
             let max_candidates = self.p.max_candidates;
             let n = properties.len();
 
@@ -1269,168 +1334,186 @@ impl Learner<'_> {
             let mut plans = std::mem::take(plans);
             let mut luts = std::mem::take(luts);
             let mut hist = std::mem::take(hist);
-            plans.clear();
-            luts.clear();
-            let mut hist_len = 0usize;
-            let mut planned = 0u32;
-            for &prop in props {
-                // An absolute-value property and its signed counterpart can
-                // be identical throughout this node. Their quantiles, bins,
-                // and costs then match, and the earlier property wins ties.
-                let absolute = match prop {
-                    6 | 7 => Some(prop - 2),
-                    17 | 19 | 21 | 23 => Some(prop - 1),
-                    _ => None,
+            for index_pass in [index_only, false] {
+                let props = if index_pass {
+                    &INDEX_PROPS[..]
+                } else {
+                    all_props
                 };
-                if let Some(absolute) = absolute
-                    && planned & (1 << absolute) != 0
-                    && properties.iter().all(|row| {
-                        let a: i32 = row[absolute as usize].into();
-                        let b: i32 = row[prop as usize].into();
-                        a == b
-                    })
-                {
-                    continue;
+                plans.clear();
+                luts.clear();
+                let mut hist_len = 0usize;
+                let mut planned = 0u32;
+                for &prop in props {
+                    // An absolute-value property and its signed counterpart can
+                    // be identical throughout this node. Their quantiles, bins,
+                    // and costs then match, and the earlier property wins ties.
+                    let absolute = match prop {
+                        6 | 7 => Some(prop - 2),
+                        17 | 19 | 21 | 23 => Some(prop - 1),
+                        _ => None,
+                    };
+                    if let Some(absolute) = absolute
+                        && planned & (1 << absolute) != 0
+                        && properties.iter().all(|row| {
+                            let a: i32 = row[absolute as usize].into();
+                            let b: i32 = row[prop as usize].into();
+                            a == b
+                        })
+                    {
+                        continue;
+                    }
+                    if let Some(plan) = plan_split(
+                        properties,
+                        prop as usize,
+                        max_candidates,
+                        window.bin_stride,
+                        hist_len as u32,
+                        &mut luts,
+                        &mut scratch.ma_property,
+                    ) {
+                        hist_len += plan.hist_len();
+                        plans.push(plan);
+                        planned |= 1 << prop;
+                    }
                 }
-                if let Some(plan) = plan_split(
-                    properties,
-                    prop as usize,
-                    max_candidates,
-                    window.bin_stride,
-                    hist_len as u32,
-                    &mut luts,
-                    &mut scratch.ma_property,
-                ) {
-                    hist_len += plan.hist_len();
-                    plans.push(plan);
-                    planned |= 1 << prop;
-                }
-            }
 
-            let multi_scan = if pool.num_threads() > 1 {
-                n >= PARALLEL_SCAN_MIN_SAMPLES
-            } else {
-                n >= SERIAL_MULTI_SCAN_MIN_SAMPLES
-            };
-            if multi_scan {
-                // Large node: its rows no longer sit in cache, so one pass
-                // bins every property at once, in concurrent row chunks
-                // whose histograms are summed afterwards (one chunk on a
-                // single thread).
-                hist.clear();
-                hist.resize(hist_len, 0);
-                let (plans_ref, luts_ref, preds_ref) = (&plans, &luts, &preds);
-                if pool.num_threads() > 1 {
-                    let chunks = (n / PARALLEL_SCAN_CHUNK_SAMPLES).clamp(2, pool.num_threads());
-                    let parts = pool.steal_map(scratch, chunks, |c, _worker_scratch| {
-                        let start = c * n / chunks;
-                        let end = (c + 1) * n / chunks;
-                        let mut hist = vec![0u32; hist_len];
+                let multi_scan = if pool.num_threads() > 1 {
+                    n >= PARALLEL_SCAN_MIN_SAMPLES
+                } else {
+                    n >= SERIAL_MULTI_SCAN_MIN_SAMPLES
+                };
+                if multi_scan {
+                    // Large node: its rows no longer sit in cache, so one pass
+                    // bins every property at once, in concurrent row chunks
+                    // whose histograms are summed afterwards (one chunk on a
+                    // single thread).
+                    hist.clear();
+                    hist.resize(hist_len, 0);
+                    let (plans_ref, luts_ref, preds_ref) = (&plans, &luts, &preds);
+                    if pool.num_threads() > 1 {
+                        let chunks = (n / PARALLEL_SCAN_CHUNK_SAMPLES).clamp(2, pool.num_threads());
+                        let parts = pool.steal_map(scratch, chunks, |c, _worker_scratch| {
+                            let start = c * n / chunks;
+                            let end = (c + 1) * n / chunks;
+                            let mut hist = vec![0u32; hist_len];
+                            scan_split_plans(
+                                &properties[start..end],
+                                &tokens[start..end],
+                                plans_ref,
+                                luts_ref,
+                                preds_ref,
+                                &window,
+                                &mut hist,
+                            );
+                            hist
+                        });
+                        for part_hist in &parts {
+                            for (a, &b) in hist.iter_mut().zip(part_hist) {
+                                *a += b;
+                            }
+                        }
+                    } else {
                         scan_split_plans(
-                            &properties[start..end],
-                            &tokens[start..end],
-                            plans_ref,
-                            luts_ref,
-                            preds_ref,
-                            &window,
-                            &mut hist,
+                            properties, tokens, plans_ref, luts_ref, preds_ref, &window, &mut hist,
                         );
-                        hist
-                    });
-                    for part_hist in &parts {
-                        for (a, &b) in hist.iter_mut().zip(part_hist) {
-                            *a += b;
+                    }
+                    for plan in plans.iter() {
+                        let start = plan.hist_start as usize;
+                        let end = start + plan.hist_len();
+                        let score = score_split_plan(
+                            plan,
+                            &preds,
+                            alphabet,
+                            &window,
+                            &hist[start..end],
+                            &all_hist,
+                            &all_nbits,
+                            n as u32,
+                            &mut scratch.ma_property,
+                        );
+                        if let Some((t, bits)) = score {
+                            consider(&mut best, &mut best_index, plan.prop, t, bits);
                         }
                     }
                 } else {
-                    scan_split_plans(
-                        properties, tokens, plans_ref, luts_ref, preds_ref, &window, &mut hist,
-                    );
-                }
-                for plan in plans.iter() {
-                    let start = plan.hist_start as usize;
-                    let end = start + plan.hist_len();
-                    let score = score_split_plan(
-                        plan,
-                        &preds,
-                        alphabet,
-                        &window,
-                        &hist[start..end],
-                        &all_hist,
-                        &all_nbits,
-                        n as u32,
-                        &mut scratch.ma_property,
-                    );
-                    if let Some((t, bits)) = score
-                        && (best.is_none() || bits < best.unwrap().2)
+                    // Cache-resident node: each property is binned and scored on
+                    // its own (concurrently for medium nodes); a small
+                    // single-property histogram stays in L1 and beats summing
+                    // per-chunk multi-property ones.
+                    let mut slots = std::mem::take(&mut scratch.ma_property.split_slots);
+                    slots.clear();
+                    if plans.len() >= 4
+                        && window.bin_stride <= 256
+                        && let &[p0, p1, p2, p3] = &preds[..]
                     {
-                        best = Some((plan.prop as usize, t, bits));
+                        // When the active spans occupy at most 256 cells, one
+                        // byte represents each row's offset.
+                        slots.extend(
+                            split_slots(tokens, [p0, p1, p2, p3], &window.spans)
+                                .map(|row| row.map(|slot| slot as u8)),
+                        );
                     }
-                }
-            } else {
-                // Cache-resident node: each property is binned and scored on
-                // its own (concurrently for medium nodes); a small
-                // single-property histogram stays in L1 and beats summing
-                // per-chunk multi-property ones.
-                let mut slots = std::mem::take(&mut scratch.ma_property.split_slots);
-                slots.clear();
-                if plans.len() >= 4
-                    && window.bin_stride <= 256
-                    && let &[p0, p1, p2, p3] = &preds[..]
-                {
-                    // When the active spans occupy at most 256 cells, one
-                    // byte represents each row's offset.
-                    slots.extend(
-                        split_slots(tokens, [p0, p1, p2, p3], &window.spans)
-                            .map(|row| row.map(|slot| slot as u8)),
-                    );
-                }
-                let packed_slots = (!slots.is_empty()).then_some(slots.as_slice());
-                let one_plan = |plan: &SplitPlan, sc: &mut MaPropertyScratch| {
-                    sc.prepare(alphabet);
-                    let mut hist = std::mem::take(&mut sc.multi_hist);
-                    hist.clear();
-                    hist.resize(plan.hist_len(), 0);
-                    scan_split_plan(
-                        properties,
-                        tokens,
-                        plan,
-                        &luts,
-                        &preds,
-                        &window,
-                        packed_slots,
-                        &mut hist,
-                    );
-                    let score = score_split_plan(
-                        plan, &preds, alphabet, &window, &hist, &all_hist, &all_nbits, n as u32, sc,
-                    );
-                    sc.multi_hist = hist;
-                    score
-                };
-                let scores: Vec<Option<(i32, f32)>> =
-                    if n >= PARALLEL_PLAN_MIN_SAMPLES && pool.num_threads() > 1 {
-                        let plans_ref = &plans;
-                        pool.steal_map(scratch, plans.len(), |k, worker_scratch| {
-                            one_plan(&plans_ref[k], &mut worker_scratch.ma_property)
-                        })
-                    } else {
-                        plans
-                            .iter()
-                            .map(|plan| one_plan(plan, &mut scratch.ma_property))
-                            .collect()
+                    let packed_slots = (!slots.is_empty()).then_some(slots.as_slice());
+                    let one_plan = |plan: &SplitPlan, sc: &mut MaPropertyScratch| {
+                        sc.prepare(alphabet);
+                        let mut hist = std::mem::take(&mut sc.multi_hist);
+                        hist.clear();
+                        hist.resize(plan.hist_len(), 0);
+                        scan_split_plan(
+                            properties,
+                            tokens,
+                            plan,
+                            &luts,
+                            &preds,
+                            &window,
+                            packed_slots,
+                            &mut hist,
+                        );
+                        let score = score_split_plan(
+                            plan, &preds, alphabet, &window, &hist, &all_hist, &all_nbits,
+                            n as u32, sc,
+                        );
+                        sc.multi_hist = hist;
+                        score
                     };
-                for (plan, score) in plans.iter().zip(scores) {
-                    if let Some((t, bits)) = score
-                        && (best.is_none() || bits < best.unwrap().2)
-                    {
-                        best = Some((plan.prop as usize, t, bits));
+                    let scores: Vec<Option<(i32, f32)>> =
+                        if n >= PARALLEL_PLAN_MIN_SAMPLES && pool.num_threads() > 1 {
+                            let plans_ref = &plans;
+                            pool.steal_map(scratch, plans.len(), |k, worker_scratch| {
+                                one_plan(&plans_ref[k], &mut worker_scratch.ma_property)
+                            })
+                        } else {
+                            plans
+                                .iter()
+                                .map(|plan| one_plan(plan, &mut scratch.ma_property))
+                                .collect()
+                        };
+                    for (plan, score) in plans.iter().zip(scores) {
+                        if let Some((t, bits)) = score {
+                            consider(&mut best, &mut best_index, plan.prop, t, bits);
+                        }
                     }
+                    scratch.ma_property.split_slots = slots;
                 }
-                scratch.ma_property.split_slots = slots;
+                if !index_pass || best.is_some_and(|b| base_bits - b.2 > self.p.split_cost_bits) {
+                    break;
+                }
+                best = None;
+                best_index = None;
             }
             scratch.ma_property.plans = plans;
             scratch.ma_property.luts = luts;
             scratch.ma_property.multi_hist = hist;
+            let best = best_index
+                .filter(|index| {
+                    let gain = base_bits - index.2;
+                    gain > self.p.split_cost_bits
+                        && best.is_none_or(|free| {
+                            gain * INDEX_FIRST_MAX_GAIN_RATIO >= base_bits - free.2
+                        })
+                })
+                .or(best);
             if let Some((prop, threshold, bits)) = best {
                 let g = base_bits - bits - self.p.split_cost_bits;
                 if g > 0.0 {
@@ -1448,11 +1531,11 @@ impl Learner<'_> {
             split,
             gain,
             pred: base_pred as u32,
-            offset: if base_pred == PRED_ZERO {
-                zero_offset
-            } else {
-                0
-            },
+            offset: MODAL_PREDS
+                .iter()
+                .position(|&pred| pred == base_pred)
+                .map_or(0, |k| modal[k]),
+            modal,
         }
     }
 }
@@ -1465,6 +1548,8 @@ struct Pending {
     /// Leaf offset: the node's modal value when `pred` is Zero under
     /// `modal_offsets`, else 0.
     offset: i32,
+    /// The offsets the node's `MODAL_PREDS` tokens are coded against.
+    modal: ModalOffsets,
     start: usize,
     end: usize,
     depth: u16,
@@ -1608,40 +1693,179 @@ fn val_range(val: &mut [i32], start: usize, end: usize) -> &mut [i32] {
     &mut val[start.min(n)..end.min(n)]
 }
 
-/// Widest value span a node may have for a modal offset (a histogram of that
-/// many bins is built per node).
+/// Predictors whose tokens follow the node's modal residual: Zero, Left, Top.
+const MODAL_PREDS: [usize; 3] = [PRED_ZERO, 1, 2];
+/// The property holding each of `MODAL_PREDS`' predictions (none for Zero).
+const MODAL_PRED_PROPS: [Option<usize>; 3] = [None, Some(7), Some(6)];
+/// One offset per `MODAL_PREDS` entry.
+type ModalOffsets = [i32; MODAL_PREDS.len()];
+
+/// Residual spans up to this, or up to four bins per row, are binned to find
+/// the mode; wider ones are sorted.
 const MODAL_MAX_SPAN: i64 = 4096;
 
-/// Rebase a node's Zero-predictor tokens on its modal value: the node's
-/// Zero leaf predicts that value (offset) and the split scan prices both
-/// children against it. Returns the offset (0 when the node has no values
-/// or spans too wide a range). `hist` is scratch (the bin counts, idle
-/// between node scores).
-fn rebase_zero(tok: &mut [[u8; NUM_MA_PREDS]], val: &[i32], hist: &mut Vec<u32>) -> i32 {
-    let (Some(&lo), Some(&hi)) = (val.iter().min(), val.iter().max()) else {
-        return 0;
-    };
-    let span = i64::from(hi) - i64::from(lo) + 1;
-    let mode = if span > MODAL_MAX_SPAN {
+/// Nodes of more rows keep Left and Top at offset 0: a step worth an
+/// offset shows once the neighbour's own value is pinned down, deep in the
+/// tree, and scanning every large node for one is most of the cost.
+const MODAL_STEP_MAX_ROWS: usize = 4096;
+
+/// Tokens below this are the packed residual itself.
+const EXACT_TOKENS: usize = 16;
+
+/// The most frequent of `rows` residuals, the smallest on a tie.
+fn residual_mode(residual: impl Fn(usize) -> i64, rows: usize, hist: &mut Vec<u32>) -> i64 {
+    let (lo, hi) = (0..rows).fold((i64::MAX, i64::MIN), |(lo, hi), i| {
+        let r = residual(i);
+        (lo.min(r), hi.max(r))
+    });
+    let span = hi - lo + 1;
+    hist.clear();
+    if span > u32::MAX as i64 {
         0
+    } else if span > MODAL_MAX_SPAN.max(4 * rows as i64) {
+        // Sparse over a wide range: sort instead of binning.
+        hist.extend((0..rows).map(|i| (residual(i) - lo) as u32));
+        hist.sort_unstable();
+        let (mut best, mut count, mut run) = (0u32, 0usize, 0usize);
+        for (i, &r) in hist.iter().enumerate() {
+            run = if i > 0 && hist[i - 1] == r {
+                run + 1
+            } else {
+                1
+            };
+            if run > count {
+                (best, count) = (r, run);
+            }
+        }
+        lo + i64::from(best)
     } else {
-        hist.clear();
         hist.resize(span as usize, 0);
-        for &v in val {
-            hist[(v - lo) as usize] += 1;
+        for i in 0..rows {
+            hist[(residual(i) - lo) as usize] += 1;
         }
         let (best, _) =
             hist.iter().enumerate().fold(
                 (0usize, 0u32),
                 |acc, (i, &c)| if c > acc.1 { (i, c) } else { acc },
             );
-        lo + best as i32
-    };
-    for (t, &v) in tok.iter_mut().zip(val) {
-        let (token, _, _) = uint_encode(pack_signed(v - mode));
-        t[PRED_ZERO] = token.min(u8::MAX as u32) as u8;
+        lo + best as i64
     }
-    mode
+}
+
+/// Counts of the exact tokens of the Left and Top columns (by `MODAL_PREDS`
+/// index).
+fn near_counts(tok: &[[u8; NUM_MA_PREDS]]) -> [[u32; EXACT_TOKENS]; MODAL_PREDS.len()] {
+    let mut near = [[0u32; EXACT_TOKENS]; MODAL_PREDS.len()];
+    for t in tok {
+        // Zero's mode is searched in the values: its column is not counted.
+        for (counts, &pred) in near.iter_mut().zip(&MODAL_PREDS).skip(1) {
+            if let Some(count) = counts.get_mut(t[pred] as usize) {
+                *count += 1;
+            }
+        }
+    }
+    near
+}
+
+/// Row `i`'s residual of `MODAL_PREDS[k]`.
+#[inline]
+fn modal_residual<T: MaProperty>(
+    props: &[[T; NUM_MA_PROPS]],
+    val: &[i32],
+    k: usize,
+    i: usize,
+) -> i64 {
+    i64::from(val[i])
+        - MODAL_PRED_PROPS[k].map_or(0, |prop| Into::<i32>::into(props[i][prop]) as i64)
+}
+
+/// Code the `MODAL_PREDS[k]` tokens of the rows against `offset`.
+fn retoken<T: MaProperty>(
+    tok: &mut [[u8; NUM_MA_PREDS]],
+    props: &[[T; NUM_MA_PROPS]],
+    val: &[i32],
+    k: usize,
+    offset: i64,
+) {
+    for (i, t) in tok.iter_mut().enumerate() {
+        let (token, _, _) = uint_encode(pack_signed(
+            (modal_residual(props, val, k, i) - offset) as i32,
+        ));
+        t[MODAL_PREDS[k]] = token.min(u8::MAX as u32) as u8;
+    }
+}
+
+/// Nodes from this many rows on rewrite their tokens in concurrent row
+/// chunks (given a pool).
+const PARALLEL_REBASE_MIN_ROWS: usize = 1 << 15;
+
+/// Rebase a node's `MODAL_PREDS` tokens on each one's modal residual: a leaf
+/// of the node using that predictor adds the mode as its offset (a Zero leaf
+/// predicts the node's most frequent value, a Left leaf its most frequent
+/// step from the west neighbour), and the split scan prices both children
+/// against it. Returns the offsets. Left and Top keep offset 0 in nodes of
+/// more than `MODAL_STEP_MAX_ROWS` rows. `base` holds the offsets the tokens
+/// are coded against on entry (`None` when unknown): a predictor keeping its
+/// offset keeps its tokens, and those tokens name the steps near it exactly,
+/// which settles its mode unless the far ones could outnumber it.
+fn rebase_modal<T: MaProperty + Sync>(
+    tok: &mut [[u8; NUM_MA_PREDS]],
+    props: &[[T; NUM_MA_PROPS]],
+    val: &[i32],
+    base: Option<ModalOffsets>,
+    pool: Option<&ThreadPool>,
+    scratch: &mut CoderScratch,
+) -> ModalOffsets {
+    const N: usize = MODAL_PREDS.len();
+    let rows = val.len();
+    if rows == 0 {
+        return [0; N];
+    }
+    let steps = rows <= MODAL_STEP_MAX_ROWS;
+    let near = match base {
+        Some(_) if steps => near_counts(tok),
+        _ => [[0; EXACT_TOKENS]; N],
+    };
+    let hist = &mut scratch.ma_property.multi_bin_count;
+    let modes: [i64; N] = core::array::from_fn(|k| {
+        if k != 0 && !steps {
+            return 0;
+        }
+        let near_mode = base.filter(|_| k != 0).and_then(|base| {
+            let reach = (EXACT_TOKENS / 2) as i32;
+            let (mut best, mut count) = (0i32, 0u32);
+            for r in -reach..reach {
+                let c = near[k][pack_signed(r) as usize];
+                if c > count {
+                    (best, count) = (r, c);
+                }
+            }
+            let far = rows as u32 - near[k].iter().sum::<u32>();
+            (count > far).then(|| i64::from(base[k]) + i64::from(best))
+        });
+        near_mode.unwrap_or_else(|| residual_mode(|i| modal_residual(props, val, k, i), rows, hist))
+    });
+    let pool = pool.filter(|pool| pool.num_threads() > 1 && rows >= PARALLEL_REBASE_MIN_ROWS);
+    for k in 0..N {
+        if base.is_some_and(|base| i64::from(base[k]) == modes[k]) {
+            continue;
+        }
+        match pool {
+            None => retoken(tok, props, val, k, modes[k]),
+            Some(pool) => {
+                let chunk_rows = rows
+                    .div_ceil((rows / PARALLEL_SCAN_CHUNK_SAMPLES).clamp(2, pool.num_threads()));
+                let mut chunks: Vec<&mut [[u8; NUM_MA_PREDS]]> =
+                    tok.chunks_mut(chunk_rows).collect();
+                pool.steal_for_each_mut(scratch, &mut chunks, |chunk, tok, _| {
+                    let start = chunk * chunk_rows;
+                    let end = start + tok.len();
+                    retoken(tok, &props[start..end], &val[start..end], k, modes[k]);
+                });
+            }
+        }
+    }
+    modes.map(|mode| mode as i32)
 }
 
 fn grow_tree(
@@ -1665,8 +1889,8 @@ fn grow_tree(
             // probe sees exactly the original sequence.
             let lo = p.start + learner.s.partition(p.start, p.end, prop, threshold);
             let offsets = (
-                learner.rebase(p.start, lo, scratch),
-                learner.rebase(lo, p.end, scratch),
+                learner.rebase(p.start, lo, Some(p.modal), pool, scratch),
+                learner.rebase(lo, p.end, Some(p.modal), pool, scratch),
             );
             let committed_live = lo != p.start && lo != p.end;
             // Speculated nodes: the next best pending splits by gain (ties
@@ -1674,7 +1898,7 @@ fn grow_tree(
             // never what is committed). Their rows are untouched until they
             // commit, so partition their indices to find the rows each child
             // will own in the same order.
-            let mut speculated: Vec<(u32, usize, usize, u8, i32, u16)> = Vec::new();
+            let mut speculated: Vec<(u32, usize, usize, u8, i32, u16, ModalOffsets)> = Vec::new();
             let speculate = window.min(remaining) - 1;
             if speculate > 0 {
                 let mut next: Vec<&Pending> = heap
@@ -1686,7 +1910,15 @@ fn grow_tree(
                 next.sort_by(|a, b| b.gain.total_cmp(&a.gain));
                 for q in next.into_iter().take(speculate) {
                     let (prop, threshold) = q.split.expect("only splittable nodes are queued");
-                    speculated.push((q.node_id, q.start, q.end, prop, threshold, q.depth + 1));
+                    speculated.push((
+                        q.node_id,
+                        q.start,
+                        q.end,
+                        prop,
+                        threshold,
+                        q.depth + 1,
+                        q.modal,
+                    ));
                 }
             }
             // Two tasks per node, `gt` then `le`. A committed child scores
@@ -1710,13 +1942,14 @@ fn grow_tree(
                         offset,
                         // On the last split, the children only need their leaf scores.
                         remaining > 1,
+                        INDEX_PROPS.contains(&prop),
                         pool,
                         worker_scratch,
                     );
                     return Some((lo, pending));
                 }
                 let j = (k - committed_tasks) / 2;
-                let (_, start, end, prop, threshold, depth) = speculated_ref[j];
+                let (_, start, end, prop, threshold, depth, base) = speculated_ref[j];
                 let (indices, split_at) =
                     learner_ref.s.partition_indices(start, end, prop, threshold);
                 if split_at == 0 || split_at == indices.len() {
@@ -1730,13 +1963,16 @@ fn grow_tree(
                 };
                 let mut copy = learner_ref.s.select(&indices[rows.clone()]);
                 let offset = if modal {
-                    rebase_zero(
+                    with_ma_properties!(&copy.props, |rows| rebase_modal(
                         &mut copy.tok,
+                        rows,
                         &copy.val,
-                        &mut worker_scratch.ma_property.multi_bin_count,
-                    )
+                        Some(base),
+                        None,
+                        worker_scratch,
+                    ))
                 } else {
-                    0
+                    [0; MODAL_PREDS.len()]
                 };
                 let pending = learner_ref.evaluate_rows(
                     0,
@@ -1747,6 +1983,7 @@ fn grow_tree(
                     depth,
                     offset,
                     true,
+                    INDEX_PROPS.contains(&prop),
                     pool,
                     worker_scratch,
                 );
@@ -1785,8 +2022,8 @@ fn grow_tree(
             // Scored ahead on a copy: partition the learner's rows now, and
             // rebase the children's Zero tokens as the copy was.
             let lo = p.start + learner.s.partition(p.start, p.end, prop, threshold);
-            learner.rebase(p.start, lo, scratch);
-            learner.rebase(lo, p.end, scratch);
+            learner.rebase(p.start, lo, Some(p.modal), pool, scratch);
+            learner.rebase(lo, p.end, Some(p.modal), pool, scratch);
         }
         let Some((_, mut gt, mut le)) = ahead.remove(&p.node_id).expect("scored ahead").children
         else {
@@ -1939,7 +2176,7 @@ pub(crate) fn learn_ma_tree_in_place(
     let mut learner = new_learner(samples, params, vec![MaNode::Leaf { pred: 0, offset: 0 }]);
     let flat_bits = flat_cost(&learner, scratch);
     let mut heap = std::collections::BinaryHeap::new();
-    let offset = learner.rebase(0, n, scratch);
+    let offset = learner.rebase(0, n, None, pool, scratch);
     let root = learner.evaluate(
         0,
         0,
@@ -1947,6 +2184,7 @@ pub(crate) fn learn_ma_tree_in_place(
         0,
         offset,
         learner.p.max_leaves as u32 > 1,
+        false,
         pool,
         scratch,
     );
@@ -2035,9 +2273,9 @@ pub(crate) fn deepen_ma_tree(
     let seed_leaves: Vec<usize> = (0..learner.nodes.len())
         .filter(|&node| matches!(learner.nodes[node], MaNode::Leaf { .. }) && counts[node] != 0)
         .collect();
-    let modal_offsets: Vec<i32> = seed_leaves
+    let modal_offsets: Vec<ModalOffsets> = seed_leaves
         .iter()
-        .map(|&node| learner.rebase(offsets[node], offsets[node + 1], scratch))
+        .map(|&node| learner.rebase(offsets[node], offsets[node + 1], None, pool, scratch))
         .collect();
     let pendings = {
         let learner_ref = &learner;
@@ -2050,6 +2288,7 @@ pub(crate) fn deepen_ma_tree(
                 depths[node],
                 modal_offsets[k],
                 learner_ref.leaves < learner_ref.p.max_leaves as u32,
+                false,
                 pool,
                 worker_scratch,
             )
@@ -2221,6 +2460,7 @@ mod tests {
                 side_preds: NUM_MA_PREDS,
                 max_candidates: MAX_CANDIDATES,
                 modal_offsets: false,
+                index_first_depth: 0,
                 prune_leaf_bits: 0.0,
                 channel_first: false,
                 no_wp_channels: 0,
@@ -2242,6 +2482,7 @@ mod tests {
                 side_preds: NUM_MA_PREDS,
                 max_candidates: MAX_CANDIDATES,
                 modal_offsets: false,
+                index_first_depth: 0,
                 prune_leaf_bits: 0.0,
                 channel_first: false,
                 no_wp_channels: 0,
