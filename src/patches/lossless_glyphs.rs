@@ -376,14 +376,19 @@ pub(crate) fn find_lossless_additive_glyph_patches(
     if width < GLYPH_BG_TILE || height < GLYPH_BG_TILE {
         return None;
     }
-    let mut rgb = std::array::from_fn(|_| vec![0; width * height]);
     // RCT type 0 reconstructs untransformed RGB.
-    selected_rct_row_fn()(
+    let to_rgb = selected_rct_row_fn();
+    let screen = super::glyphs::screen_additive_glyphs(width, height, bits, |y0, rows, rgb| {
+        let at = y0 * width..(y0 + rows) * width;
+        to_rgb([0, 1, 2].map(|c| &linear.plane_data(c)[at.clone()]), 0, rgb);
+    })?;
+    let mut rgb = std::array::from_fn(|_| vec![0; width * height]);
+    to_rgb(
         [0, 1, 2].map(|c| linear.plane_data(c)),
         0,
         rgb.each_mut().map(Vec::as_mut_slice),
     );
-    let plan = super::glyphs::plan_additive_glyphs(rgb, width, height, bits)?;
+    let plan = super::glyphs::plan_additive_glyphs(rgb, width, height, bits, screen)?;
     let to_ycocg = |mut planes: [Vec<i32>; 3], w, h| {
         forward_ycocg_in_place(planes.each_mut().map(Vec::as_mut_slice));
         Image3Si::from_plane_data(w, h, planes)

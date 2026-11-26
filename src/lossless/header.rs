@@ -34,7 +34,7 @@ use super::rct::write_rct_transform;
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::entropy::{Token, pack_signed};
-use crate::patches::{ModularFrameKind, NUM_PATCH_CONTEXTS, PATCH_REF_ID, PatchReference};
+use crate::patches::{ModularFrameKind, NUM_PATCH_CONTEXTS, PatchReference};
 use crate::path_order;
 use crate::shared_sort::SharedSort;
 
@@ -155,7 +155,11 @@ pub(super) fn write_frame_header_modular_kind(
         ModularFrameKind::XybBlend { last } => {
             write_frame_header_modular_xyb_blend(has_alpha, last, layout, w)
         }
-        ModularFrameKind::ReferenceOnly { width, height } => {
+        ModularFrameKind::ReferenceOnly {
+            width,
+            height,
+            slot,
+        } => {
             w.write(1, 0); // all_default = false
             w.write(2, 0b10); // reference-only frame
             w.write(1, 1); // Modular
@@ -171,7 +175,7 @@ pub(super) fn write_frame_header_modular_kind(
             write_frame_dimension(width, w);
             write_frame_dimension(height, w);
             // No blending and no is_last for reference-only frames.
-            w.write(2, PATCH_REF_ID as u64); // save_as_reference = 3
+            w.write(2, slot as u64); // save_as_reference
             w.write(1, 1); // save_before_color_transform = true
             w.write(2, 0); // empty name
             w.write(1, 0); // loop filter not all-default
@@ -674,7 +678,7 @@ mod tests {
             atlas_y: 0,
             width: 8,
             height: 10,
-            ref_frame: PATCH_REF_ID,
+            ref_frame: crate::patches::PATCH_REF_ID,
             alpha_only: false,
             add,
             mul: false,

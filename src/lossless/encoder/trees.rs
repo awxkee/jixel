@@ -541,7 +541,12 @@ impl SourcePlan {
         };
         let dense = effort.tree_dense_sampling && rgb_stage.as_ref().is_some_and(photo);
         let mut palette_spare_wp = None;
-        let mut palette_stage = palette.and_then(|p| {
+        // A two-color palette is learned whatever its coarse learn says:
+        // nothing ranks against it, and without the preset ranking nothing
+        // starts from that learn either (26 pages byte-identical, 5 % of
+        // their encode).
+        let unranked = !rank_presets_deep && palette.is_some_and(GlobalPalette::is_bilevel);
+        let mut palette_stage = palette.filter(|_| !unranked).and_then(|p| {
             let source = p.source(xsize, ysize);
             let stage = coarse(&source, wp_params, scratch)?;
             // A two-color index keeps the predictor and the regular budget:
@@ -568,13 +573,15 @@ impl SourcePlan {
             self.palette_dense_no_wp = palette_spare_wp == Some(true);
         }
         let large_palette = palette.is_some_and(GlobalPalette::is_large);
-        self.rgb = large_palette || rgb_coarse <= palette_coarse * PALETTE_COARSE_MARGIN;
+        self.rgb =
+            large_palette || (!unranked && rgb_coarse <= palette_coarse * PALETTE_COARSE_MARGIN);
         let palette_margin = if large_palette {
             LARGE_PALETTE_COARSE_MARGIN
         } else {
             PALETTE_COARSE_MARGIN
         };
-        self.palette = palette_stage.is_some() && palette_coarse <= rgb_coarse * palette_margin;
+        self.palette =
+            unranked || (palette_stage.is_some() && palette_coarse <= rgb_coarse * palette_margin);
 
         // Small images stop here: the preset ranking costs more than it finds.
         let rank_more = source_values_of(xsize, ysize, frame.coded_chans) >= RANK_MIN_VALUES;
@@ -809,6 +816,7 @@ impl Tournament {
         // each form under a tree of Zero-predictor leaves as well, where LZ77
         // copies the screen's pixels. The smallest written frame stays.
         let packed = PackedPalette::new(palette, frame.xsize, frame.ysize);
+        let mut held: Option<(GroupLayout, LearnedCandidate)> = None;
         if packed.is_some() || palette.is_bilevel() {
             let screen = palette.is_bilevel()
                 && palette.screen_share(frame.xsize, frame.ysize) >= palette::SCREEN_MIN_SHARE;
@@ -836,15 +844,27 @@ impl Tournament {
                     pool,
                     scratch,
                 ) {
+                    // A two-color image writes its packed or its plain index
+                    // image, whichever the final learn estimates smaller: at
+                    // Slow the estimate named the smaller file on 25 of 26
+                    // pages (the other by 21 bytes) and the second write was
+                    // 15 % of their encode.
+                    if palette.is_bilevel()
+                        && !arm.value_tree
+                        && raced.is_none()
+                        && frame.effort.tree_dense_sampling
+                    {
+                        held = Some((layout, cand));
+                        continue;
+                    }
                     self.write_palette(
                         frame, color, sources, arm, layout, &cand, best, pool, scratch,
                     );
                 }
             }
         }
-        drop(packed);
         let Some(raced) = raced else {
-            if let Some((layout, cand, coarse)) = self.learn_palette_layouts(
+            let plain = self.learn_palette_layouts(
                 frame,
                 sources,
                 &source,
@@ -852,7 +872,32 @@ impl Tournament {
                 first_stage,
                 pool,
                 scratch,
-            ) {
+            );
+            let plain_est = plain
+                .as_ref()
+                .map_or(f64::INFINITY, |(_, cand, _)| cand.est_real);
+            if let Some((held_layout, held_cand)) = held.take()
+                && held_cand.est_real < plain_est
+                && let Some(packed) = &packed
+            {
+                let packed_source = packed.source(frame.xsize, frame.ysize);
+                self.write_palette(
+                    frame,
+                    color,
+                    sources,
+                    &packed_source,
+                    held_layout,
+                    &held_cand,
+                    best,
+                    pool,
+                    scratch,
+                );
+                if let Some((_, _, coarse)) = plain {
+                    self.best_source_coarse = self.best_source_coarse.min(coarse);
+                }
+                return;
+            }
+            if let Some((layout, cand, coarse)) = plain {
                 let before = best.bits();
                 self.write_palette(
                     frame, color, sources, &source, layout, &cand, best, pool, scratch,
@@ -871,6 +916,7 @@ impl Tournament {
             }
             return;
         };
+        drop(packed);
         // The order race: both orders learn the first layout, and an order
         // whose complete estimate there trails the other's by more than
         // `ORDER_RACE_MARGIN` stops; the rest learn the other layouts and

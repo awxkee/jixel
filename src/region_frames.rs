@@ -40,6 +40,7 @@
 use crate::encode_image::AlphaPlane;
 use crate::image::Image3Si;
 use crate::patches::ContentHashMap;
+use crate::patches::PatchReference;
 use crate::shared_sort::SharedSort;
 use crate::thread_pool::ThreadPool;
 
@@ -497,6 +498,160 @@ pub(crate) fn crop(
         region.width,
         region.height,
     )
+}
+
+/// Reference slots of the region sheets; the frame's glyph atlas, when it
+/// has one, is in `PATCH_REF_ID`.
+static SHEET_SLOTS: [u32; 3] = [0, 1, 2];
+
+/// The crops of a region split as reference-only frames.
+pub(crate) struct RegionSheets {
+    /// Each sheet, its alpha and the reference slot it is saved to.
+    pub(crate) frames: Vec<(Image3Si, Option<AlphaPlane>, u32)>,
+    /// One kReplace patch per crop, onto its rectangle of the image, and
+    /// with alpha a second one that replaces the alpha there.
+    pub(crate) references: Vec<PatchReference>,
+}
+
+/// The crops of `regions` on reference-only sheets, and the patches that
+/// put each back on its rectangle. A sheet decodes its groups in parallel
+/// and the patch stage copies from it, where a frame per crop is decoded on
+/// one thread and blended over the whole canvas. The heaviest crops (by
+/// `weights`) get a sheet each, with their own palette and tree; the rest
+/// share the last one.
+pub(crate) fn sheets(
+    regions: &[Region],
+    crops: &[(Image3Si, Option<AlphaPlane>)],
+    weights: &[f64],
+) -> RegionSheets {
+    let mut order: Vec<usize> = (0..regions.len()).collect();
+    order.shared_sort_by(|&a, &b| weights[b].total_cmp(&weights[a]).then(a.cmp(&b)));
+    let alone = if order.len() <= SHEET_SLOTS.len() {
+        order.len()
+    } else {
+        SHEET_SLOTS.len() - 1
+    };
+    let mut groups: Vec<Vec<usize>> = order[..alone].iter().map(|&i| vec![i]).collect();
+    if alone < order.len() {
+        groups.push(order[alone..].to_vec());
+    }
+    let mut references: Vec<Vec<PatchReference>> = vec![Vec::new(); regions.len()];
+    let frames = groups
+        .iter()
+        .zip(SHEET_SLOTS)
+        .map(|(members, slot)| {
+            let (sheet, sheet_alpha, at) = pack_sheet(regions, crops, members);
+            for (&i, (atlas_x, atlas_y)) in members.iter().zip(at) {
+                let r = &regions[i];
+                let color = PatchReference {
+                    atlas_x,
+                    atlas_y,
+                    width: r.width,
+                    height: r.height,
+                    ref_frame: slot,
+                    alpha_only: false,
+                    add: false,
+                    mul: false,
+                    positions: vec![(r.x0, r.y0)],
+                };
+                // A patch blends its color or its alpha, not both.
+                if sheet_alpha.is_some() {
+                    references[i].push(PatchReference {
+                        alpha_only: true,
+                        ..color.clone()
+                    });
+                }
+                references[i].push(color);
+            }
+            (sheet, sheet_alpha, slot)
+        })
+        .collect();
+    RegionSheets {
+        frames,
+        references: references.into_iter().flatten().collect(),
+    }
+}
+
+/// The crops `members` packed on one sheet (with its alpha, when the crops
+/// have one), and where each one starts.
+fn pack_sheet(
+    regions: &[Region],
+    crops: &[(Image3Si, Option<AlphaPlane>)],
+    members: &[usize],
+) -> (Image3Si, Option<AlphaPlane>, Vec<(usize, usize)>) {
+    // Shelves of decreasing height, as wide as the widest crop or a square
+    // of the total area.
+    let area: usize = members
+        .iter()
+        .map(|&i| regions[i].width * regions[i].height)
+        .sum();
+    let widest = members.iter().map(|&i| regions[i].width).max().unwrap_or(1);
+    let limit = widest.max((area as f64).sqrt().ceil() as usize);
+    let mut order: Vec<usize> = (0..members.len()).collect();
+    order.shared_sort_by_key(|&k| (core::cmp::Reverse(regions[members[k]].height), k));
+    let mut at = vec![(0usize, 0usize); members.len()];
+    let (mut x, mut y, mut shelf, mut width) = (0, 0, 0, 0);
+    for &k in &order {
+        let r = &regions[members[k]];
+        if x > 0 && x + r.width > limit {
+            y += shelf;
+            x = 0;
+            shelf = 0;
+        }
+        at[k] = (x, y);
+        x += r.width;
+        shelf = shelf.max(r.height);
+        width = width.max(x);
+    }
+    let height = y + shelf;
+    let mut sheet = Image3Si::new(width, height);
+    let mut filled = vec![false; width * height];
+    let mut alpha = crops[members[0]]
+        .1
+        .is_some()
+        .then(|| vec![0u8; width * height]);
+    for (&i, &(x0, y0)) in members.iter().zip(&at) {
+        let crop = &crops[i].0;
+        for row in 0..crop.ysize() {
+            if let (Some(alpha), Some(AlphaPlane::U8(a))) = (&mut alpha, &crops[i].1) {
+                alpha[(y0 + row) * width + x0..][..crop.xsize()]
+                    .copy_from_slice(&a[row * crop.xsize()..][..crop.xsize()]);
+            }
+            for c in 0..3 {
+                sheet.plane_row_mut(c, y0 + row)[x0..x0 + crop.xsize()]
+                    .copy_from_slice(crop.plane_row(c, row));
+            }
+            filled[(y0 + row) * width + x0..][..crop.xsize()].fill(true);
+        }
+    }
+    // The gaps repeat the pixel to their left, else the one above.
+    for row in 0..height {
+        for col in 0..width {
+            if filled[row * width + col] {
+                continue;
+            }
+            for c in 0..3 {
+                let v = if col > 0 {
+                    sheet.plane_row(c, row)[col - 1]
+                } else if row > 0 {
+                    sheet.plane_row(c, row - 1)[col]
+                } else {
+                    0
+                };
+                sheet.plane_row_mut(c, row)[col] = v;
+            }
+            if let Some(alpha) = &mut alpha {
+                alpha[row * width + col] = if col > 0 {
+                    alpha[row * width + col - 1]
+                } else if row > 0 {
+                    alpha[(row - 1) * width]
+                } else {
+                    0
+                };
+            }
+        }
+    }
+    (sheet, alpha.map(AlphaPlane::U8), at)
 }
 
 #[cfg(test)]

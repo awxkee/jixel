@@ -49,11 +49,12 @@ use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
 use crate::image::Image3Si;
+use crate::patches::PatchReference;
 use crate::patches::{
     LosslessPatches, ModularFrameKind, find_lossless_additive_glyph_patches,
     find_lossless_glyph_patches, find_lossless_patches,
 };
-use crate::region_frames::Region;
+use crate::region_frames::{Region, RegionSheets};
 use crate::thread_pool::ThreadPool;
 use crate::weighted_predictor::WpParams;
 
@@ -172,7 +173,7 @@ pub(crate) fn encode_frame_lossless_base(
         pool,
         scratch,
     }
-    .encode_displayed(linear, Some(alpha), true, None, writer);
+    .encode_displayed(linear, Some(alpha), true, None, &[], writer);
 }
 
 /// Everything the frames of one lossless image share.
@@ -192,6 +193,8 @@ struct RegionSplit {
     /// The image with the rectangles cut out, saved to reference slot 0.
     base: Image3Si,
     base_alpha: Option<AlphaPlane>,
+    /// The crops on reference-only sheets.
+    sheets: RegionSheets,
 }
 
 impl FrameCoder<'_, '_> {
@@ -242,23 +245,30 @@ impl FrameCoder<'_, '_> {
         if let Some((split, sure)) = self.plan_region_split(linear, alpha, &mut whole_glyphs) {
             if sure {
                 drop(whole_glyphs);
-                self.encode_region_split(&split, writer);
+                self.encode_region_split(&split, true, writer);
                 return;
             }
             let mut split_writer = BitWriter::new();
-            self.encode_region_split(&split, &mut split_writer);
+            self.encode_region_split(&split, true, &mut split_writer);
             drop(split);
             // The estimate ranks the two within a few percent and misses
             // what the cut does to the base's palette and tree, so the
             // whole frame competes on complete size.
             let mut whole_writer = BitWriter::new();
-            self.encode_displayed(linear, alpha, false, whole_glyphs.take(), &mut whole_writer);
+            self.encode_displayed(
+                linear,
+                alpha,
+                false,
+                whole_glyphs.take(),
+                &[],
+                &mut whole_writer,
+            );
             append_smaller(&split_writer, &whole_writer, writer);
             return;
         }
 
         // Step 2: the displayed frame.
-        self.encode_displayed(linear, alpha, false, whole_glyphs, writer);
+        self.encode_displayed(linear, alpha, false, whole_glyphs, &[], writer);
     }
 
     /// The region split worth encoding, else `None`: the rare-color plan
@@ -334,11 +344,11 @@ impl FrameCoder<'_, '_> {
         };
         let split_bits = {
             let mut split_writer = BitWriter::new();
-            proxy.encode_region_split(split, &mut split_writer);
+            proxy.encode_region_split(split, false, &mut split_writer);
             split_writer.bits_written()
         };
         let mut whole_writer = BitWriter::new();
-        proxy.encode_displayed(linear, alpha, false, None, &mut whole_writer);
+        proxy.encode_displayed(linear, alpha, false, None, &[], &mut whole_writer);
         split_bits as f64 / whole_writer.bits_written().max(1) as f64
     }
 
@@ -409,19 +419,66 @@ impl FrameCoder<'_, '_> {
             _ => None,
         };
         Some((
-            RegionSplit {
-                regions,
-                crops,
-                base,
-                base_alpha,
+            {
+                let weights: Vec<f64> = own
+                    .iter()
+                    .zip(&regions)
+                    .map(|(bits, r)| bits.unwrap_or((r.width * r.height) as f64 * 24.0))
+                    .collect();
+                let sheets = crate::region_frames::sheets(&regions, &crops, &weights);
+                RegionSplit {
+                    regions,
+                    crops,
+                    base,
+                    base_alpha,
+                    sheets,
+                }
             },
             estimate,
         ))
     }
 
     /// The base saved to slot 0, then each crop replacing its rectangle.
-    fn encode_region_split(&mut self, split: &RegionSplit, writer: &mut BitWriter) {
-        self.encode_displayed(&split.base, split.base_alpha.as_ref(), true, None, writer);
+    fn encode_region_split(
+        &mut self,
+        split: &RegionSplit,
+        as_sheets: bool,
+        writer: &mut BitWriter,
+    ) {
+        if as_sheets {
+            let sheets = &split.sheets;
+            for (sheet, sheet_alpha, slot) in &sheets.frames {
+                self.core(
+                    sheet,
+                    sheet_alpha.as_ref(),
+                    self.settings.single_pass(),
+                    ModularFrameKind::ReferenceOnly {
+                        width: sheet.xsize(),
+                        height: sheet.ysize(),
+                        slot: *slot,
+                    },
+                    true,
+                    writer,
+                );
+            }
+            self.encode_displayed(
+                &split.base,
+                split.base_alpha.as_ref(),
+                false,
+                None,
+                &sheets.references,
+                writer,
+            );
+            return;
+        }
+        self.encode_displayed(
+            &split.base,
+            split.base_alpha.as_ref(),
+            true,
+            None,
+            &[],
+            writer,
+        );
         for (i, ((crop, crop_alpha), r)) in split.crops.iter().zip(&split.regions).enumerate() {
             self.core(
                 crop,
@@ -451,9 +508,15 @@ impl FrameCoder<'_, '_> {
         alpha: Option<&AlphaPlane>,
         saved_first: bool,
         glyph_plan: Option<Option<LosslessPatches>>,
+        over: &[PatchReference],
         writer: &mut BitWriter,
     ) {
-        let regular = if saved_first {
+        let regular = if !over.is_empty() {
+            ModularFrameKind::Patched {
+                references: over,
+                saved_first,
+            }
+        } else if saved_first {
             ModularFrameKind::RgbSavedFirst
         } else {
             ModularFrameKind::Regular
@@ -533,7 +596,7 @@ impl FrameCoder<'_, '_> {
 
         // Step 3: the patched pair.
         let mut patched_writer = BitWriter::new();
-        let atlas_bits = self.encode_patched(&plan, alpha, saved_first, &mut patched_writer);
+        let atlas_bits = self.encode_patched(&plan, alpha, saved_first, over, &mut patched_writer);
 
         // Step 4 (glyph plans): they win whenever the plan is any good, so
         // the regular frame (a complete second encode) is written only when
@@ -586,6 +649,7 @@ impl FrameCoder<'_, '_> {
         plan: &LosslessPatches,
         alpha: Option<&AlphaPlane>,
         saved_first: bool,
+        over: &[PatchReference],
         writer: &mut BitWriter,
     ) -> usize {
         let (atlas_w, atlas_h) = (plan.atlas.xsize(), plan.atlas.ysize());
@@ -597,17 +661,21 @@ impl FrameCoder<'_, '_> {
             ModularFrameKind::ReferenceOnly {
                 width: atlas_w,
                 height: atlas_h,
+                slot: crate::patches::PATCH_REF_ID,
             },
             true,
             writer,
         );
         let atlas_bits = writer.bits_written();
+        // The region crops go down first: the glyphs lie outside them.
+        let references: Vec<PatchReference> =
+            over.iter().chain(&plan.references).cloned().collect();
         self.core(
             &plan.base,
             alpha,
             self.settings.single_pass(),
             ModularFrameKind::Patched {
-                references: &plan.references,
+                references: &references,
                 saved_first,
             },
             true,
