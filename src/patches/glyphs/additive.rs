@@ -39,8 +39,8 @@
 //! shares stays in the base under it.
 use super::components::label_components;
 use super::ink::{
-    GLYPH_MAX_INK_SHARE, GROUND_MIN_FRAME_SHARE, GROUND_MIN_INK_SHARE, absorb_smooth_ground,
-    ink_mask, ink_share,
+    GLYPH_MAX_INK_SHARE, GROUND_MIN_FRAME_SHARE, GROUND_MIN_INK_SHARE, InkScreen,
+    absorb_smooth_ground, ink_mask_over, ink_share, screen_ink,
 };
 use super::{GLYPH_ATLAS_MAX_WIDTH, GLYPH_BG_TILE, GLYPH_MIN_REPEAT_PIXELS, GlyphShape, Lattice};
 use crate::patches::color_key::color_key;
@@ -89,14 +89,48 @@ pub(crate) struct AdditiveGlyphs {
     pub(crate) references: Vec<PatchReference>,
 }
 
+/// The first two tests of [`plan_additive_glyphs`] (flat-color ink on a
+/// tenth of the frame, most of that ink stepping smoothly) from bands of
+/// its RGB rows: `fill_band(y0, rows, rgb)` writes `rows` rows from `y0`.
+/// `None` where they fail: a photo leaves here before any plane of its
+/// size is copied or built.
+pub(crate) fn screen_additive_glyphs(
+    width: usize,
+    height: usize,
+    bits: u32,
+    mut fill_band: impl FnMut(usize, usize, [&mut [i32]; 3]),
+) -> Option<InkScreen> {
+    if width < GLYPH_BG_TILE || height < GLYPH_BG_TILE {
+        return None;
+    }
+    let shift = bits.saturating_sub(8);
+    let scale = DETECTOR_SCALE;
+    let screen = screen_ink(width, height, |y0, rows, planes| {
+        fill_band(y0, rows, planes.each_mut().map(Vec::as_mut_slice));
+        // Red, green, blue to the detector's green, red, blue.
+        planes.swap(0, 1);
+        for (plane, scale) in planes.iter_mut().zip(scale) {
+            for v in plane.iter_mut() {
+                *v = (*v * scale) >> shift;
+            }
+        }
+    });
+    // The ground must take back `GROUND_MIN_INK_SHARE` of the ink; ink
+    // that does not step smoothly is not going back.
+    (screen.ink_share >= GROUND_MIN_FRAME_SHARE && screen.smooth_share >= GROUND_MIN_INK_SHARE)
+        .then_some(screen)
+}
+
 /// Additive glyph patches of an integer RGB frame with samples in
-/// `0..=max`; `None` unless smooth ground is what most of its ink was (the
-/// gate of the lossy search) and enough glyphs stand on it.
+/// `0..=max` that passed [`screen_additive_glyphs`]; `None` unless smooth
+/// ground is what most of its ink was (the gate of the lossy search) and
+/// enough glyphs stand on it.
 pub(crate) fn plan_additive_glyphs(
     rgb: [Vec<i32>; 3],
     width: usize,
     height: usize,
     bits: u32,
+    screen: InkScreen,
 ) -> Option<AdditiveGlyphs> {
     // The detector works on 8-bit levels: deeper samples drop their low
     // bits for it, and the differences are taken on the samples themselves.
@@ -124,11 +158,9 @@ pub(crate) fn plan_additive_glyphs(
         .zip(lb)
         .map(|((&y, &x), &b)| color_key(y, x, b))
         .collect();
-    let mut ink = ink_mask(&keys, width, height);
-    let flat_ink = ink_share(&ink);
-    if flat_ink < GROUND_MIN_FRAME_SHARE {
-        return None;
-    }
+    let mut ink = ink_mask_over(&keys, &screen.modes, width, height);
+    let flat_ink = screen.ink_share;
+    drop(screen);
     let ground = absorb_smooth_ground(&lattice, &mut ink)?;
     let left = ink_share(&ink);
     let taken = flat_ink - left;

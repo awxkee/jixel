@@ -130,6 +130,8 @@ pub(crate) enum ModularFrameKind<'a> {
     ReferenceOnly {
         width: usize,
         height: usize,
+        /// The reference slot the frame is saved to.
+        slot: u32,
     },
     /// Reference-only atlas inside an `xyb_encoded` codestream: channels are
     /// Y, X, B-Y on the default LF dequant lattice, saved to the modular slot.

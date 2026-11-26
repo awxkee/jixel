@@ -38,7 +38,7 @@ mod grid;
 mod ink;
 mod templates;
 
-pub(crate) use additive::plan_additive_glyphs;
+pub(crate) use additive::{plan_additive_glyphs, screen_additive_glyphs};
 
 /// Largest glyph box side the glyph detector keeps.
 pub(super) const GLYPH_MAX_SIDE: usize = 64;

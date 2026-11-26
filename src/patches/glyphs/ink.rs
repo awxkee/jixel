@@ -33,7 +33,7 @@ use crate::patches::PATCH_TILE;
 use crate::patches::color_key::{color_key, most_frequent_color};
 
 /// Share of the frame that may be ink before it stops being a page.
-pub(super) const GLYPH_MAX_INK_SHARE: f64 = 0.6;
+pub(crate) const GLYPH_MAX_INK_SHARE: f64 = 0.6;
 /// Distance between the tiles the screen samples.
 const GLYPH_SCREEN_STRIDE: usize = 64;
 /// Share of the sampled pixels that may be ink.
@@ -45,7 +45,7 @@ const GLYPH_SCREEN_MAX_INK: f64 = 0.6;
 /// smooth ground instead (each such pixel a small step from the one before
 /// it, as [`absorb_smooth_ground`] will find them) stays: a ramp steeper
 /// than its tiles is a page for the labels on it.
-pub(super) fn sample_is_mostly_ink(xyb: &Image3F, params: &GlyphParams) -> bool {
+pub(crate) fn sample_is_mostly_ink(xyb: &Image3F, params: &GlyphParams) -> bool {
     let (width, height) = (xyb.xsize(), xyb.ysize());
     let mut colors = [[0i32; 3]; PATCH_TILE * PATCH_TILE];
     let mut sample_keys = [0u64; PATCH_TILE * PATCH_TILE];
@@ -89,7 +89,7 @@ pub(super) fn sample_is_mostly_ink(xyb: &Image3F, params: &GlyphParams) -> bool 
 /// Packed coarse color of every pixel. The full frame uses the rounding
 /// kernel on bounded chunks; matching later reads coarse samples only
 /// within glyph boxes.
-pub(super) fn color_keys(ctx: &EncodingContext, lattice: &Lattice) -> Vec<u64> {
+pub(crate) fn color_keys(ctx: &EncodingContext, lattice: &Lattice) -> Vec<u64> {
     let [qy, qx, qb] = &lattice.planes;
     let shift = lattice.shift;
     let mut keys = Vec::with_capacity(lattice.width * lattice.height);
@@ -143,13 +143,60 @@ fn tile_backgrounds(keys: &[u64], width: usize, tiles_x: usize, tiles_y: usize) 
     modes
 }
 
+/// Marks, in one band of tiles (row `ty`), the pixels that are none of the
+/// background colors of their tile and its eight neighbors.
+fn mark_ink_band(
+    ink_band: &mut [bool],
+    key_band: &[u64],
+    modes: &[u64],
+    ty: usize,
+    tiles_x: usize,
+    tiles_y: usize,
+    width: usize,
+) {
+    let bg_tile = GLYPH_BG_TILE;
+    let neighbor_rows = &modes[ty.saturating_sub(1) * tiles_x..(ty + 2).min(tiles_y) * tiles_x];
+    for tx in 0..tiles_x {
+        let (nx0, nx1) = (tx.saturating_sub(1), (tx + 2).min(tiles_x));
+        let mut backgrounds = [0u64; 9];
+        let mut n = 0;
+        for &key in neighbor_rows
+            .chunks_exact(tiles_x)
+            .flat_map(|row| &row[nx0..nx1])
+        {
+            if !backgrounds[..n].contains(&key) {
+                backgrounds[n] = key;
+                n += 1;
+            }
+        }
+        let backgrounds = &backgrounds[..n];
+        let x0 = tx * bg_tile;
+        let x1 = (x0 + bg_tile).min(width);
+        for (ink_row, key_row) in ink_band
+            .chunks_exact_mut(width)
+            .zip(key_band.chunks_exact(width))
+        {
+            for (pixel, key) in ink_row[x0..x1].iter_mut().zip(&key_row[x0..x1]) {
+                *pixel = !backgrounds.contains(key);
+            }
+        }
+    }
+}
+
 /// Marks the pixels that are none of the background colors of their tile
 /// and its eight neighbors.
-pub(super) fn ink_mask(keys: &[u64], width: usize, height: usize) -> Vec<bool> {
+pub(crate) fn ink_mask(keys: &[u64], width: usize, height: usize) -> Vec<bool> {
+    let tiles_x = width.div_ceil(GLYPH_BG_TILE);
+    let tiles_y = height.div_ceil(GLYPH_BG_TILE);
+    let modes = tile_backgrounds(keys, width, tiles_x, tiles_y);
+    ink_mask_over(keys, &modes, width, height)
+}
+
+/// [`ink_mask`] over tile backgrounds already found (`modes`, row-major).
+pub(crate) fn ink_mask_over(keys: &[u64], modes: &[u64], width: usize, height: usize) -> Vec<bool> {
     let bg_tile = GLYPH_BG_TILE;
     let tiles_x = width.div_ceil(bg_tile);
     let tiles_y = height.div_ceil(bg_tile);
-    let modes = tile_backgrounds(keys, width, tiles_x, tiles_y);
     let band_len = width * bg_tile;
     let mut ink = vec![false; width * height];
     for (ty, (ink_band, key_band)) in ink
@@ -157,38 +204,13 @@ pub(super) fn ink_mask(keys: &[u64], width: usize, height: usize) -> Vec<bool> {
         .zip(keys.chunks(band_len))
         .enumerate()
     {
-        let neighbor_rows = &modes[ty.saturating_sub(1) * tiles_x..(ty + 2).min(tiles_y) * tiles_x];
-        for tx in 0..tiles_x {
-            let (nx0, nx1) = (tx.saturating_sub(1), (tx + 2).min(tiles_x));
-            let mut backgrounds = [0u64; 9];
-            let mut n = 0;
-            for &key in neighbor_rows
-                .chunks_exact(tiles_x)
-                .flat_map(|row| &row[nx0..nx1])
-            {
-                if !backgrounds[..n].contains(&key) {
-                    backgrounds[n] = key;
-                    n += 1;
-                }
-            }
-            let backgrounds = &backgrounds[..n];
-            let x0 = tx * bg_tile;
-            let x1 = (x0 + bg_tile).min(width);
-            for (ink_row, key_row) in ink_band
-                .chunks_exact_mut(width)
-                .zip(key_band.chunks_exact(width))
-            {
-                for (pixel, key) in ink_row[x0..x1].iter_mut().zip(&key_row[x0..x1]) {
-                    *pixel = !backgrounds.contains(key);
-                }
-            }
-        }
+        mark_ink_band(ink_band, key_band, modes, ty, tiles_x, tiles_y, width);
     }
     ink
 }
 
 /// Share of the frame that is ink.
-pub(super) fn ink_share(ink: &[bool]) -> f64 {
+pub(crate) fn ink_share(ink: &[bool]) -> f64 {
     ink.iter().filter(|&&p| p).count() as f64 / ink.len().max(1) as f64
 }
 
@@ -196,8 +218,8 @@ pub(super) fn ink_share(ink: &[bool]) -> f64 {
 /// take to be used. Ramps and wallpapers under labels gave 0.74..1 of their
 /// ink (0.18..0.5 of the frame), text screenshots with photos and shaded
 /// boxes 0..0.56 and one 0.69.
-pub(super) const GROUND_MIN_FRAME_SHARE: f64 = 0.1;
-pub(super) const GROUND_MIN_INK_SHARE: f64 = 0.7;
+pub(crate) const GROUND_MIN_FRAME_SHARE: f64 = 0.1;
+pub(crate) const GROUND_MIN_INK_SHARE: f64 = 0.7;
 
 /// Largest lattice step (Y, X, B) between neighbors of one smooth ground:
 /// about two 8-bit levels, the step of a banded gradient.
@@ -215,6 +237,111 @@ static GROUND_TILE_SPREAD: [i32; 3] = [48, 128, 48];
 const GROUND_MAX_POCKET_PIXELS: usize = 256;
 const GROUND_POCKET_REACH: usize = 6;
 
+/// Rows sampled for [`InkScreen::smooth_share`].
+const SMOOTH_SCREEN_ROW_STRIDE: usize = 4;
+
+/// The ink pixels of one row past its first, and how many of them are a
+/// small step from the pixel before.
+fn smooth_ink_in_row([y, x, b]: [&[i32]; 3], ink: &[bool]) -> (usize, usize) {
+    if ink.len() < 2 {
+        return (0, 0);
+    }
+    let small_step = |&[left, right]: &[i32; 2], limit| (right - left).abs() <= limit;
+    let pairs = y
+        .array_windows::<2>()
+        .zip(x.array_windows::<2>())
+        .zip(b.array_windows::<2>());
+    let (mut smooth, mut total) = (0usize, 0usize);
+    for (&is_ink, ((y, x), b)) in ink[1..].iter().zip(pairs) {
+        if !is_ink {
+            continue;
+        }
+        total += 1;
+        smooth += usize::from(
+            small_step(y, GROUND_STEP[0])
+                && small_step(x, GROUND_STEP[1])
+                && small_step(b, GROUND_STEP[2]),
+        );
+    }
+    (smooth, total)
+}
+
+/// What a frame's ink looks like before its mask is built.
+pub(crate) struct InkScreen {
+    /// The background of every tile (see [`ink_mask_over`]).
+    pub(crate) modes: Vec<u64>,
+    /// [`ink_share`] of the frame's [`ink_mask`].
+    pub(crate) ink_share: f64,
+    /// The share of ink pixels a small step ([`GROUND_STEP`]) from the pixel
+    /// before them, on every fourth row: what [`absorb_smooth_ground`] can
+    /// take back, before its flood over the frame.
+    pub(crate) smooth_share: f64,
+}
+
+/// The ink of a frame from one band of tiles at a time: `fill_band(y0,
+/// rows, planes)` writes the lattice planes of `rows` rows from `y0`.
+/// Nothing the size of the frame is allocated, so a frame the shares turn
+/// away (a photo) never has its lattice, keys and mask built.
+pub(crate) fn screen_ink(
+    width: usize,
+    height: usize,
+    mut fill_band: impl FnMut(usize, usize, &mut [Vec<i32>; 3]),
+) -> InkScreen {
+    let bg_tile = GLYPH_BG_TILE;
+    let tiles_x = width.div_ceil(bg_tile);
+    let tiles_y = height.div_ceil(bg_tile);
+    let mut planes: [Vec<i32>; 3] = std::array::from_fn(|_| Vec::with_capacity(width * bg_tile));
+    let mut keys: Vec<u64> = Vec::with_capacity(width * bg_tile);
+    let mut load = |ty: usize, planes: &mut [Vec<i32>; 3], keys: &mut Vec<u64>| {
+        let y0 = ty * bg_tile;
+        let rows = bg_tile.min(height - y0);
+        for plane in planes.iter_mut() {
+            plane.clear();
+            plane.resize(width * rows, 0);
+        }
+        fill_band(y0, rows, planes);
+        let [py, px, pb] = &*planes;
+        keys.clear();
+        keys.extend(
+            py.iter()
+                .zip(px)
+                .zip(pb)
+                .map(|((&y, &x), &b)| color_key(y, x, b)),
+        );
+        y0
+    };
+    // The tile backgrounds first: a band's ink needs those of the next one.
+    let mut modes: Vec<u64> = Vec::with_capacity(tiles_x * tiles_y);
+    for ty in 0..tiles_y {
+        load(ty, &mut planes, &mut keys);
+        modes.extend(tile_backgrounds(&keys, width, tiles_x, 1));
+    }
+    let mut ink_band = vec![false; width * bg_tile];
+    let (mut ink, mut smooth, mut total) = (0usize, 0usize, 0usize);
+    for ty in 0..tiles_y {
+        let y0 = load(ty, &mut planes, &mut keys);
+        let ink_band = &mut ink_band[..keys.len()];
+        mark_ink_band(ink_band, &keys, &modes, ty, tiles_x, tiles_y, width);
+        ink += ink_band.iter().filter(|&&p| p).count();
+        let [py, px, pb] = &planes;
+        for (row, ink_row) in ink_band.chunks_exact(width).enumerate() {
+            if !(y0 + row).is_multiple_of(SMOOTH_SCREEN_ROW_STRIDE) {
+                continue;
+            }
+            let at = row * width..(row + 1) * width;
+            let (row_smooth, row_total) =
+                smooth_ink_in_row([&py[at.clone()], &px[at.clone()], &pb[at]], ink_row);
+            smooth += row_smooth;
+            total += row_total;
+        }
+    }
+    InkScreen {
+        modes,
+        ink_share: ink as f64 / (width * height).max(1) as f64,
+        smooth_share: smooth as f64 / total.max(1) as f64,
+    }
+}
+
 /// Gradients are background too. The tile vote only knows flat colors, so
 /// the bands of a ramp between them come out as ink and every label over
 /// the ramp drowns in one frame-sized component. Ink regions whose pixels
@@ -222,7 +349,7 @@ const GROUND_POCKET_REACH: usize = 6;
 /// [`GROUND_STEP`]) go back to the background when they are large and
 /// continue a background pixel as smoothly, or are larger than any glyph.
 /// Returns the pixels cleared.
-pub(super) fn absorb_smooth_ground(lattice: &Lattice, ink: &mut [bool]) -> Option<Ground> {
+pub(crate) fn absorb_smooth_ground(lattice: &Lattice, ink: &mut [bool]) -> Option<Ground> {
     let (width, height) = (lattice.width, lattice.height);
     let [py, px, pb] = &lattice.planes;
     let smooth = |a: usize, b: usize| {
@@ -233,9 +360,61 @@ pub(super) fn absorb_smooth_ground(lattice: &Lattice, ink: &mut [bool]) -> Optio
     let mut visited = vec![false; ink.len()];
     let mut ground: Option<Vec<bool>> = None;
     let mut region: Vec<u32> = Vec::new();
-    // Regions left as ink, end to end, for the pocket pass.
+    // Runs of the region (row, first and last column) whose rows above and
+    // below are still to be looked at.
+    let mut spans: Vec<(u32, u32, u32)> = Vec::new();
+    // Regions left as ink, end to end, and their boxes (x0, x1, y0, y1),
+    // for the pocket pass.
     let mut left: Vec<u32> = Vec::new();
     let mut left_ends: Vec<usize> = Vec::new();
+    let mut left_boxes: Vec<[u32; 4]> = Vec::new();
+    // Takes the unvisited ink pixel `seed` of row `y` and the run of the
+    // region through it. A region is filled run by run: its pixels are the
+    // same whatever the order, and the first of them is where it began.
+    let grow = |seed: usize,
+                y: usize,
+                ink: &[bool],
+                visited: &mut [bool],
+                region: &mut Vec<u32>,
+                spans: &mut Vec<(u32, u32, u32)>,
+                touches_background: &mut bool| {
+        let row = y * width;
+        visited[seed] = true;
+        let mut first = seed;
+        while first > row {
+            let to = first - 1;
+            if !smooth(first, to) {
+                break;
+            }
+            if !ink[to] {
+                *touches_background = true;
+                break;
+            }
+            if visited[to] {
+                break;
+            }
+            visited[to] = true;
+            first = to;
+        }
+        let mut last = seed;
+        while last + 1 < row + width {
+            let to = last + 1;
+            if !smooth(last, to) {
+                break;
+            }
+            if !ink[to] {
+                *touches_background = true;
+                break;
+            }
+            if visited[to] {
+                break;
+            }
+            visited[to] = true;
+            last = to;
+        }
+        region.extend(first as u32..=last as u32);
+        spans.push((y as u32, (first - row) as u32, (last - row) as u32));
+    };
     let mut next = 0;
     while let Some(offset) = ink[next..]
         .iter()
@@ -245,36 +424,47 @@ pub(super) fn absorb_smooth_ground(lattice: &Lattice, ink: &mut [bool]) -> Optio
         let start = next + offset;
         next = start + 1;
         region.clear();
-        region.push(start as u32);
-        visited[start] = true;
         let mut touches_background = false;
-        let mut head = 0;
-        while head < region.len() {
-            let at = region[head] as usize;
-            head += 1;
-            let (x, y) = (at % width, at / width);
-            let mut visit = |to: usize| {
-                if !smooth(at, to) {
-                    return;
+        let (mut x0, mut x1, mut y0, mut y1) = (u32::MAX, 0, u32::MAX, 0);
+        grow(
+            start,
+            start / width,
+            ink,
+            &mut visited,
+            &mut region,
+            &mut spans,
+            &mut touches_background,
+        );
+        while let Some((y, first, last)) = spans.pop() {
+            (x0, x1, y0, y1) = (x0.min(first), x1.max(last), y0.min(y), y1.max(y));
+            let y = y as usize;
+            let row = y * width;
+            for (exists, to_row, to_y) in [
+                (y > 0, row.wrapping_sub(width), y.wrapping_sub(1)),
+                (y + 1 < height, row + width, y + 1),
+            ] {
+                if !exists {
+                    continue;
                 }
-                if !ink[to] {
-                    touches_background = true;
-                } else if !visited[to] {
-                    visited[to] = true;
-                    region.push(to as u32);
+                for x in first as usize..=last as usize {
+                    let (at, to) = (row + x, to_row + x);
+                    if !smooth(at, to) {
+                        continue;
+                    }
+                    if !ink[to] {
+                        touches_background = true;
+                    } else if !visited[to] {
+                        grow(
+                            to,
+                            to_y,
+                            ink,
+                            &mut visited,
+                            &mut region,
+                            &mut spans,
+                            &mut touches_background,
+                        );
+                    }
                 }
-            };
-            if x > 0 {
-                visit(at - 1);
-            }
-            if x + 1 < width {
-                visit(at + 1);
-            }
-            if y > 0 {
-                visit(at - width);
-            }
-            if y + 1 < height {
-                visit(at + width);
             }
         }
         let is_ground = region.len() >= GROUND_MIN_ISLAND_PIXELS
@@ -287,6 +477,7 @@ pub(super) fn absorb_smooth_ground(lattice: &Lattice, ink: &mut [bool]) -> Optio
         } else if region.len() <= GROUND_MAX_POCKET_PIXELS {
             left.extend_from_slice(&region);
             left_ends.push(left.len());
+            left_boxes.push([x0, x1, y0, y1]);
         }
     }
     drop(visited);
@@ -296,15 +487,11 @@ pub(super) fn absorb_smooth_ground(lattice: &Lattice, ink: &mut [bool]) -> Optio
     if let Some(ground) = &mut ground {
         let mut pockets: Vec<u32> = Vec::new();
         let mut first = 0;
-        for &end in &left_ends {
+        for (&end, &[x0, x1, y0, y1]) in left_ends.iter().zip(&left_boxes) {
             let pocket = &left[first..end];
             first = end;
             let seed = pocket[0] as usize;
-            let (mut x0, mut x1, mut y0, mut y1) = (width, 0, height, 0);
-            for &at in pocket {
-                let (x, y) = (at as usize % width, at as usize / width);
-                (x0, x1, y0, y1) = (x0.min(x), x1.max(x), y0.min(y), y1.max(y));
-            }
+            let (x0, x1, y0, y1) = (x0 as usize, x1 as usize, y0 as usize, y1 as usize);
             let (x0, x1) = (
                 x0.saturating_sub(GROUND_POCKET_REACH),
                 (x1 + GROUND_POCKET_REACH).min(width - 1),
@@ -336,7 +523,7 @@ pub(super) fn absorb_smooth_ground(lattice: &Lattice, ink: &mut [bool]) -> Optio
 
 /// The smooth ground of a frame: the pixels [`absorb_smooth_ground`] took
 /// back from the ink, and the range of their colors per background tile.
-pub(super) struct Ground {
+pub(crate) struct Ground {
     mask: Vec<bool>,
     width: usize,
     tiles_x: usize,
@@ -373,14 +560,14 @@ impl Ground {
     }
 
     /// Makes the ground ink again.
-    pub(super) fn give_back(&self, ink: &mut [bool]) {
+    pub(crate) fn give_back(&self, ink: &mut [bool]) {
         for (pixel, &taken) in ink.iter_mut().zip(&self.mask) {
             *pixel |= taken;
         }
     }
 
     #[inline]
-    pub(super) fn holds(&self, x: usize, y: usize) -> bool {
+    pub(crate) fn holds(&self, x: usize, y: usize) -> bool {
         self.mask[y * self.width + x]
     }
 
@@ -389,7 +576,7 @@ impl Ground {
     /// and what stands on it changes with it like its neighbors do. The
     /// ground of a tile counts when it is one ramp (a narrow range of
     /// colors), not the patches of a chart that happen to span the color.
-    pub(super) fn continues(&self, x: usize, y: usize, color: [i32; 3]) -> bool {
+    pub(crate) fn continues(&self, x: usize, y: usize, color: [i32; 3]) -> bool {
         let (tx, ty) = (x / GLYPH_BG_TILE, y / GLYPH_BG_TILE);
         (ty.saturating_sub(1)..(ty + 2).min(self.tiles_y)).any(|ty| {
             (tx.saturating_sub(1)..(tx + 2).min(self.tiles_x)).any(|tx| {

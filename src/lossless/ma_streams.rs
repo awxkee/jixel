@@ -253,10 +253,8 @@ fn choose_tree_streams_standard<T: lz77::LiteralToken>(
     let raw_slices: Vec<&[T]> = tokens.iter().map(Vec::as_slice).collect();
     let (e_lit, e_run) =
         estimate_literal_and_run_bits(&raw_slices, num_contexts, min_symbol, pool, scratch);
-    if e_run > e_lit * deep_lz_max_ratio {
-        // Runs lose to the literals; a structure repeated further back may
-        // still pay where a match is priced against what it replaces.
-        if let Some(priced) = priced_tree_streams(
+    let priced_parse = |scratch: &mut CoderScratch| -> Option<Vec<Vec<LzToken>>> {
+        priced_tree_streams(
             crate::Speed::Slow,
             &raw_slices,
             e_lit,
@@ -264,19 +262,38 @@ fn choose_tree_streams_standard<T: lz77::LiteralToken>(
             min_symbol,
             pool,
             scratch,
-        ) {
+        )
+    };
+    // Literals with the priced parse beside them, or the parse alone where
+    // it leads by `VARIANT_ESTIMATE_MAX_RATIO`.
+    let with_priced =
+        |tokens: Vec<Vec<T>>, priced: Vec<Vec<LzToken>>, scratch: &mut CoderScratch| {
             let slices: Vec<&[LzToken]> = priced.iter().map(Vec::as_slice).collect();
             let e_priced = estimate_streams_bits(&slices, num_contexts, min_symbol, pool, scratch);
             if e_priced * VARIANT_ESTIMATE_MAX_RATIO < e_lit {
-                return vec![TreeStreams::Lz(priced)];
+                vec![TreeStreams::Lz(priced)]
+            } else {
+                vec![TreeStreams::Literals(tokens), TreeStreams::Lz(priced)]
             }
-            return vec![TreeStreams::Literals(tokens), TreeStreams::Lz(priced)];
-        }
-        return vec![TreeStreams::Literals(tokens)];
+        };
+    if e_run > e_lit * deep_lz_max_ratio {
+        // Runs lose to the literals; a structure repeated further back may
+        // still pay where a match is priced against what it replaces.
+        return match priced_parse(scratch) {
+            Some(priced) => with_priced(tokens, priced, scratch),
+            None => vec![TreeStreams::Literals(tokens)],
+        };
     }
     let lz = deep(scratch);
     let slices: Vec<&[LzToken]> = lz.iter().map(Vec::as_slice).collect();
     let e_lz = estimate_streams_bits(&slices, num_contexts, min_symbol, pool, scratch);
+    if e_lz >= e_lit {
+        // The deep matcher lost as well: its matches are taken by length,
+        // and the priced parse keeps only those cheaper than their literals.
+        if let Some(priced) = priced_parse(scratch) {
+            return with_priced(tokens, priced, scratch);
+        }
+    }
     if e_lz >= e_lit * VARIANT_ESTIMATE_MAX_RATIO {
         vec![TreeStreams::Literals(tokens)]
     } else if e_lz < e_lit {
