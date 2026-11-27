@@ -95,6 +95,7 @@ mod lossy_modular;
 mod lz77_ac;
 mod lz_match;
 mod ma_tree;
+mod mix_palette;
 mod modular;
 mod mosaic_seam;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]

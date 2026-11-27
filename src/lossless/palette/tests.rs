@@ -271,7 +271,7 @@ fn packed_palette_inverts_through_the_decoder_squeeze() {
     let linear = gray_plane(w, h, bilevel);
     let palette = build_global_palette(&linear, None, 1, w, h, &pool, &mut scratch).unwrap();
     assert_eq!(palette.nb_colors, 2);
-    let packed = PackedPalette::new(&palette, w, h).unwrap();
+    let packed = PackedPalette::new(&palette, w, h, false).unwrap();
     assert_eq!(packed.packed_colors, 4);
     assert_eq!(packed.indices.len(), w / 2 * h);
     // The decoder's inverse horizontal Squeeze with a zero smoothing term.
@@ -291,7 +291,7 @@ fn packed_palette_inverts_through_the_decoder_squeeze() {
         })
         .collect();
     assert_eq!(unpacked, palette.indices);
-    let source = packed.source(w, h);
+    let source = packed.source();
     assert!(packed.horizontal);
     assert_eq!((source.hshift, source.vshift), (1, 0));
     assert_eq!(
@@ -307,9 +307,9 @@ fn packed_palette_inverts_through_the_decoder_squeeze() {
     let (w, h) = (37, 12);
     let linear = gray_plane(w, h, bilevel);
     let palette = build_global_palette(&linear, None, 1, w, h, &pool, &mut scratch).unwrap();
-    let packed = PackedPalette::new(&palette, w, h).unwrap();
+    let packed = PackedPalette::new(&palette, w, h, false).unwrap();
     assert!(!packed.horizontal);
-    let source = packed.source(w, h);
+    let source = packed.source();
     assert_eq!((source.hshift, source.vshift), (0, 1));
     assert_eq!((source.channels[2].w, source.channels[2].h), (w, h / 2));
     for (i, &index) in packed.indices.iter().enumerate() {
@@ -335,17 +335,34 @@ fn packed_palette_inverts_through_the_decoder_squeeze() {
     let (w, h) = (38, 11);
     let odd = gray_plane(w - 1, h, bilevel);
     let odd_palette = build_global_palette(&odd, None, 1, w - 1, h, &pool, &mut scratch).unwrap();
-    assert!(PackedPalette::new(&odd_palette, w - 1, h).is_none());
-    let five = gray_plane(w, h, |x, y| 50 * ((x + 2 * y) % 5) as i32);
-    let five_palette = build_global_palette(&five, None, 1, w, h, &pool, &mut scratch).unwrap();
-    assert_eq!(five_palette.nb_colors, 5);
-    assert!(PackedPalette::new(&five_palette, w, h).is_none());
+    assert!(PackedPalette::new(&odd_palette, w - 1, h, false).is_none());
+    // Allowed a wider frame, they pair up along rows with the last column
+    // repeated: the last pair of every row holds one color twice.
+    let padded = PackedPalette::new(&odd_palette, w - 1, h, true).unwrap();
+    assert_eq!(padded.padded_xsize(), Some(w));
+    assert!(padded.horizontal);
+    assert_eq!(padded.indices.len(), w / 2 * h);
+    for (y, row) in padded.indices.chunks_exact(w / 2).enumerate() {
+        let last = usize::from(*row.last().unwrap());
+        let (average, residual) = (
+            padded.tuples[last],
+            padded.tuples[padded.packed_colors + last],
+        );
+        assert_eq!(residual, 0);
+        assert_eq!(average as u16, odd_palette.indices[y * (w - 1) + w - 2]);
+    }
+    let even = PackedPalette::new(&palette, w, h, true).unwrap();
+    assert_eq!(even.padded_xsize(), None);
+    let nine = gray_plane(w, h, |x, y| 30 * ((x + 2 * y) % 9) as i32);
+    let nine_palette = build_global_palette(&nine, None, 1, w, h, &pool, &mut scratch).unwrap();
+    assert_eq!(nine_palette.nb_colors, 9);
+    assert!(PackedPalette::new(&nine_palette, w, h, false).is_none());
 
     // A plane without one of the four pairs keeps a shorter second palette.
     let stripes = gray_plane(w, h, |x, _| 255 * (x % 2) as i32);
     let stripes_palette =
         build_global_palette(&stripes, None, 1, w, h, &pool, &mut scratch).unwrap();
-    let packed = PackedPalette::new(&stripes_palette, w, h).unwrap();
+    let packed = PackedPalette::new(&stripes_palette, w, h, false).unwrap();
     assert_eq!(packed.packed_colors, 1);
     assert!(packed.indices.iter().all(|&index| index == 0));
 }
@@ -354,19 +371,22 @@ fn packed_palette_inverts_through_the_decoder_squeeze() {
 fn packed_few_color_palette_inverts_through_the_decoder_squeeze() {
     let pool = ThreadPool::new_lossless(2);
     let mut scratch = CoderScratch::lossless();
-    // Ramps of three and four colors: the smoothing term is nonzero on them.
+    // Ramps of three to eight colors: the smoothing term is nonzero on them.
     for (colors, (w, h)) in [
         (3usize, (40, 13)),
         (4, (40, 13)),
         (3, (37, 14)),
         (4, (37, 14)),
+        (5, (40, 13)),
+        (8, (40, 13)),
+        (8, (37, 14)),
     ] {
         let plane = gray_plane(w, h, |x, y| {
-            60 * (((x / 3 + y / 2) + (x * y) % 7 / 6) % colors) as i32
+            30 * (((x / 3 + y / 2) + (x * y) % 7 / 6) % colors) as i32
         });
         let palette = build_global_palette(&plane, None, 1, w, h, &pool, &mut scratch).unwrap();
         assert_eq!(palette.nb_colors, colors);
-        let packed = PackedPalette::new(&palette, w, h).unwrap();
+        let packed = PackedPalette::new(&palette, w, h, false).unwrap();
         assert_eq!(packed.horizontal, w % 2 == 0);
         let n = packed.packed_colors;
         assert!(n >= colors && packed.indices.iter().all(|&i| usize::from(i) < n));

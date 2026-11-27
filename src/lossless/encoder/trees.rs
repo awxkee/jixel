@@ -205,6 +205,12 @@ pub(super) fn learn_tree_candidates(
 /// [`ORDER_RACE_BOTH_MAX_BITS`] (34 raced frames of 134 graphics, photos
 /// and screenshots).
 const ORDER_RACE_MARGIN: f64 = 1.02;
+
+/// A packed index image of more than four colors is learned past its first
+/// stage only while that stage's estimate stays within this of the plain
+/// index image's. The packed form wins about one such frame in six, and the
+/// frames it wins start at or below the plain estimate with few exceptions.
+const PACKED_COARSE_MARGIN: f64 = 1.1;
 const ORDER_RACE_BOTH_MAX_BITS: f64 = 65536.0;
 
 /// A large palette's frame at most this share of the RGB frame's bits ends
@@ -811,36 +817,62 @@ impl Tournament {
         } else {
             &layouts.all[..]
         };
-        // A frame of at most four colors also codes its index image two
-        // pixels to a sample. A bi-level one holding a repeated screen codes
+        // A frame of a few colors also codes its index image two pixels to a
+        // sample; past four colors that form waits for the plain one's
+        // estimate. A bi-level one holding a repeated screen codes
         // each form under a tree of Zero-predictor leaves as well, where LZ77
         // copies the screen's pixels. The smallest written frame stays.
-        let packed = PackedPalette::new(palette, frame.xsize, frame.ysize);
+        // The packed index image of a frame odd both ways lies in a frame
+        // one column wider, cropped to the image by the decoder.
+        let may_pad = matches!(frame.kind, ModularFrameKind::Regular) && frame.alpha.is_none();
+        let packed = PackedPalette::new(palette, frame.xsize, frame.ysize, may_pad);
+        let padded_frame = packed
+            .as_ref()
+            .and_then(PackedPalette::padded_xsize)
+            .map(|xsize| CoreFrame {
+                xsize,
+                kind: ModularFrameKind::RgbCrop {
+                    x0: 0,
+                    y0: 0,
+                    width: xsize,
+                    height: frame.ysize,
+                    full: true,
+                    last: true,
+                },
+                ..*frame
+            });
+        let packed_frame = padded_frame.as_ref().unwrap_or(frame);
         let mut held: Option<(GroupLayout, LearnedCandidate)> = None;
         if packed.is_some() || palette.is_bilevel() {
             let screen = palette.is_bilevel()
                 && palette.screen_share(frame.xsize, frame.ysize) >= palette::SCREEN_MIN_SHARE;
             let mut arms: Vec<MaSource<'_>> = Vec::with_capacity(3);
-            if let Some(packed) = &packed {
-                arms.push(packed.source(frame.xsize, frame.ysize));
+            if let Some(packed) = packed.as_ref().filter(|packed| !packed.races_coarse()) {
+                arms.push(packed.source());
             }
             if screen {
                 let mut values = palette.source(frame.xsize, frame.ysize);
                 values.value_tree = true;
                 arms.push(values);
                 if let Some(packed) = &packed {
-                    let mut values = packed.source(frame.xsize, frame.ysize);
+                    let mut values = packed.source();
                     values.value_tree = true;
                     arms.push(values);
                 }
             }
             for arm in &arms {
+                let frame = if arm.hshift + arm.vshift > 0 {
+                    packed_frame
+                } else {
+                    frame
+                };
                 if let Some((layout, cand, _)) = self.learn_palette_layouts(
                     frame,
                     sources,
                     arm,
                     palette_layouts,
                     None,
+                    f64::INFINITY,
                     pool,
                     scratch,
                 ) {
@@ -870,9 +902,23 @@ impl Tournament {
                 &source,
                 palette_layouts,
                 first_stage,
+                f64::INFINITY,
                 pool,
                 scratch,
             );
+            if let Some((_, _, coarse)) = &plain {
+                self.learn_late_packed(
+                    packed_frame,
+                    color,
+                    sources,
+                    packed.as_ref(),
+                    palette_layouts,
+                    *coarse,
+                    best,
+                    pool,
+                    scratch,
+                );
+            }
             let plain_est = plain
                 .as_ref()
                 .map_or(f64::INFINITY, |(_, cand, _)| cand.est_real);
@@ -880,9 +926,9 @@ impl Tournament {
                 && held_cand.est_real < plain_est
                 && let Some(packed) = &packed
             {
-                let packed_source = packed.source(frame.xsize, frame.ysize);
+                let packed_source = packed.source();
                 self.write_palette(
-                    frame,
+                    packed_frame,
                     color,
                     sources,
                     &packed_source,
@@ -916,7 +962,6 @@ impl Tournament {
             }
             return;
         };
-        drop(packed);
         // The order race: both orders learn the first layout, and an order
         // whose complete estimate there trails the other's by more than
         // `ORDER_RACE_MARGIN` stops; the rest learn the other layouts and
@@ -924,10 +969,33 @@ impl Tournament {
         let raced_source = raced.source(frame.xsize, frame.ysize);
         let (head, tail) = palette_layouts.split_at(1);
         let mut learns = [(&source, first_stage), (&raced_source, None)].map(|(source, stage)| {
-            let learn =
-                self.learn_palette_layouts(frame, sources, source, head, stage, pool, scratch);
+            let learn = self.learn_palette_layouts(
+                frame,
+                sources,
+                source,
+                head,
+                stage,
+                f64::INFINITY,
+                pool,
+                scratch,
+            );
             (source, learn)
         });
+        let plain_coarse = learns
+            .iter()
+            .filter_map(|(_, learn)| learn.as_ref().map(|learn| learn.2))
+            .fold(f64::INFINITY, f64::min);
+        self.learn_late_packed(
+            packed_frame,
+            color,
+            sources,
+            packed.as_ref(),
+            palette_layouts,
+            plain_coarse,
+            best,
+            pool,
+            scratch,
+        );
         let est_of = |learn: &Option<(GroupLayout, LearnedCandidate, f64)>| {
             learn
                 .as_ref()
@@ -952,8 +1020,16 @@ impl Tournament {
             }
             if !tail.is_empty()
                 && cand.est_real <= final_limit
-                && let Some((tail_layout, tail_cand, tail_coarse)) =
-                    self.learn_palette_layouts(frame, sources, source, tail, None, pool, scratch)
+                && let Some((tail_layout, tail_cand, tail_coarse)) = self.learn_palette_layouts(
+                    frame,
+                    sources,
+                    source,
+                    tail,
+                    None,
+                    f64::INFINITY,
+                    pool,
+                    scratch,
+                )
             {
                 coarse = coarse.min(tail_coarse);
                 if tail_cand.est_real < cand.est_real {
@@ -967,8 +1043,48 @@ impl Tournament {
         }
     }
 
+    /// The packed index image of a palette past four colors: learned once
+    /// the plain index image's first-stage estimate is known, dropped when
+    /// its own trails that by more than [`PACKED_COARSE_MARGIN`], and
+    /// written otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn learn_late_packed(
+        &mut self,
+        frame: &CoreFrame<'_>,
+        color: &mut ColorTransform<'_>,
+        sources: &SourcePlan,
+        packed: Option<&PackedPalette<'_>>,
+        layouts: &[GroupLayout],
+        plain_coarse: f64,
+        best: &mut SmallestFrame,
+        pool: &ThreadPool,
+        scratch: &mut CoderScratch,
+    ) {
+        let Some(packed) = packed.filter(|packed| packed.races_coarse()) else {
+            return;
+        };
+        if !plain_coarse.is_finite() {
+            return;
+        }
+        let arm = packed.source();
+        if let Some((layout, cand, _)) = self.learn_palette_layouts(
+            frame,
+            sources,
+            &arm,
+            layouts,
+            None,
+            plain_coarse * PACKED_COARSE_MARGIN,
+            pool,
+            scratch,
+        ) {
+            self.write_palette(
+                frame, color, sources, &arm, layout, &cand, best, pool, scratch,
+            );
+        }
+    }
+
     /// The palette source's learn under `layouts`, pruned against the RGB
-    /// tree's estimates.
+    /// tree's estimates and against `coarse_cap`.
     #[allow(clippy::too_many_arguments)]
     fn learn_palette_layouts(
         &self,
@@ -977,6 +1093,7 @@ impl Tournament {
         source: &MaSource<'_>,
         layouts: &[GroupLayout],
         first_stage: Option<CoarseLearn>,
+        coarse_cap: f64,
         pool: &ThreadPool,
         scratch: &mut CoderScratch,
     ) -> Option<(GroupLayout, LearnedCandidate, f64)> {
@@ -989,7 +1106,7 @@ impl Tournament {
             frame.min_symbol,
             sources.palette_wp,
             sources.final_wp(frame, true),
-            self.rgb_coarse * PALETTE_COARSE_MARGIN,
+            (self.rgb_coarse * PALETTE_COARSE_MARGIN).min(coarse_cap),
             // Room for the 256 layout's ~4% on palette graphics.
             self.rgb_final * PALETTE_FINAL_MARGIN * PALETTE_LAYOUT_MARGIN,
             true,
