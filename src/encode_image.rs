@@ -1618,6 +1618,23 @@ pub fn encode_image(
             encode_image(input, width, height, config)
         });
     }
+    let coded = encode_rgb_templates(input, width, height, config)?;
+    // Once, against the finished file: the lossy arms code the image
+    // several times over on their way to it.
+    if let Some(mixed) = mix_palette_arm(input, width, height, config, coded.len())? {
+        return Ok(mixed);
+    }
+    Ok(coded)
+}
+
+/// [`encode_image`] of a prepared config without the palette arm: what the
+/// arms that code the image or its crops again call.
+fn encode_rgb_templates(
+    input: &[u8],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
     race_glyph_templates(config, width, height, |config| {
         if config.templates_active {
             encode_lossy_u8_alpha::<3>(input, width, height, config)
@@ -1824,6 +1841,54 @@ fn encode_image_rgb(
                 .with_num_threads(config.num_threads),
         );
     }
+    encode_rgb_lossy_arms(input, width, height, config)
+}
+
+/// Flat-color art quantized to fills and their mixes and coded losslessly,
+/// when that is smaller than the `lossy` file (see
+/// [`crate::mix_palette::search`]); `None` for any other frame.
+fn mix_palette_arm(
+    input: &[u8],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+    lossy: usize,
+) -> Result<Option<Vec<u8>>, EncodeError> {
+    if !bilevel_codes_exactly(config)
+        || config.speed < Speed::Medium
+        || !matches!(
+            config.color_encoding.transfer,
+            crate::color_encoding::TransferFunction::Srgb
+        )
+        || config.icc_profile.is_some()
+    {
+        return Ok(None);
+    }
+    let mut exact = config.clone();
+    exact.lossless = true;
+    exact.lossy_fallback = true;
+    crate::mix_palette::search(
+        input.as_chunks::<3>().0,
+        width,
+        height,
+        config.distance,
+        lossy,
+        config.speed,
+        |frame, width, height, speed| {
+            exact.speed = speed;
+            encode_image_rgb(frame.as_flattened(), width, height, &exact)
+        },
+    )
+}
+
+/// The lossy arms of an RGB encode: vector layers, ink, crop frames and
+/// the plain frame.
+fn encode_rgb_lossy_arms(
+    input: &[u8],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
     let vector_source = config
         .vector_layers
         .then(|| crate::vector_layers::SplitSource::rgb(input, width, height))
@@ -2155,7 +2220,7 @@ fn encode_without_layers(
     plain_config.ink_layer = false;
     plain_config.vector_layers = false;
     plain_config.crop_frames = false;
-    encode_image(input, width, height, &plain_config)
+    encode_rgb_templates(input, width, height, &plain_config)
 }
 
 /// On a tie the vector encode stands: exact where the others are lossy.
@@ -3031,7 +3096,7 @@ fn encode_crop_stack(
         let crop = crop_frames::cut(input, width, b);
         // What VarDCT spends on the rectangle: the crop coded on its own by
         // the plain encoder at this distance.
-        let model = encode_image(&crop, b.width, b.height, &vardct_config)?.len() as f64;
+        let model = encode_rgb_templates(&crop, b.width, b.height, &vardct_config)?.len() as f64;
         let content = crop_frames::content(crop, b, config.distance);
         let frame = crop_frame(&spec, &content, b, false, Speed::Medium, &mut scratch);
         let bytes = frame.bits_written() as f64 / 8.0 + crop_frames::FRAME_OVERHEAD;
@@ -3048,7 +3113,7 @@ fn encode_crop_stack(
     }
     for b in &detail {
         let crop = crop_frames::cut(input, width, b);
-        let model = encode_image(&crop, b.width, b.height, &vardct_config)?.len() as f64;
+        let model = encode_rgb_templates(&crop, b.width, b.height, &vardct_config)?.len() as f64;
         let Some(frame) = lossy_frame(&spec, &crop, b, false, &mut scratch) else {
             continue;
         };
@@ -5857,13 +5922,7 @@ mod encode_smoke_tests {
             encode_image_gray(&gray, w, h, &lossy).unwrap(),
             encode_image_gray(&gray, w, h, &exact).unwrap()
         );
-        // A third color, or a progressive request, keeps the lossy path.
-        let mut three = rgb.clone();
-        three[..3].copy_from_slice(&[9, 200, 9]);
-        assert_ne!(
-            encode_image(&three, w, h, &lossy).unwrap(),
-            encode_image(&three, w, h, &exact).unwrap()
-        );
+        // A progressive request keeps the lossy path.
         assert!(!bilevel_codes_exactly(
             &lossy.clone().with_progressive(true)
         ));
@@ -5941,9 +6000,10 @@ mod encode_smoke_tests {
             .with_speed(Speed::Medium)
             .with_distance(1.0)
             .with_num_threads(1);
-        // The fixture layers when nothing forbids it.
-        let plain = encode_image(&rgb, 256, 256, &config).unwrap();
-        let flat = encode_image(&rgb, 256, 256, &layered_off(config.clone())).unwrap();
+        // The fixture layers when nothing forbids it (the lossy arms alone:
+        // the palette arm takes so few colors either way).
+        let plain = encode_rgb_templates(&rgb, 256, 256, &config).unwrap();
+        let flat = encode_rgb_templates(&rgb, 256, 256, &layered_off(config.clone())).unwrap();
         assert_ne!(plain, flat, "the fixture must take a layered arm");
         let tagged = config.with_icc_profile(icc);
         assert!(!tagged.xyb_layers_decodable());
@@ -5969,9 +6029,12 @@ mod encode_smoke_tests {
         perceptual.color_encoding.rendering_intent = RenderingIntent::Perceptual;
         let tagged = encode(&config.clone().with_icc_profile(srgb_icc.clone()));
         assert_eq!(tagged, encode(&perceptual));
+        // The lossy arms alone: the palette arm takes so few colors with
+        // or without the layers.
+        let lossy = |config: &EncodeConfig| encode_rgb_templates(&rgb, 256, 256, config).unwrap();
         assert_ne!(
-            tagged,
-            encode(
+            lossy(&perceptual),
+            lossy(
                 &perceptual
                     .clone()
                     .with_ink_layer(false)

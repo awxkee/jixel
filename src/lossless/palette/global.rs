@@ -224,7 +224,13 @@ pub(in crate::lossless) fn bilevel_screen_share(linear: &Image3Si) -> Option<f64
 }
 
 /// Most colors a global palette may have for its index image to be packed.
-pub(in crate::lossless) const PACKED_PALETTE_MAX_COLORS: usize = 4;
+/// Past eight the packed form won one image of thirty-nine.
+pub(in crate::lossless) const PACKED_PALETTE_MAX_COLORS: usize = 8;
+
+/// Most colors for the packed form to be learned in full whatever the plain
+/// form's estimate. Above it the packed form wins about one image in six, so
+/// it is learned after the plain one and stops early when it trails.
+const PACKED_PALETTE_SURE_COLORS: usize = 4;
 
 /// A global palette of at most [`PACKED_PALETTE_MAX_COLORS`] colors with its
 /// index image packed two pixels to a sample. One Squeeze of the index
@@ -232,7 +238,8 @@ pub(in crate::lossless) const PACKED_PALETTE_MAX_COLORS: usize = 4;
 /// over those two channels codes one index per (average, residual) tuple.
 /// On a 0 / 1 index the squeeze smoothing term is always zero, so each pair
 /// is one of four tuples; with more colors it is not, and one pair can take
-/// a few tuples. The half-size index image gives the tree twice the
+/// a few tuples. Flat graphics of a few colors hold a small share of the
+/// possible tuples. The half-size index image gives the tree twice the
 /// neighborhood and LZ77 a wider alphabet.
 pub(in crate::lossless) struct PackedPalette<'a> {
     base: &'a GlobalPalette,
@@ -242,26 +249,47 @@ pub(in crate::lossless) struct PackedPalette<'a> {
     pub(super) packed_colors: usize,
     /// Pairs lie along rows; otherwise along columns.
     pub(super) horizontal: bool,
+    /// The size of the frame that holds the packed index image: the image's,
+    /// or one column wider.
+    xsize: usize,
+    ysize: usize,
+    padded: bool,
 }
 
 impl<'a> PackedPalette<'a> {
     /// `None` unless the palette has 2..=[`PACKED_PALETTE_MAX_COLORS`] colors
     /// and the samples pair up along a row or, failing that, along a column:
     /// the average channel of an odd size is one sample longer than the
-    /// residual channel, and a Palette needs equal channels.
+    /// residual channel, and a Palette needs equal channels. An image odd
+    /// both ways pairs up along rows in a frame one column wider, its last
+    /// column repeated, when `may_pad` says the frame may differ from the
+    /// image in size.
     pub(in crate::lossless) fn new(
         base: &'a GlobalPalette,
         xsize: usize,
         ysize: usize,
+        may_pad: bool,
     ) -> Option<Self> {
         let colors = base.nb_colors;
         if !(2..=PACKED_PALETTE_MAX_COLORS).contains(&colors) || xsize == 0 || ysize == 0 {
             return None;
         }
-        let horizontal = xsize.is_multiple_of(2);
-        if !horizontal && !ysize.is_multiple_of(2) {
+        let padded = !xsize.is_multiple_of(2) && !ysize.is_multiple_of(2);
+        if padded && !may_pad {
             return None;
         }
+        let horizontal = padded || xsize.is_multiple_of(2);
+        let widened: Vec<u16>;
+        let (plane, plane_xsize) = if padded {
+            widened = base
+                .indices
+                .chunks_exact(xsize)
+                .flat_map(|row| row.iter().chain(row.last()).copied())
+                .collect();
+            (&widened[..], xsize + 1)
+        } else {
+            (&base.indices[..], xsize)
+        };
         // Averages lie in 0..colors. A pair difference is below `colors` and
         // the smoothing term below `2 * colors` in magnitude, so a residual
         // lies within `3 * colors`.
@@ -272,11 +300,11 @@ impl<'a> PackedPalette<'a> {
             debug_assert!((0..colors as i32).contains(&a) && r.abs() <= reach);
             (a * span + r + reach) as usize
         };
-        let mut indices = Vec::with_capacity(base.indices.len() / 2);
+        let mut indices = Vec::with_capacity(plane.len() / 2);
         let mut index_of = [0u16; MAX_SLOTS];
         // Store tuple slots in the final index buffer while Squeeze's rows
         // are still in scratch. Remap them once the tuple order is known.
-        crate::squeeze::visit_squeezed_index_rows(&base.indices, xsize, horizontal, |avg, res| {
+        crate::squeeze::visit_squeezed_index_rows(plane, plane_xsize, horizontal, |avg, res| {
             indices.extend(avg.iter().zip(res).map(|(&a, &r)| {
                 let slot = slot(a, r);
                 index_of[slot] = 1;
@@ -311,10 +339,25 @@ impl<'a> PackedPalette<'a> {
             indices,
             packed_colors,
             horizontal,
+            xsize: plane_xsize,
+            ysize,
+            padded,
         })
     }
 
-    pub(in crate::lossless) fn source(&self, xsize: usize, ysize: usize) -> MaSource<'_> {
+    /// The width of the frame when it is one column wider than the image.
+    pub(in crate::lossless) fn padded_xsize(&self) -> Option<usize> {
+        self.padded.then_some(self.xsize)
+    }
+
+    /// The packed form races the plain one on its first learning stage
+    /// instead of being learned in full.
+    pub(in crate::lossless) fn races_coarse(&self) -> bool {
+        self.base.nb_colors > PACKED_PALETTE_SURE_COLORS
+    }
+
+    pub(in crate::lossless) fn source(&self) -> MaSource<'_> {
+        let (xsize, ysize) = (self.xsize, self.ysize);
         let (hshift, vshift) = (u32::from(self.horizontal), u32::from(!self.horizontal));
         MaSource {
             channels: vec![
